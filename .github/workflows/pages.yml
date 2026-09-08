@@ -90,6 +90,9 @@ jobs:
           # never a real host — the printed command died on DNS the
           # moment anyone pasted it; this serves from the apex instead.
           cp docs/install.sh "$site/install.sh"
+          # Verified platform matrix (round 99) — linked from the
+          # installer header and the README.
+          cp docs/PLATFORMS.md "$site/PLATFORMS.md"
           cp docs/logo.png "$site/logo.png"
           cp docs/social-preview.png "$site/social-preview.png"
           # Product console — the multi-tenant SaaS app.

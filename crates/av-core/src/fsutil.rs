@@ -27,11 +27,28 @@ use std::path::Path;
 /// platforms we fall back to the Linux value (a conservative
 /// choice: a mismatch would surface as an `ELOOP`/`ENOTDIR`/`EACCES`
 /// at first symlink attempt, not silent success).
+///
+/// CAUTION (round-99 find): on Linux the fcntl bits are per-ARCH,
+/// not per-OS. PowerPC swaps the asm-generic layout: 0x20000 there
+/// is O_DIRECT — passing it forced direct-I/O alignment on every
+/// spool append (EINVAL, all sessions fail-closed on ppc64le) while
+/// silently NOT refusing symlinks. Alpha/sparc differ too; neither
+/// has a supported Rust target here.
 #[cfg(unix)]
 pub const fn unix_o_nofollow() -> i32 {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(
+        target_os = "linux",
+        not(any(target_arch = "powerpc", target_arch = "powerpc64"))
+    ))]
     {
         0x20000
+    }
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "powerpc", target_arch = "powerpc64")
+    ))]
+    {
+        0x8000
     }
     #[cfg(any(
         target_os = "macos",

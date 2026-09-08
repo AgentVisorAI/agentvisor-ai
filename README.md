@@ -56,6 +56,12 @@ curl -fsSL https://agentvisorai.me/install.sh | sh    # installs `agentvisord` +
 avctl
 ```
 
+Prebuilt static binaries cover Linux (x86_64/aarch64, any libc) and
+macOS (both architectures); other Unix targets build from source —
+the verified matrix, including 32-bit ARM, riscv64, ppc64le and
+big-endian s390x, is in [docs/PLATFORMS.md](docs/PLATFORMS.md).
+Windows runs via WSL.
+
 Or install straight from this repository (same thing the script runs):
 
 ```bash
