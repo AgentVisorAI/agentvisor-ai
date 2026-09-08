@@ -759,16 +759,31 @@ export async function samlRoutes(app: FastifyInstance): Promise<void> {
             "allowedDomains is required (non-empty comma-separated list) when jitEnabled=true — an empty allowlist would let a signed AuthnResponse with any asserted email JIT-create a user in this org",
         });
       }
-      const cfg = await db.samlConfig.update({
-        where: { id: existing.id },
-        data: {
-          ...body.data,
-          sloUrl:
-            body.data.sloUrl === undefined
-              ? undefined
-              : body.data.sloUrl ?? null,
-        },
-      });
+      // Same P2002 → 409 mapping as the CREATE above: displayName is
+      // patchable and carries @@unique([orgId, displayName]) — a rename
+      // onto a sibling config surfaced as an unhandled 500 while the
+      // identical collision on create returned 409 displayname_in_use.
+      let cfg;
+      try {
+        cfg = await db.samlConfig.update({
+          where: { id: existing.id },
+          data: {
+            ...body.data,
+            sloUrl:
+              body.data.sloUrl === undefined
+                ? undefined
+                : body.data.sloUrl ?? null,
+          },
+        });
+      } catch (err) {
+        if (
+          typeof err === "object" && err !== null &&
+          (err as { code?: string }).code === "P2002"
+        ) {
+          return reply.code(409).send({ error: "displayname_in_use" });
+        }
+        throw err;
+      }
       writeAudit(
         {
           orgId: claims.orgId,

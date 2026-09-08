@@ -9,7 +9,7 @@
  * defined in datasource.js. Flip the flag, deploy the backend, done.
  */
 window.MOCK_MODE = true;
-window.API_BASE = "";  // e.g. "https://api.agentvisorai.me/api/v1" once deployed
+window.API_BASE = "";  // e.g. "https://api.agentvisorai.me" once deployed (origin only — paths already carry /api/v1)
 
 (function () {
   "use strict";

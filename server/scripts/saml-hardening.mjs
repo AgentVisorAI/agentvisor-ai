@@ -322,6 +322,36 @@ async function main() {
   });
   results.push({ drill: "member-delete-403", status: memberDeleteReq.status, expect: 403 });
 
+  // ============ 4b. PATCH rename onto a sibling's displayName → 409 ============
+  // @@unique([orgId, displayName]): the CREATE path returned 409
+  // displayname_in_use but the PATCH path surfaced the same collision
+  // as an unhandled 500 until it grew the matching P2002 catch.
+  console.log("\n[4b] PATCH displayName collision → 409");
+  const cfg2 = await createConfig(ownerCookie, {
+    displayName: "Staging IdP",
+    ssoUrl: "https://staging-idp.example/sso",
+    entityIdIdp: "https://staging-idp.example/entity",
+    x509Cert: idp.certPem,
+    wantAssertionsSigned: true,
+    wantResponseSigned: false,
+    jitEnabled: false,
+    jitDefaultRole: "member",
+    allowedDomains: "",
+    allowEncryptedAssertions: false,
+  });
+  const renameClash = await fetch(`${API}/api/v1/auth/saml/${cfg2.id}`, {
+    method: "PATCH",
+    headers: { Cookie: ownerCookie, Origin: SPA_ORIGIN, "Sec-Fetch-Site": "same-origin", "Content-Type": "application/json" },
+    body: JSON.stringify({ displayName: "Prod IdP" }),
+  });
+  const renameBody = await renameClash.text();
+  results.push({
+    drill: "patch-rename-collision-409",
+    status: renameClash.status === 409 && /displayname_in_use/.test(renameBody) ? 409 : renameClash.status === 409 ? -1 : renameClash.status,
+    expect: 409,
+    body: renameClash.status !== 409 ? renameBody.slice(0, 100) : undefined,
+  });
+
   // ============ 5. JIT disabled + user not in DB → 403 ============
   console.log("\n[5] JIT disabled + user not in DB");
   await fetch(`${API}/api/v1/auth/saml/${cfg.id}`, {
