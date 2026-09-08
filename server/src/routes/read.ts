@@ -163,8 +163,14 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
              COALESCE(SUM("blockedPayoutUsdMicros"), 0)::bigint  AS blockedpayout
       FROM sessions
       WHERE "orgId" = ${claims.orgId}
-        AND "openedAt" >= ${windowStart}
-        AND "openedAt" < ${windowEnd}
+        -- Round-104 TZ fix: openedAt is a naive-UTC timestamp while a
+        -- bound JS Date arrives as timestamptz; the mixed comparison
+        -- casts through the SESSION TimeZone, shifting the window by
+        -- the DB's UTC offset (a New-York DB pushed fresh sessions
+        -- past windowEnd -> the whole series summed to zero). Pin the
+        -- params to naive UTC so any database TimeZone works.
+        AND "openedAt" >= (${windowStart}::timestamptz AT TIME ZONE 'UTC')
+        AND "openedAt" < (${windowEnd}::timestamptz AT TIME ZONE 'UTC')
         ${query.data.deploymentId ? Prisma.sql`AND "deploymentId" = ${query.data.deploymentId}` : Prisma.empty}
       GROUP BY 1
     `);
