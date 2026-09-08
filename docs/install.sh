@@ -16,7 +16,7 @@
 #   3. Prints the one guided next step (`avctl setup`).
 #
 # Environment overrides:
-#   AV_VERSION=0.1.0-rc.3   release to install (default: pinned below)
+#   AV_VERSION=0.1.0-rc.4   release to install (default: pinned below)
 #   AV_INSTALL_DIR=~/bin    where prebuilt binaries land
 #   AV_INSTALL_SOURCE=1     skip prebuilt path, build from source
 #
@@ -28,7 +28,7 @@ set -eu
 REPO="https://github.com/AgentVisorAI/agentvisor"
 RELEASE_REPO="https://github.com/AgentVisorAI/agentvisor-ai"
 # Pinned to the latest published release; bump alongside each tag.
-AV_VERSION="${AV_VERSION:-0.1.0-rc.3}"
+AV_VERSION="${AV_VERSION:-0.1.0-rc.4}"
 
 say()  { printf '\033[1m%s\033[0m\n' "$*"; }
 note() { printf '  %s\n' "$*"; }
