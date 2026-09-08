@@ -15,7 +15,7 @@ One page. Grep for the failure, do the fix, move on. Kept short on purpose.
 - Status page: `docs/STATUS.md` in this repo (edit + push to update)
 - Investor comms: read-only status page + one-line email
 
-## The 10 things that will go wrong
+## The 11 things that will go wrong
 
 ### 1. Database is down (`/readyz` returning 503, all writes 500)
 
@@ -187,6 +187,32 @@ fly logs --app agentvisor-api -i <machine-id> | grep "req-<id>"
 
 The problem+json error body also contains `requestId`, so a 4xx / 5xx
 response the customer pastes into a ticket is directly greppable.
+
+### 11. Customer daemon's clock is hours off (TZ set as local-time-UTC)
+
+**Signal:** customer reports sessions stuck `live` with no timeline, and
+`avctl console-sync` printing
+`warning: console dropped timestamp-skewed events … leaving that batch retryable`
+plus `receiptsSkipped` > 0 in the summary line.
+
+**What's happening (verified end-to-end, round 106, +6h faketime):** the
+console clamps session `openedAt`/`closedAt` to `now+5min`, refuses
+events dated >5 min in the future, and avctl then **defers the receipt**
+so a sealed session never appears with an empty timeline. Nothing is
+lost — the daemon's spool keeps everything and every batch stays
+retryable. A daemon *behind* real time syncs fully (past-dated events
+are honest replay).
+
+**Fix:** correct the machine's clock/NTP (`timedatectl set-ntp true`,
+or fix the container host), which stops new sessions from skewing.
+Evidence already stamped in the future is immutable (MAC'd spool /
+signed receipts) and lands automatically once the wall clock passes
+the stamps — for a +6h skew that means up to 6 hours later; re-run
+`avctl console-sync` (or let the timer tick) after the catch-up.
+avctl defers the session's receipt until every frozen record has
+landed, so the console never shows a sealed-but-incomplete session.
+The signed receipt's `issued_at` keeps the daemon's original attested
+clock claim by design.
 
 ## Standard operating procedures
 
