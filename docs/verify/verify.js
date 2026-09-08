@@ -19,6 +19,60 @@
       for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
       return out;
     }
+    // Rust-parity strictness (round-12 differential): atob() is
+    // WHATWG-forgiving (strips ASCII whitespace), and JSON.parse keeps
+    // the LAST duplicate key — both places where this page could show
+    // a green tick on a file `avctl receipt-verify` / the daemon
+    // refuse. One file must never verify differently across the
+    // toolchain (equivocation vector), so mirror Rust's refusals.
+    // NB: b64ToBytes above deliberately maps URL-safe input for the
+    // #data= SHARE-LINK envelope only — signature/pubkey fields go
+    // through this strict gate first.
+    function isStrictStandardB64(s) {
+      return typeof s === "string" && s.length % 4 === 0 && /^[A-Za-z0-9+/]*={0,2}$/.test(s);
+    }
+    function firstDuplicateKey(text) {
+      // Minimal walker over ALREADY-JSON.parse-able text: tracks key
+      // sets per object depth. Keep in sync with
+      // server/scripts/verify-receipt.mjs (no shared imports here).
+      let i = 0;
+      const stack = [];
+      const n = text.length;
+      function skipWs() { while (i < n && /[ \t\n\r]/.test(text[i])) i++; }
+      function readString() {
+        i++;
+        let out = "";
+        while (i < n) {
+          const c = text[i];
+          if (c === "\\") { out += text[i] + (text[i + 1] ?? ""); i += 2; continue; }
+          if (c === '"') { i++; return out; }
+          out += c; i++;
+        }
+        return out;
+      }
+      while (i < n) {
+        skipWs();
+        const c = text[i];
+        if (c === "{") { stack.push({ keys: new Set(), expectKey: true }); i++; continue; }
+        if (c === "}") { stack.pop(); i++; continue; }
+        if (c === "[") { stack.push(null); i++; continue; }
+        if (c === "]") { stack.pop(); i++; continue; }
+        if (c === '"') {
+          const s = readString();
+          skipWs();
+          const top = stack[stack.length - 1];
+          if (top && top.expectKey && text[i] === ":") {
+            if (top.keys.has(s)) return s;
+            top.keys.add(s);
+          }
+          continue;
+        }
+        if (c === ",") { const top = stack[stack.length - 1]; if (top) top.expectKey = true; i++; continue; }
+        if (c === ":") { const top = stack[stack.length - 1]; if (top) top.expectKey = false; i++; continue; }
+        i++;
+      }
+      return null;
+    }
 
     // R193 F1: enforce identity binding — the receipt.body's
     // `key_id` field (a 32-hex-char prefix of SHA-256(pubkey))
@@ -190,6 +244,12 @@
       const r = bundle.receipt || {};
       const pub = bundle.publicKey || {};
       if (!r.rawBody || !r.rawSignatureB64) throw new Error("Receipt is missing rawBody or rawSignatureB64.");
+      // Rust-parity: a signature that only decodes under forgiving
+      // WHATWG base64 (whitespace / URL-safe chars / bad padding) is a
+      // verification FAILURE, exactly as avctl/daemon report it.
+      if (!isStrictStandardB64(r.rawSignatureB64)) {
+        return { ok: false, trustedKey: false, demoKey: false, bundle };
+      }
       if (!pub.hex || !/^[0-9a-fA-F]{64}$/.test(pub.hex)) throw new Error("Bundle is missing a valid 32-byte Ed25519 public key.");
       const keyBytes = hex2bytes(pub.hex);
       let key;
@@ -435,6 +495,20 @@
       let bundle;
       try { bundle = JSON.parse(text); }
       catch (e) { render({ kind: "err", message: "Not valid JSON: " + e.message }); return; }
+      // Rust-parity on the raw-receipt path (both toolchains read the
+      // SAME file): duplicate JSON keys and non-strict base64 pubkeys
+      // are refusals in avctl/daemon — never a green tick here.
+      if (looksLikeRawReceipt(bundle)) {
+        const dup = firstDuplicateKey(text);
+        if (dup !== null) {
+          render({ kind: "err", message: 'Duplicate JSON key "' + dup + '" — the Rust verifier refuses this file; refusing here too.' });
+          return;
+        }
+        if (!isStrictStandardB64(bundle.public_key_b64)) {
+          render({ kind: "err", message: "public_key_b64 is not strict standard base64 — the Rust verifier refuses this file; refusing here too." });
+          return;
+        }
+      }
       try {
         const { ok, trustedKey, demoKey, bundle: b } = await verifyBundle(bundle);
         if (ok && !tamper) lastGood = text;

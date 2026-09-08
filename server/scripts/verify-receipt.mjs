@@ -86,8 +86,10 @@ if (files.length !== 1) {
 }
 
 let bundle;
+let rawText;
 try {
-  bundle = JSON.parse(readFileSync(files[0], "utf8"));
+  rawText = readFileSync(files[0], "utf8");
+  bundle = JSON.parse(rawText);
 } catch (e) {
   console.error("Could not read/parse:", files[0], "-", e.message);
   process.exit(2);
@@ -122,6 +124,18 @@ function looksLikeRawReceipt(parsed) {
   );
 }
 if (looksLikeRawReceipt(bundle)) {
+  // Raw path: both this script and the Rust toolchain read the SAME
+  // bytes — enforce Rust's duplicate-key and strict-base64 refusals
+  // (defined below) so the two verifiers can never split verdicts.
+  const dup = firstDuplicateKey(rawText);
+  if (dup !== null) {
+    console.error(`duplicate JSON key "${dup}" — the Rust verifier refuses this file; refusing here too`);
+    process.exit(1);
+  }
+  if (!isStrictStandardB64(bundle.public_key_b64)) {
+    console.error("public_key_b64 is not strict standard base64 — the Rust verifier refuses this file; refusing here too");
+    process.exit(1);
+  }
   const body = {};
   for (const k of Object.keys(bundle)) {
     if (k === "signature_b64") continue;
@@ -194,7 +208,72 @@ function receiptSigningMessage(rawBody) {
   // Unknown version — return empty to fail-closed.
   return Buffer.alloc(0);
 }
+// Rust-parity strictness (round-12 differential: one file must never
+// verify green here while `avctl receipt-verify` / the daemon refuse
+// it — an equivocation vector for whoever holds the "greener" tool):
+//   1. STANDARD base64 alphabet only, correct padding, no whitespace.
+//      Node's Buffer.from(s, "base64") is WHATWG-forgiving (skips
+//      whitespace and invalid chars); Rust's strict decoder refuses.
+//   2. Duplicate JSON keys at any nesting level are refused — Rust
+//      reject_duplicate_keys does (RFC 8259 leaves dup handling
+//      implementation-defined; JSON.parse silently keeps the LAST,
+//      so two readers can disagree about the signed content).
+function isStrictStandardB64(s) {
+  return typeof s === "string" && s.length % 4 === 0 && /^[A-Za-z0-9+/]*={0,2}$/.test(s);
+}
+function firstDuplicateKey(text) {
+  // Minimal JSON walker: tracks object key sets per depth. Assumes
+  // `text` already survived JSON.parse (called only on parseable input).
+  let i = 0;
+  const stack = [];
+  const n = text.length;
+  function skipWs() { while (i < n && /[ \t\n\r]/.test(text[i])) i++; }
+  function readString() {
+    // at opening quote
+    i++;
+    let out = "";
+    while (i < n) {
+      const c = text[i];
+      if (c === "\\") { out += text[i] + (text[i + 1] ?? ""); i += 2; continue; }
+      if (c === '"') { i++; return out; }
+      out += c; i++;
+    }
+    return out;
+  }
+  while (i < n) {
+    skipWs();
+    const c = text[i];
+    if (c === "{") { stack.push({ keys: new Set(), expectKey: true }); i++; continue; }
+    if (c === "}") { stack.pop(); i++; continue; }
+    if (c === "[") { stack.push(null); i++; continue; }
+    if (c === "]") { stack.pop(); i++; continue; }
+    if (c === '"') {
+      const s = readString();
+      skipWs();
+      const top = stack[stack.length - 1];
+      if (top && top.expectKey && text[i] === ":") {
+        if (top.keys.has(s)) return s;
+        top.keys.add(s);
+      }
+      continue;
+    }
+    if (c === ",") {
+      const top = stack[stack.length - 1];
+      if (top) top.expectKey = true;
+      i++;
+      continue;
+    }
+    if (c === ":") { const top = stack[stack.length - 1]; if (top) top.expectKey = false; i++; continue; }
+    i++;
+  }
+  return null;
+}
+
 const msg = receiptSigningMessage(r.rawBody);
+if (!isStrictStandardB64(r.rawSignatureB64)) {
+  console.error("signature_b64 is not strict standard base64 (URL-safe chars, whitespace, or bad padding) — the Rust verifier refuses this file; refusing here too");
+  process.exit(1);
+}
 const sig = Buffer.from(r.rawSignatureB64, "base64");
 
 const sigOk = verify(null, msg, key, sig);
