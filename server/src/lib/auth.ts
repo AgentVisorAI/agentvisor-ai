@@ -78,10 +78,30 @@ export async function verifyPassword(
     return false;
   }
   try {
-    return await verify(hashStr, candidate);
+    if (await verify(hashStr, candidate)) return true;
   } catch {
     return false;
   }
+  // Round-116 (R14 hunt): #386 added the NFC normalization above with
+  // NO legacy fallback — a hash minted BEFORE the deploy over the raw
+  // (e.g. NFD) bytes can never match the normalized candidate again:
+  // the exact same keystrokes on the exact same machine stopped
+  // working the moment #386 shipped (permanent lockout, "wrong
+  // password", no recovery short of a reset email). When the
+  // normalized form differs from the raw input, retry verbatim so
+  // pre-#386 hashes keep verifying; hashPassword upgrades them to NFC
+  // on the next password change/reset. No timing split against
+  // enumeration: both forms burn a real argon2 verify, and the
+  // raw-retry branch only exists for inputs that are non-NFC to begin
+  // with (attacker-visible plaintext property, not account state).
+  if (candidate !== plaintext) {
+    try {
+      return await verify(hashStr, plaintext);
+    } catch {
+      return false;
+    }
+  }
+  return false;
 }
 
 export interface SessionClaims {
