@@ -13,7 +13,9 @@
 #      (Windows: use WSL; the static Linux binaries run there.
 #       32-bit hosts (armv7l/i686): the source build works — the
 #       policy sandbox falls back to wasmtime's portable interpreter
-#       on targets without native JIT. Expect a long compile on a Pi.)
+#       on targets without native JIT. Expect a long compile on a Pi.
+#       Big-endian (s390x) source builds verified too — receipts
+#       sealed there verify on little-endian hosts and vice versa.)
 #   3. Prints the one guided next step (`avctl setup`).
 #
 # Environment overrides:
