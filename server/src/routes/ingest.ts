@@ -392,6 +392,26 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
     const body = sessionUpsert.safeParse(req.body);
     if (!body.success) return reply.code(400).send({ error: "invalid_input" });
     const s = body.data;
+    // Round-105: clamp session clocks the same way the events path
+    // guards occurredAt (now+5min / Jan 1 2000). openedAt is
+    // client-supplied, so a TZ-misconfigured daemon (local time
+    // written as UTC) or a hostile token holder could post a +6h
+    // session that pins the list top for hours, renders "live" the
+    // whole time (the stalled heuristic needs now-openedAt > 30min),
+    // and postpones retention (`openedAt < cutoff` never matches).
+    // Events are dropped; sessions are CLAMPED instead — dropping
+    // would lose an honest-but-skewed deployment's entire audit
+    // trail, while the signed receipt remains the cryptographic
+    // record of the daemon's own clock claim.
+    {
+      const nowMs = Date.now();
+      const maxMs = nowMs + 5 * 60_000;
+      const minMs = new Date("2000-01-01T00:00:00Z").getTime();
+      const clampDate = (d: Date) =>
+        new Date(Math.min(Math.max(d.getTime(), minMs), maxMs));
+      s.openedAt = clampDate(s.openedAt);
+      if (s.closedAt) s.closedAt = clampDate(s.closedAt);
+    }
     // Look up existing session first so we can protect a sealed status
     // from being "un-sealed" by a buggy daemon retrying with status=live.
     // Once a session is sealed the totals are finalized and the receipt
