@@ -58,6 +58,7 @@
  */
 
 import type { FastifyBaseLogger, FastifyRequest } from "fastify";
+import { truncateWellFormed } from "./strings.js";
 import { db } from "../db.js";
 
 export interface AuditInput {
@@ -75,7 +76,7 @@ export function writeAudit(input: AuditInput, log?: FastifyBaseLogger): void {
   const ip = input.req?.ip ?? null;
   const ua =
     typeof input.req?.headers["user-agent"] === "string"
-      ? (input.req.headers["user-agent"] as string).slice(0, 512)
+      ? truncateWellFormed(input.req.headers["user-agent"] as string, 512)
       : null;
   void db.auditEntry
     .create({

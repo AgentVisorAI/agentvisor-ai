@@ -28,6 +28,7 @@
  */
 
 import { SAML, ValidateInResponseTo } from "@node-saml/node-saml";
+import { truncateWellFormed } from "./strings.js";
 import type { SamlConfig } from "@prisma/client";
 import { db } from "../db.js";
 import { env, apiPublicBase } from "../env.js";
@@ -467,9 +468,9 @@ export async function consumeSamlResponse(
     // is 320; console password signup already enforces
     // displayName max(80), so 200 here gives IdP-asserted
     // legitimate names some slack while still bounded.
-    email: email.toLowerCase().trim().normalize("NFC").slice(0, 320),
+    email: truncateWellFormed(email.toLowerCase().trim().normalize("NFC"), 320),
     displayName: typeof displayName === "string"
-      ? displayName.slice(0, 200)
+      ? truncateWellFormed(displayName, 200)
       : null,
     nameID,
     nameIDFormat,

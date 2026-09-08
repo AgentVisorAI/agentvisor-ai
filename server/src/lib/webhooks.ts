@@ -29,6 +29,7 @@
  * production deployments would swap in Sidekiq / BullMQ.
  */
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { truncateWellFormed } from "./strings.js";
 import { isIP } from "node:net";
 import { promises as dns } from "node:dns";
 import { Agent, fetch as undiciFetch } from "undici";
@@ -668,7 +669,8 @@ async function deliverOne(
     // wall time.
     const respText = await readBodyCapped(res, 2048);
     clearTimeout(timer);
-    const truncated = respText.length > 2000 ? respText.slice(0, 2000) + "…" : respText;
+    const truncated =
+      respText.length > 2000 ? truncateWellFormed(respText, 2000) + "…" : respText;
     if (responseCode >= 200 && responseCode < 300) {
       await db.webhookDelivery.update({
         where: { id: deliveryId },
