@@ -903,6 +903,13 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
           });
         }
       };
+      // Round-116: UTF-8 BOM first. The charset=utf-8 HTTP header dies
+      // with the response — Excel opens the downloaded FILE and sniffs,
+      // assuming ANSI without a BOM, so unicode emails/org names (legal
+      // since #381) render as mojibake (café → cafÃ©) for analysts on
+      // Windows. RFC 4180 is silent on BOMs; every mainstream parser
+      // tolerates one.
+      await writeChunk("\uFEFF");
       await writeChunk("at,event,actor,target,ip,note,metadata\n");
       for (const r of rows) {
         if (clientClosed) break;
