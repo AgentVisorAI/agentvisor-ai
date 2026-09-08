@@ -15,7 +15,14 @@ const ARGON2_OPTS = {
 } as const;
 
 export async function hashPassword(plaintext: string): Promise<string> {
-  return hash(plaintext, ARGON2_OPTS);
+  // Round-115: NFC-normalize before hashing (NIST 800-63B §5.1.1.2).
+  // The same keystrokes arrive NFC from Linux/browser input but often
+  // NFD from macOS input paths — byte-distinct forms of one visually
+  // identical password hashed differently, locking users out across
+  // machines. Normalizing both here and in verifyPassword makes the
+  // pair self-consistent for every call site (signup, login,
+  // change-password, reset-confirm, invite-accept).
+  return hash(plaintext.normalize("NFC"), ARGON2_OPTS);
 }
 
 // Precomputed dummy hash so login for a missing user still runs a real
@@ -46,6 +53,9 @@ export async function verifyPassword(
   hashStr: string,
   plaintext: string,
 ): Promise<boolean> {
+  // Round-115: mirror hashPassword's NFC normalization so the same
+  // keystrokes verify regardless of the client OS's composition form.
+  const candidate = plaintext.normalize("NFC");
   // R86 F3: burn full argon2 time even when hashStr isn't a
   // valid argon2 PHC string. Prior shape called `verify(hashStr,
   // …)` and let @node-rs/argon2 throw immediately on a
@@ -61,14 +71,14 @@ export async function verifyPassword(
   // full argon2 budget regardless of the persistence detail.
   if (!hashStr.startsWith("$argon2")) {
     try {
-      await verify(await getDummyPasswordHash(), plaintext);
+      await verify(await getDummyPasswordHash(), candidate);
     } catch {
       // ignored
     }
     return false;
   }
   try {
-    return await verify(hashStr, plaintext);
+    return await verify(hashStr, candidate);
   } catch {
     return false;
   }
