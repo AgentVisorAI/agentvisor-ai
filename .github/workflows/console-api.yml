@@ -78,6 +78,14 @@ jobs:
           POSTGRES_USER: agentvisor
           POSTGRES_PASSWORD: devpw
           POSTGRES_DB: agentvisor
+          # Round-112 TZ guard: run the database in a non-UTC zone so
+          # any naive-timestamp vs timestamptz comparison (the class
+          # behind the zeroed /overview series and the 4.5h-stalled
+          # webhook retries, #377) regresses loudly — mixed casts go
+          # through the SESSION TimeZone, which only bites when the DB
+          # default isn't UTC.
+          TZ: America/New_York
+          PGTZ: America/New_York
         ports: ["5432:5432"]
         options: >-
           --health-cmd "pg_isready -U agentvisor"
@@ -89,6 +97,10 @@ jobs:
       JWT_SECRET: ci_only_secret_at_least_32_bytes_of_entropy_here_ok
       ALLOWED_ORIGINS: http://127.0.0.1:8787
       PORT: "8985"
+      # Round-112 TZ guard, server half: Node runs in a THIRD zone so
+      # server-local formatting can never masquerade as UTC in tests
+      # (runner is UTC, DB is New York, server is Tokyo).
+      TZ: Asia/Tokyo
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
