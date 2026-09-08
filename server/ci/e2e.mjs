@@ -53,12 +53,24 @@ try {
     const nfcPw = "unicode-Straße-pw-99".normalize("NFC");
     const nfdPw = nfcPw.normalize("NFD");
     const raw = async (path, body) => {
-      const r = await origFetch(`${API_BASE}${path}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Origin: "http://127.0.0.1:8787" },
-        body: JSON.stringify(body),
-      });
-      return { status: r.status, body: await r.json().catch(() => ({})) };
+      // Signup is capped 5/min/IP and this job runs smoke.py + e2e
+      // against one API on one IP — the two language-guard signups
+      // land in the same window and can draw 429 (they did, on the
+      // first main run after this block shipped). Honor Retry-After
+      // once; zero delay when there's headroom.
+      for (let attempt = 0; ; attempt++) {
+        const r = await origFetch(`${API_BASE}${path}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Origin: "http://127.0.0.1:8787" },
+          body: JSON.stringify(body),
+        });
+        if (r.status === 429 && attempt === 0) {
+          const wait = Number(r.headers.get("retry-after")) || 61;
+          await new Promise((res) => setTimeout(res, (wait + 1) * 1000));
+          continue;
+        }
+        return { status: r.status, body: await r.json().catch(() => ({})) };
+      }
     };
     const s1 = await raw("/api/v1/auth/signup", { email: nfdMail, password: nfdPw, orgName: "NFD Co" });
     check("unicode signup (NFD forms)", s1.status < 400, s1.status);
