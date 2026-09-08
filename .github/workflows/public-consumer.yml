@@ -184,5 +184,5 @@ jobs:
           [ "$(docker inspect avd --format '{{.State.ExitCode}}')" = "0" ]
           docker cp avd:/app/spool/atif/receipts /tmp/receipts
           ls /tmp/receipts/*.json
-          grep -q '"blocked":1' /tmp/receipts/*.json
+          grep -Eq '"blocked":[[:space:]]*1' /tmp/receipts/*.json
           docker rm avd
