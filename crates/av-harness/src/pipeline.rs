@@ -4373,14 +4373,23 @@ mod tests {
         .unwrap();
         let mut headers = HeaderMap::new();
         headers.insert(SESSION_HEADER, HeaderValue::from_static("budget-cleanup"));
-        state.prepare_chat(&headers, payload(), None).unwrap();
+        let mut prepared = state.prepare_chat(&headers, payload(), None).unwrap();
+        // Root cause of the intermittent CI-only failure (3× as of
+        // 2026-09-08, never in 40+ local runs): dropping the prepared
+        // request arms AdmissionDebit::drop, whose refund runs on the
+        // blocking pool and races the precondition read below — on a
+        // loaded runner the refund won and `observed` read Ok(0). The
+        // race also made the FINAL assert vacuous: a drop-refund zeroes
+        // the cells with no help from the finalizer. Disarm the debit
+        // exactly like a real dispatch (`take_for_dispatch`, the
+        // :4021 idiom) so the cells stay genuinely spent until
+        // `close_session` clears them — the behavior this test pins.
+        let _ = prepared.admission_debit.take_for_dispatch();
+        drop(prepared);
         let tokens_key = format!(
             "{}tokens",
             av_state::ActionBudget::session_prefix("budget-cleanup")
         );
-        // Intermittent CI-only failure (2× as of 2026-09-07, never in
-        // 40+ local runs): print the observed state so the next
-        // occurrence is diagnosable instead of a bare assert.
         let observed = store.get(&tokens_key);
         assert!(
             observed.as_ref().copied().unwrap_or(0) > 0,
