@@ -267,6 +267,7 @@ dependencies = [
  "clap",
  "futures",
  "hex",
+ "httpdate",
  "reqwest 0.12.28",
  "rpassword",
  "serde",
