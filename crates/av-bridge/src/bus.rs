@@ -268,6 +268,86 @@ mod tests {
     #[cfg(any(feature = "nats", feature = "kafka"))]
     use std::sync::Arc;
 
+    /// Round-21 mutation finding: every shipped backend overrides
+    /// `find_event_by_uid`, so the trait DEFAULT (the contract any
+    /// future backend inherits) had zero coverage — replacing its whole
+    /// body with `Ok(None)` survived, as did flipping the uid compare
+    /// and the no-progress guard. A future backend inheriting a broken
+    /// default would silently lose publish idempotency (dup events on
+    /// retry). Pin the default against a minimal in-memory bus that
+    /// deliberately does NOT override it.
+    struct DefaultLookupBus {
+        events: Vec<StoredEvent>,
+    }
+
+    impl EventBus for DefaultLookupBus {
+        fn publish(
+            &self,
+            _topic: &str,
+            _key: &str,
+            _value: &serde_json::Value,
+        ) -> Result<PublishAck, BusError> {
+            Err(BusError::Backend("publish unused in this test".to_owned()))
+        }
+        fn fetch(
+            &self,
+            _topic: &str,
+            _partition: u32,
+            offset: u64,
+            max: usize,
+        ) -> Result<Vec<StoredEvent>, BusError> {
+            Ok(self
+                .events
+                .iter()
+                .filter(|event| event.offset >= offset)
+                .take(max)
+                .cloned()
+                .collect())
+        }
+        fn partitions(&self, _topic: &str) -> Result<u32, BusError> {
+            Ok(1)
+        }
+        fn topics(&self) -> Vec<String> {
+            vec!["t".to_owned()]
+        }
+    }
+
+    fn stored(offset: u64, uid: &str) -> StoredEvent {
+        StoredEvent {
+            partition: 0,
+            offset,
+            key: "k".to_owned(),
+            value: serde_json::json!({"metadata": {"uid": uid}, "n": offset}),
+            stored_at: 0,
+        }
+    }
+
+    #[test]
+    fn default_find_event_by_uid_matches_exact_uid_only() {
+        let bus = DefaultLookupBus {
+            events: vec![stored(0, "uid-a"), stored(1, "uid-b"), stored(2, "uid-c")],
+        };
+        let hit = bus.find_event_by_uid("t", "k", "uid-b").unwrap();
+        assert_eq!(
+            hit.map(|ack| ack.offset),
+            Some(1),
+            "default lookup must find the exact uid at its offset"
+        );
+        assert!(
+            bus.find_event_by_uid("t", "k", "uid-missing").unwrap().is_none(),
+            "default lookup must return None for an absent uid, not a false ack"
+        );
+        // Empty bus: terminates with None (no progress-loop hang).
+        let empty = DefaultLookupBus { events: vec![] };
+        assert!(empty.find_event_by_uid("t", "k", "uid-a").unwrap().is_none());
+        // Default maintenance is an explicit no-op count.
+        assert_eq!(
+            bus.maintenance(0).unwrap(),
+            0,
+            "default maintenance must report zero work"
+        );
+    }
+
     #[test]
     fn partition_assignment_is_stable() {
         // Pinned values (FNV-1a 64 mod 8): changing the hash silently
