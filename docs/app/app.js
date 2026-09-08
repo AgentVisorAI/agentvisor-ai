@@ -2745,12 +2745,12 @@
     var evtSearch = $("#evtSearch");
     var activeKind = "";
     function applyEvtFilter() {
-      var q = ((evtSearch && evtSearch.value) || "").trim().toLowerCase();
+      var q = ((evtSearch && evtSearch.value) || "").trim().toLowerCase().normalize("NFC");
       var shown = 0;
       $$(".evt", evList).forEach(function (row) {
         var ev = events[parseInt(row.getAttribute("data-i"), 10)];
         var okKind = !activeKind || ev.kind === activeKind;
-        var hay = ((ev.tag || "") + " " + (ev.msg || "") + " " + (ev.sub || "") + " " + ev.kind).toLowerCase();
+        var hay = ((ev.tag || "") + " " + (ev.msg || "") + " " + (ev.sub || "") + " " + ev.kind).toLowerCase().normalize("NFC");
         var show = okKind && (!q || hay.indexOf(q) >= 0);
         row.classList.toggle("evt-hidden", !show);
         if (show) shown++;
@@ -6105,11 +6105,11 @@
       "</div>";
     var search = $("#auditSearch", root);
     function filtered() {
-      var q = ((search && search.value) || "").trim().toLowerCase();
+      var q = ((search && search.value) || "").trim().toLowerCase().normalize("NFC");
       return audit.filter(function (a) {
         if (activeCat && a.event.split(".")[0] !== activeCat) return false;
         if (!q) return true;
-        return (a.event + " " + a.actor + " " + (a.target || "") + " " + (a.note || "")).toLowerCase().indexOf(q) >= 0;
+        return (a.event + " " + a.actor + " " + (a.target || "") + " " + (a.note || "")).toLowerCase().normalize("NFC").indexOf(q) >= 0;
       });
     }
     function apply() {
@@ -6382,7 +6382,7 @@
     var list = backdrop.querySelector("#cmdkList");
     var selected = 0;
 
-    function fuzzyMatch(q, s) { s = s.toLowerCase(); q = q.toLowerCase(); var i = 0; for (var c of s) if (c === q[i]) i++; return i === q.length; }
+    function fuzzyMatch(q, s) { s = s.toLowerCase().normalize("NFC"); q = q.toLowerCase().normalize("NFC"); var i = 0; for (var c of s) if (c === q[i]) i++; return i === q.length; }
     // Rank: label prefix < label substring < desc substring < scattered
     // subsequence. Without this, "reset" selected "SeTtings" (its
     // letters appear in order) above the literal "Reset demo data".

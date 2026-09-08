@@ -52,7 +52,10 @@ async function authenticateDaemon(
 
 const sessionUpsert = z.object({
   externalId: z.string().min(1).max(128),
-  agent: z.string().min(1).max(80),
+  // Round-123: NFC like every other identity-ish string (#381 pattern)
+  // so server-side session search matches regardless of the daemon
+  // host's composition form.
+  agent: z.string().min(1).max(80).transform((v) => v.normalize("NFC")),
   workflow: z.enum(["signed", "unsigned"]).default("signed"),
   status: z.enum(["live", "sealed", "blocked"]).default("live"),
   // R161 F1: cap at 1M policy versions. Prior shape was

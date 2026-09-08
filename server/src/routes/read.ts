@@ -265,7 +265,7 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
         deploymentId: z.string().max(64).optional(),
         // Free-text filter. Server-side so filtering over the whole
         // fleet works at 1M+ sessions (not just the visible page).
-        q: z.string().max(200).optional(),
+        q: z.string().max(200).transform((v) => v.normalize("NFC")).optional(),
         // R131 F2: z.coerce.boolean() is Boolean(v) — any
         // non-empty string, INCLUDING the literal "false",
         // coerces to true. GET .../read/sessions?blockedOnly=false
