@@ -797,7 +797,12 @@ export function startWebhookSweeper(logger?: FastifyBaseLogger): void {
         SET status = 'pending'
         WHERE id IN (
           SELECT id FROM "webhook_deliveries"
-          WHERE status = 'retrying' AND "nextRetryAt" <= now()
+          -- Round-104 TZ fix: nextRetryAt is a naive-UTC timestamp
+          -- (Prisma DateTime); bare now() is timestamptz and the
+          -- comparison casts it through the SESSION TimeZone. With a
+          -- non-UTC database (TZ=America/New_York) retries stalled ~4-5
+          -- hours. Normalize now() to naive UTC explicitly.
+          WHERE status = 'retrying' AND "nextRetryAt" <= (now() AT TIME ZONE 'UTC')
           ORDER BY "nextRetryAt" ASC
           LIMIT 20
           FOR UPDATE SKIP LOCKED
