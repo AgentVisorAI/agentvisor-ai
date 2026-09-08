@@ -188,8 +188,13 @@ fn long_expired_token_is_rejected() {
     let claims = claims_with(iat, exp);
     let token = mint(&keys, &claims);
     match v.validate(&token) {
-        Err(IdentityError::Verification(_)) => {}
-        other => panic!("expected Verification/expired, got {other:?}"),
+        // Round-107: expiry surfaces exp/now (skew diagnosability)
+        // instead of the opaque Verification("ExpiredSignature").
+        Err(IdentityError::Expired { exp: e, now: n }) => {
+            assert_eq!(e, exp);
+            assert!(n >= now);
+        }
+        other => panic!("expected Expired, got {other:?}"),
     }
 }
 
