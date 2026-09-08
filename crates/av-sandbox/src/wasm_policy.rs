@@ -362,6 +362,35 @@ mod tests {
             err.contains("evaluate"),
             "error should name the missing export: {err}"
         );
+    }
+
+    #[test]
+    fn wrong_arity_abi_exports_rejected_at_load() {
+        // Round-18 mutation finding: the arity halves of the load-time
+        // ABI checks (`params == 1 && results == 1`, and evaluate's
+        // `2 && 1`) were unpinned — `&&` → `||` mutants survived, so a
+        // refactor could silently start accepting a policy whose
+        // `alloc`/`evaluate` exist under the right NAMES but the wrong
+        // SHAPES. Such a module loads, then every instantiation-time
+        // call fails closed — the deny-storm operability failure the
+        // load gate exists to prevent. Pin both wrong-arity refusals.
+        let alloc_wrong_arity = r#"(module
+            (memory (export "memory") 1)
+            (func (export "alloc") (param i32 i32) (result i32) (i32.const 2048))
+            (func (export "evaluate") (param i32 i32) (result i32) (i32.const 0)))"#;
+        let err = WasmPolicy::from_bytes("alloc-arity", alloc_wrong_arity.as_bytes())
+            .err()
+            .expect("load must fail on a 2-param alloc");
+        assert!(err.contains("alloc"), "error should name alloc: {err}");
+
+        let evaluate_wrong_arity = r#"(module
+            (memory (export "memory") 1)
+            (func (export "alloc") (param i32) (result i32) (i32.const 2048))
+            (func (export "evaluate") (param i32) (result i32) (i32.const 0)))"#;
+        let err = WasmPolicy::from_bytes("evaluate-arity", evaluate_wrong_arity.as_bytes())
+            .err()
+            .expect("load must fail on a 1-param evaluate");
+        assert!(err.contains("evaluate"), "error should name evaluate: {err}");
 
         // No exported memory.
         let no_memory = r#"(module
