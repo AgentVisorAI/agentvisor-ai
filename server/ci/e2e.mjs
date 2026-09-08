@@ -42,6 +42,34 @@ try {
   const me = await ds.getSession();
   check("session persisted", me && me.user.email === email, me?.user?.email);
 
+  // Round-115 language guard (#381/#385-class): the same visually
+  // identical credentials must work regardless of the client OS's
+  // Unicode composition form (Linux/browsers send NFC; macOS input
+  // paths often emit NFD). Uses raw fetch — the ds keeps cookies and
+  // we must not disturb the main session.
+  {
+    const nfcMail = `nfc-café-${Date.now()}@e2e.test`.normalize("NFC");
+    const nfdMail = nfcMail.normalize("NFD");
+    const nfcPw = "unicode-Straße-pw-99".normalize("NFC");
+    const nfdPw = nfcPw.normalize("NFD");
+    const raw = async (path, body) => {
+      const r = await origFetch(`${API_BASE}${path}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Origin: "http://127.0.0.1:8787" },
+        body: JSON.stringify(body),
+      });
+      return { status: r.status, body: await r.json().catch(() => ({})) };
+    };
+    const s1 = await raw("/api/v1/auth/signup", { email: nfdMail, password: nfdPw, orgName: "NFD Co" });
+    check("unicode signup (NFD forms)", s1.status < 400, s1.status);
+    const dup = await raw("/api/v1/auth/signup", { email: nfcMail, password: nfcPw, orgName: "Dup Co" });
+    check("NFC duplicate of NFD email refused", dup.status === 409, dup.status);
+    // NOTE: login answers 200 {mfaRequired:true} on WRONG creds too
+    // (anti-enumeration) — success is only proven by the user object.
+    const li = await raw("/api/v1/auth/login", { email: nfcMail, password: nfcPw });
+    check("cross-form login (NFC creds vs NFD signup)", !!li.body.user, JSON.stringify(li.body).slice(0, 60));
+  }
+
   const dep = await ds.createDeployment({name:"e2e-prod", environment:"production", region:"us-west-1"});
   check("createDeployment", !!dep.ingestToken && !!dep.deployment.id, dep.deployment.id);
   check("createDeployment.deployment.name", dep.deployment.name === "e2e-prod");
