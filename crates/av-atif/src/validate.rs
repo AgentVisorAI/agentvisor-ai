@@ -1890,6 +1890,65 @@ mod tests {
             ),
             "numeric content must be refused at any version"
         );
+
+        // Round-24 second pass: the wrong-type refusal trios
+        // (`!is_string() && !is_null()` shapes) and remaining version
+        // gates were still unpinned — table-drive them with the same
+        // doc builder. Each row: (step extras, issue needle).
+        let wrong_type_rows: Vec<(serde_json::Value, &str)> = vec![
+            (serde_json::json!({"reasoning_effort": true}), "reasoning_effort"),
+            (serde_json::json!({"model_name": 123}), "model_name"),
+            (
+                serde_json::json!({"is_copied_context": "yes"}),
+                "is_copied_context",
+            ),
+            (serde_json::json!({"reasoning_content": 7}), "reasoning_content"),
+            (
+                serde_json::json!({"tool_calls": [{"tool_call_id": "c1", "function_name": "f", "arguments": {}, "extra": {"k": 1}}]}),
+                "extra",
+            ),
+            (
+                serde_json::json!({"observation": {"results": [{"content": "x", "subagent_trajectory_ref": [{"trajectory_id": 9}]}]}}),
+                "must be a string",
+            ),
+            (
+                serde_json::json!({"observation": {"results": [{"content": "x", "subagent_trajectory_ref": [{"trajectory_path": ""}]}]}}),
+                "must set trajectory_id or trajectory_path",
+            ),
+        ];
+        for (extras, needle) in &wrong_type_rows {
+            assert!(
+                has_issue(&doc("1.6", extras.clone()), needle),
+                "expected issue containing {needle:?} for {extras}"
+            );
+        }
+        // And the acceptance side: correct types produce NO issue for
+        // the same needles (guards the `&&`→`||` direction).
+        let ok_rows: Vec<(serde_json::Value, &str)> = vec![
+            (
+                serde_json::json!({"reasoning_effort": "high"}),
+                "reasoning_effort",
+            ),
+            (serde_json::json!({"model_name": "gpt-x"}), "model_name"),
+            (
+                serde_json::json!({"is_copied_context": true}),
+                "is_copied_context",
+            ),
+            (
+                serde_json::json!({"reasoning_content": "chain"}),
+                "reasoning_content",
+            ),
+            (
+                serde_json::json!({"observation": {"results": [{"content": "x", "subagent_trajectory_ref": [{"trajectory_id": "sub-1"}]}]}}),
+                "must set trajectory_id",
+            ),
+        ];
+        for (extras, needle) in &ok_rows {
+            assert!(
+                !has_issue(&doc("1.7", extras.clone()), needle),
+                "well-typed {extras} must not trip {needle:?}"
+            );
+        }
     }
 
     #[test]
