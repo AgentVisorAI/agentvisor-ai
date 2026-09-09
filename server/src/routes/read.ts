@@ -780,8 +780,19 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
       // allocates + scans per request before isNaN redirects to
       // audit_invalid_before. ISO-8601 max is ~30 chars; 64 is
       // generous. Sibling of R131 F1's cursor cap on /audit.
+      //
+      // beforeId: compound continuation. The export sorts
+      // (at desc, id desc) and takes 10 000 rows; continuing with
+      // `at < before` alone SILENTLY DROPS every remaining row that
+      // shares the boundary timestamp (bulk imports and busy tenants
+      // routinely write same-millisecond entries). Passing the last
+      // row's id (now the first CSV column) resumes exactly:
+      // `at < before OR (at = before AND id < beforeId)`.
       const q = z
-        .object({ before: z.string().max(64).optional() })
+        .object({
+          before: z.string().max(64).optional(),
+          beforeId: z.string().max(64).optional(),
+        })
         .safeParse(req.query);
       if (!q.success) {
         return errRedirect("audit_invalid_before");
@@ -791,10 +802,21 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
         return errRedirect("audit_invalid_before");
       }
       const rows = await db.auditEntry.findMany({
-        where: { orgId: claims.orgId, at: { lt: before } },
+        where: {
+          orgId: claims.orgId,
+          ...(q.data.beforeId
+            ? {
+                OR: [
+                  { at: { lt: before } },
+                  { at: before, id: { lt: q.data.beforeId } },
+                ],
+              }
+            : { at: { lt: before } }),
+        },
         orderBy: [{ at: "desc" }, { id: "desc" }],
         take: 10_000,
         select: {
+          id: true,
           at: true,
           event: true,
           actorEmail: true,
@@ -910,11 +932,12 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
       // Windows. RFC 4180 is silent on BOMs; every mainstream parser
       // tolerates one.
       await writeChunk("\uFEFF");
-      await writeChunk("at,event,actor,target,ip,note,metadata\n");
+      await writeChunk("id,at,event,actor,target,ip,note,metadata\n");
       for (const r of rows) {
         if (clientClosed) break;
         const actor = r.actorEmail || (r.actorId ? "user:" + r.actorId : "system");
         const row = [
+          escape(r.id),
           r.at.toISOString(),
           escape(r.event),
           escape(actor),

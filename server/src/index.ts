@@ -343,6 +343,36 @@ async function main(): Promise<void> {
 
   app.addHook("preHandler", authenticate);
 
+  // Workspace-context pin. Switching workspaces replaces the
+  // browser-wide session cookie, so any mutating form/dialog still open
+  // in ANOTHER tab silently retargets its side effects at whichever org
+  // the cookie now names (retention changes, API keys, webhooks,
+  // policies, invites — generalizing the per-endpoint invite pin). The
+  // SPA stamps every request with the org id it is RENDERING
+  // (X-AV-Org); a mismatch against the authenticated claims means the
+  // context moved underneath the user and the mutation must not
+  // proceed. Scope: cookie-session mutations only — API-key sessions
+  // are org-fixed (no cross-tab cookie to race), scripts/daemons don't
+  // send the header, GETs merely re-render, and /auth/* must stay
+  // reachable from stale tabs (logout must always work; switch-org's
+  // entire purpose is changing the context).
+  app.addHook("preHandler", async (req, reply) => {
+    const method = req.method.toUpperCase();
+    if (method === "GET" || method === "HEAD" || method === "OPTIONS") return;
+    const pinned = req.headers["x-av-org"];
+    if (typeof pinned !== "string" || pinned.length === 0) return;
+    if (!req.session || req.session.sub.startsWith("apikey:")) return;
+    if (
+      typeof req.url === "string" &&
+      /^\/api\/v1\/(auth|ingest)(\/|\?|$)/.test(req.url)
+    ) {
+      return;
+    }
+    if (pinned !== req.session.orgId) {
+      return reply.code(409).send({ error: "org_context_changed" });
+    }
+  });
+
   // Echo the request-id back on every response (and every problem+json
   // error body) so ops can grep the logs from a customer's browser
   // console in one step. Fastify already generates req.id for logging;

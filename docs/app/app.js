@@ -44,6 +44,20 @@
     // actually came from instead of a reset list.
     lastList: {},
   };
+  // Live workspace-context pin for the datasource (see apiFetch's
+  // X-AV-Org stamp): a getter so the value ALWAYS reflects the org this
+  // tab is currently rendering — no sync calls to forget at the many
+  // state.session assignment sites. Another tab switching workspaces
+  // replaces the shared cookie; the server then 409s this tab's stale
+  // mutations instead of retargeting them.
+  try {
+    Object.defineProperty(window, "__avActiveOrgId", {
+      get: function () {
+        return state.session && state.session.org ? state.session.org.id : undefined;
+      },
+      configurable: true,
+    });
+  } catch (e) {}
   function rememberListUrl(section) {
     state.lastList[section] = location.hash || ("#/" + section);
   }

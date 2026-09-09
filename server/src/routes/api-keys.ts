@@ -151,18 +151,70 @@ export async function apiKeyRoutes(app: FastifyInstance): Promise<void> {
           select: { id: true, email: true },
         })
       : null;
-    const key = await db.apiKey.create({
-      data: {
-        orgId: claims.orgId,
-        name: body.data.name,
-        tokenHash,
-        tokenHint: plaintextBody.slice(0, 8),
-        role: body.data.role,
-        createdById: creatorUser?.id ?? null,
-        createdByEmail: creatorUser?.email ?? null,
-      },
-      select: { id: true, name: true, tokenHint: true, role: true, createdAt: true },
-    });
+    // In-flight authorization TOCTOU: between requireSession's check
+    // and this create, an owner can remove/demote the caller — the
+    // removal's key-revocation sweep only touches keys that EXIST, so
+    // a create that lands after the sweep hands the removed user a
+    // live credential. Re-validate the creator's CURRENT authority
+    // inside a SERIALIZABLE transaction with the create: any overlap
+    // with the removal/demotion tx aborts one side (P2034 → 409, the
+    // client retries into a clean refusal).
+    let key;
+    try {
+      key = await db.$transaction(
+        async (tx) => {
+          if (claims.sub.startsWith("apikey:")) {
+            const parentId = claims.sub.slice("apikey:".length);
+            const parent = await tx.apiKey.findFirst({
+              where: { id: parentId, orgId: claims.orgId, revokedAt: null },
+              select: { role: true },
+            });
+            if (
+              !parent ||
+              !canGrantRole(parent.role as SessionClaims["membershipRole"], body.data.role)
+            ) {
+              throw new Error("__creator_no_longer_authorized__");
+            }
+          } else {
+            const m = await tx.membership.findUnique({
+              where: { userId_orgId: { userId: claims.sub, orgId: claims.orgId } },
+              select: { role: true },
+            });
+            if (
+              !m ||
+              !canGrantRole(m.role as SessionClaims["membershipRole"], body.data.role)
+            ) {
+              throw new Error("__creator_no_longer_authorized__");
+            }
+          }
+          return tx.apiKey.create({
+            data: {
+              orgId: claims.orgId,
+              name: body.data.name,
+              tokenHash,
+              tokenHint: plaintextBody.slice(0, 8),
+              role: body.data.role,
+              createdById: creatorUser?.id ?? null,
+              createdByEmail: creatorUser?.email ?? null,
+            },
+            select: { id: true, name: true, tokenHint: true, role: true, createdAt: true },
+          });
+        },
+        { isolationLevel: "Serializable" },
+      );
+    } catch (e) {
+      if (e instanceof Error && e.message === "__creator_no_longer_authorized__") {
+        return reply.code(403).send({ error: "creator_no_longer_authorized" });
+      }
+      if (
+        typeof e === "object" &&
+        e !== null &&
+        (e as { code?: string }).code === "P2034"
+      ) {
+        return reply.code(409).send({ error: "conflict_retry" });
+      }
+      throw e;
+    }
     // R145 F3: enrich actor email via resolveActor.
     const createActor = await resolveActor(claims.sub);
     writeAudit(

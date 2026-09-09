@@ -434,6 +434,25 @@ try {
   const aud2 = await ds.listAudit({ limit: 2, cursor: aud1.nextCursor });
   check("audit cursor walk distinct", aud2.entries.length > 0 && aud2.entries[0].at !== aud1.entries[0].at);
 
+  // Workspace-context pin (header form): a mutation stamped with a
+  // stale X-AV-Org (another tab switched the shared cookie) must 409
+  // before side effects; the matching stamp passes. The real
+  // ApiDataSource's apiFetch reads window.__avActiveOrgId — set it the
+  // way the SPA's live getter would.
+  {
+    const sess = await ds.getSession();
+    globalThis.window.__avActiveOrgId = "org_stale_from_other_tab";
+    let pinErr = "";
+    try { await ds.createApiKey("pin-probe-stale"); }
+    catch (e) { pinErr = e.errorCode || e.message; }
+    check("stale X-AV-Org mutation refused", pinErr === "org_context_changed", pinErr);
+    globalThis.window.__avActiveOrgId = sess.org.id;
+    const pinOkKey = await ds.createApiKey("pin-probe-live");
+    check("matching X-AV-Org mutation ok", !!(pinOkKey && pinOkKey.key), JSON.stringify(pinOkKey).slice(0, 80));
+    await ds.revokeApiKey(pinOkKey.key.id);
+    delete globalThis.window.__avActiveOrgId;
+  }
+
   await ds.logout();
   const s2 = await ds.getSession();
   check("logout clears session", s2 === null);

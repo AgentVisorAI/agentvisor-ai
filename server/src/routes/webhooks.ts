@@ -389,13 +389,22 @@ export async function webhookRoutes(app: FastifyInstance): Promise<void> {
       if (!delivery) return reply.code(404).send({ error: "delivery_not_found" });
       // Only failed / delivered deliveries can be manually
       // redelivered. Retrying is already the sweeper's job; a
-      // pending row is mid-flight. Guarding here prevents an
-      // impatient operator from stacking retries.
+      // pending row is mid-flight. The status must be checked IN the
+      // update's WHERE (conditional claim), not read-then-written:
+      // two concurrent redeliver clicks both read `failed`, the first
+      // update lands and a worker claims the row as `pending` — the
+      // second's unconditional update then overwrote the active claim
+      // back to `retrying`, letting a second worker pick up the same
+      // delivery concurrently (duplicate outbound delivery, the exact
+      // stacking the guard exists to prevent).
       if (delivery.status === "pending" || delivery.status === "retrying") {
         return reply.code(409).send({ error: "delivery_already_in_flight" });
       }
-      await db.webhookDelivery.update({
-        where: { id: delivery.id },
+      const claimed = await db.webhookDelivery.updateMany({
+        where: {
+          id: delivery.id,
+          status: { in: ["failed", "delivered"] },
+        },
         data: {
           status: "retrying",
           nextRetryAt: new Date(),
@@ -416,6 +425,11 @@ export async function webhookRoutes(app: FastifyInstance): Promise<void> {
           attempt: 0,
         },
       });
+      if (claimed.count === 0) {
+        // Raced: the row left failed/delivered between our read and
+        // the conditional update (another redeliver or the sweeper).
+        return reply.code(409).send({ error: "delivery_already_in_flight" });
+      }
       writeAudit(
         {
           orgId: claims.orgId,

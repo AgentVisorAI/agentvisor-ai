@@ -1,5 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import { requireSession } from "../lib/session-middleware.js";
+import { ipMatchesAny } from "../lib/cidr.js";
 import { bus, type EventPayload } from "../lib/bus.js";
 import { db } from "../db.js";
 import { env } from "../env.js";
@@ -205,17 +206,28 @@ export async function streamRoutes(app: FastifyInstance): Promise<void> {
     // saturation are avoided.
     const MAX_CONSECUTIVE_REVALIDATE_ERRORS = 2;
     const MIN_MS_BETWEEN_FAILED_REVALIDATES = 60_000;
+    // Peer address captured at connect (same trustProxy-resolved value
+    // requireSession's allowlist gate used); the socket doesn't move,
+    // so re-checks compare the CURRENT allowlist against this address.
+    const connectIp = req.ip;
     let consecutiveErrors = 0;
     let lastErrorAt = 0;
     const revalidate = async (): Promise<boolean> => {
       try {
+        // Cookie expiry: jose enforces `exp` per REQUEST, but this
+        // stream verifies once at connect and then lives for hours —
+        // without this check a tab opened just before expiry kept
+        // receiving tenant events indefinitely.
+        if (typeof claims.exp === "number" && Date.now() / 1000 > claims.exp) {
+          return false;
+        }
         const user = await db.user.findUnique({
           where: { id: claims.sub },
           select: {
             sessionRevokedAt: true,
             memberships: {
               where: { orgId: claims.orgId },
-              select: { id: true },
+              select: { id: true, org: { select: { ipAllowlist: true } } },
             },
           },
         });
@@ -223,15 +235,21 @@ export async function streamRoutes(app: FastifyInstance): Promise<void> {
         lastErrorAt = 0;
         if (!user) return false;
         if (user.memberships.length === 0) return false;
+        // Org IP allowlist: requireSession enforced the allowlist AT
+        // CONNECT; an owner tightening it afterwards expects existing
+        // access from newly-excluded addresses to stop, and every
+        // REST call does — only the already-open stream kept flowing.
+        // Re-check the CURRENT allowlist against the connect-time
+        // peer address on every tick.
+        const cidrs = user.memberships[0]?.org.ipAllowlist ?? [];
+        if (cidrs.length > 0 && !ipMatchesAny(connectIp, cidrs)) {
+          return false;
+        }
         if (
           user.sessionRevokedAt &&
-          // R210 F1: same second-precision fix as
-          // session-middleware.ts:102-105 — see that file for
-          // full rationale. Comparing seconds-boundary iat
-          // against millisecond-precision revokedAt refused
-          // same-wall-clock-second logouts→logins as dead JWTs
-          // until the next second ticked over.
-          claims.iat < Math.floor(user.sessionRevokedAt.getTime() / 1000)
+          // Millisecond-exact fence — same comparison as
+          // session-middleware.ts (see rationale there).
+          claims.iatMs < user.sessionRevokedAt.getTime()
         ) {
           return false;
         }

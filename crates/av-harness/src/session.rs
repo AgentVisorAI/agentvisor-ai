@@ -1132,7 +1132,16 @@ impl SessionRegistry {
             .sessions
             .iter()
             .filter(|entry| {
-                entry.close_complete_flag()
+                // artifact_committed is the terminal flag the
+                // capture-failed close path sets (close_session_locked
+                // seals the session and returns CaptureIncomplete
+                // WITHOUT ever reaching mark_close_complete — that
+                // marker belongs to successful closes). Requiring
+                // close_complete here meant NO capture-failed session
+                // ever qualified: the cap existed but matched nothing,
+                // and sustained capture failures grew the registry
+                // without bound.
+                entry.artifact_committed_flag()
                     && entry.capture_failed()
                     && entry.active_streams.load(Ordering::Acquire) == 0
                     && entry.pending_jobs.load(Ordering::Acquire) == 0
@@ -2079,6 +2088,51 @@ mod tests {
         assert!(r.get("empty-1").is_none());
         assert!(r.get("empty-2").is_some(), "under-cap quarantines stay resident");
         assert!(r.get(&format!("empty-{}", CAP + 1)).is_some());
+    }
+
+    /// The capture-failed overflow cap must MATCH the state the
+    /// capture-failed close path actually leaves behind:
+    /// `close_session_locked` seals with `mark_artifact_committed` and
+    /// returns `CaptureIncomplete` WITHOUT ever calling
+    /// `mark_close_complete` (that marker belongs to successful
+    /// closes). The old predicate required `close_complete_flag`, so
+    /// the cap matched NOTHING — sustained capture failures (a flaky
+    /// disk, a crashing bridge) grew the registry without bound for
+    /// the life of the process.
+    #[test]
+    fn evict_finalized_caps_capture_failed_sessions() {
+        let r = SessionRegistry::new();
+        const CAP: usize = 4096;
+        for n in 0..CAP + 2 {
+            let s = r.get_or_open(
+                &format!("cf-{n}"),
+                Workflow::Signed,
+                &identity(),
+                &Default::default(),
+            );
+            s.mark_capture_failed();
+            s.try_close();
+            // Mirror close_session_locked's capture-failed arm:
+            // artifact_committed set, close_complete NEVER set.
+            s.mark_artifact_committed();
+            s.set_idle_for_testing(10);
+        }
+        r.get("cf-0").unwrap().set_idle_for_testing(100);
+        r.get("cf-1").unwrap().set_idle_for_testing(50);
+
+        let evicted = r.evict_finalized(u64::MAX);
+        let mut evicted_ids: Vec<String> = evicted.iter().map(|s| s.id.clone()).collect();
+        evicted_ids.sort();
+        assert_eq!(
+            evicted_ids,
+            vec!["cf-0".to_owned(), "cf-1".to_owned()],
+            "exactly the two oldest over-cap capture-failed sessions are evicted",
+        );
+        assert!(
+            r.get("cf-2").is_some(),
+            "under-cap capture-failed sessions stay resident"
+        );
+        assert!(r.get(&format!("cf-{}", CAP + 1)).is_some());
     }
 
     /// A session touched millions of times a second under normal operation

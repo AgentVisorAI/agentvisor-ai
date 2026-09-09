@@ -1692,6 +1692,21 @@ impl HarnessConfig {
                 errors.push(format!("upstream_url has no host, got {:?}", self.upstream_url));
             }
         }
+        // The chat/tool paths are CONCATENATED onto this base
+        // (`format!("{upstream_url}/v1/chat/completions")` in
+        // pipeline.rs), so a base carrying a query or fragment
+        // silently swallows them: `http://host/#x` + `/v1/...` puts
+        // the entire path inside the fragment and the actual request
+        // targets `/` — validation passed, boot succeeded, and every
+        // completion quietly hit the wrong endpoint. Refuse at
+        // startup like every other config-shape problem.
+        if self.upstream_url.contains(['?', '#']) {
+            errors.push(format!(
+                "upstream_url must not carry a query or fragment (request paths are \
+                 appended to it), got {:?}",
+                self.upstream_url
+            ));
+        }
         if let Some(tool_upstream) = &self.tool_upstream_url {
             // Empty is rejected rather than treated as unset: routing gates
             // tool forwarding on `is_some()` (routes.rs), so an empty string
@@ -3246,6 +3261,29 @@ spec:
                 "{url}: {err}"
             );
         }
+    }
+
+    /// Request paths are CONCATENATED onto `upstream_url`
+    /// (`format!("{base}/v1/chat/completions")`), so a base carrying a
+    /// query or fragment silently swallows the path: `http://h/#x` +
+    /// `/v1/...` targets `/` with everything after `#` treated as a
+    /// fragment. That misconfiguration used to validate + boot and
+    /// only misbehave per-request. `tool_upstream_url` stays exempt:
+    /// it is posted WHOLE, so a query there is legitimate.
+    #[test]
+    fn upstream_url_rejects_query_and_fragment() {
+        for url in ["http://127.0.0.1:9000/#oops", "https://api.example.com/?tenant=1"] {
+            let err = HarnessConfig::from_toml(&format!("upstream_url = \"{url}\"")).unwrap_err();
+            assert!(
+                err.contains("upstream_url") && err.contains("query or fragment"),
+                "{url}: {err}"
+            );
+        }
+        // A query on tool_upstream_url (posted whole) stays legal.
+        HarnessConfig::from_toml(
+            "upstream_url = \"https://api\"\ntool_upstream_url = \"http://tools/mcp?fmt=json\"",
+        )
+        .unwrap();
     }
 
     /// A seconds interval > 1 day is almost certainly a unit-conversion

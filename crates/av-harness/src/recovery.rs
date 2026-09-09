@@ -393,6 +393,19 @@ impl RecoveryPass for QuarantineOrphanJsonPass {
                 {
                     continue;
                 }
+                // Sealed pairs (sidecar present) are this pass's
+                // steady-state population and a zero-work skip; they
+                // must not consume the real-work budget. Counting them
+                // let ~MAX_RECOVERY_ENTRIES_PER_TICK retained sealed
+                // artifacts enumerated ahead of an aged orphan starve
+                // that orphan out of EVERY tick forever (stable
+                // directory order + per-tick budget reset). Count only
+                // sidecar-less candidates that reach the stat + age
+                // work below; the dirent cap above still bounds the
+                // whole walk.
+                if path.with_extension("atif-auth").exists() {
+                    continue;
+                }
                 examined = examined.saturating_add(1);
                 if examined > crate::reconciler::MAX_RECOVERY_ENTRIES_PER_TICK {
                     crate::reconciler::bump_recovery_scan_cap(
@@ -402,9 +415,6 @@ impl RecoveryPass for QuarantineOrphanJsonPass {
                         dirents_seen,
                     );
                     break;
-                }
-                if path.with_extension("atif-auth").exists() {
-                    continue;
                 }
                 let age = tokio::fs::metadata(&path)
                     .await

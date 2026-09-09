@@ -1662,15 +1662,6 @@ impl Finalizer {
             {
                 continue;
             }
-            // Real-work cap: count only entries that made it past the
-            // extension + `.session.json` filter, so wrong-extension
-            // junk cannot consume the pass's real-work budget for
-            // this tick.
-            examined = examined.saturating_add(1);
-            if examined > MAX_RECOVERY_ENTRIES_PER_TICK {
-                bump_recovery_scan_cap(&self.metrics, "adopt_strict_atif", examined, dirents_seen);
-                break;
-            }
             // The session is already in the
             // registry — adoption would skip it after an expensive
             // read+parse+validate; skip on the stem match instead.
@@ -1698,6 +1689,19 @@ impl Finalizer {
             // unauthenticated bytes are never read or parsed.
             if !path.with_extension("atif-auth").exists() {
                 continue;
+            }
+            // Real-work cap, counted only for entries that reach the
+            // expensive read+parse+validate below. Counting the cheap
+            // skips (already-registered stems, sidecar-less remnants)
+            // let a steady-state spool of ~MAX_RECOVERY_ENTRIES_PER_TICK
+            // retained artifacts permanently starve any adoptable
+            // artifact enumerated after them — same budget-starvation
+            // shape as the QuarantineOrphanJsonPass counter fix; the
+            // dirent cap still bounds the whole walk.
+            examined = examined.saturating_add(1);
+            if examined > MAX_RECOVERY_ENTRIES_PER_TICK {
+                bump_recovery_scan_cap(&self.metrics, "adopt_strict_atif", examined, dirents_seen);
+                break;
             }
             // Bounded read: a hostile ATIF file cannot force recovery to
             // buffer arbitrary bytes. The size cap catches the coarsest
@@ -8970,12 +8974,14 @@ mod tests {
         );
     }
 
-    /// R25: the ENTRIES cap fires on entries that PASSED the
-    /// extension filter — legitimate matching artifacts beyond the
-    /// per-tick real-work cap are deferred to the next tick. This
-    /// separates "wrong-extension junk" (wall-time bounded by the
-    /// dirent cap) from "matching artifacts under legitimate load"
-    /// (real-work bounded by the entries cap).
+    /// R25: the ENTRIES cap fires on entries that reach the REAL WORK
+    /// (read+parse+validate) — legitimate adoption candidates beyond
+    /// the per-tick cap are deferred to the next tick. Cheap skips
+    /// (wrong extension, `.session.json`, already-registered stems,
+    /// sidecar-less remnants) must NOT consume the real-work budget:
+    /// counting them let a steady-state spool of retained artifacts
+    /// permanently starve any candidate enumerated after them, so
+    /// they are bounded by the dirent cap instead.
     #[tokio::test]
     async fn recovery_scan_entries_cap_fires_on_matching_entries_flood() {
         let temp = tempfile::tempdir().unwrap();
@@ -8987,21 +8993,23 @@ mod tests {
             Arc::clone(&metrics),
         );
 
-        // Plant MAX_RECOVERY_ENTRIES_PER_TICK + 100 files that pass
-        // the `.json` extension filter but fail the `.session.json`
-        // secondary filter (so they DO consume the entries cap, but
-        // don't need to be sealed metadata to reach that point).
-        // `adopt_strict_atif_artifacts` counts them, hits the
-        // per-tick entries cap, breaks, bumps counter.
+        // Plant MAX_RECOVERY_ENTRIES_PER_TICK + 100 adoption
+        // CANDIDATES: unregistered `.json` artifacts WITH a provenance
+        // sidecar, so each consumes one real-work slot (the empty body
+        // then fails the read/parse step → warn+continue — the cap is
+        // about work reached, not work succeeded).
         let overshoot = MAX_RECOVERY_ENTRIES_PER_TICK + 100;
         for i in 0..overshoot {
-            // Legitimately-shaped .json files (not .session.json)
-            // that fail deeper validation → each one consumes
-            // exactly one `examined` slot before falling through
-            // to the read+parse+validate path where an empty file
-            // errors out (warn+continue in adopt_strict_atif).
             let stem = format!("{:032x}", i);
             std::fs::write(spool.join(format!("{stem}.json")), b"").unwrap();
+            std::fs::write(spool.join(format!("{stem}.atif-auth")), b"provenance").unwrap();
+        }
+        // Sidecar-less remnants are cheap skips: plant a pile and
+        // assert they do NOT contribute to the real-work count (the
+        // cap still fires exactly once from the candidates alone, and
+        // planting these ahead of candidates must not starve them).
+        for i in 0..50 {
+            std::fs::write(spool.join(format!("{:032x}.json", 0x1000_0000 + i)), b"").unwrap();
         }
 
         let sessions = SessionRegistry::new();

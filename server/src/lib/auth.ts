@@ -108,7 +108,27 @@ export interface SessionClaims {
   sub: string; // user id
   orgId: string; // active org
   membershipRole: "owner" | "admin" | "member";
-  iat: number; // JWT issued-at, seconds since epoch — checked against user.sessionRevokedAt
+  iat: number; // JWT issued-at, seconds since epoch
+  /**
+   * Millisecond-precision issue instant (custom claim; `iat` is
+   * spec-bound to whole seconds). The revocation fence
+   * (`user.sessionRevokedAt`) is a millisecond timestamp: comparing it
+   * against a SECONDS-floored iat left every JWT minted earlier in the
+   * same wall-clock second as a fence bump alive — an owner demoting
+   * an admin (or a password reset revoking sessions) did not kill a
+   * cookie minted in that same second, and the stale privileged claim
+   * rode out its whole TTL. Verified fallback for cookies minted
+   * before this claim existed: `iat * 1000` (their in-second precision
+   * is unknowable; the old semantics apply until they expire).
+   */
+  iatMs: number;
+  /**
+   * JWT expiry, seconds since epoch. jose enforces it at verification
+   * time for every REQUEST, but long-lived consumers (the SSE stream)
+   * verify once at connect and then hold the claims for hours — they
+   * must re-check expiry themselves on their revalidation ticks.
+   */
+  exp?: number;
   /**
    * Present iff this session was minted by a TENANT-configured IdP
    * (SAML): the org whose IdP asserted the identity. Such a session is
@@ -154,8 +174,8 @@ export function canGrantRole(
 
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 7; // 7 days
 
-export async function mintSession(claims: Omit<SessionClaims, "iat">): Promise<string> {
-  return new SignJWT({ ...claims })
+export async function mintSession(claims: Omit<SessionClaims, "iat" | "iatMs" | "exp">): Promise<string> {
+  return new SignJWT({ ...claims, iatMs: Date.now() })
     .setProtectedHeader({ alg: "HS256", typ: "JWT" })
     .setIssuer(env.JWT_ISSUER)
     .setAudience(env.JWT_AUDIENCE)
@@ -188,6 +208,10 @@ export async function verifySession(
       orgId: payload.orgId,
       membershipRole: payload.membershipRole,
       iat: payload.iat,
+      // Pre-iatMs cookies (rolling deploy) fall back to the seconds
+      // floor — old fence semantics until those cookies expire.
+      iatMs: typeof payload.iatMs === "number" ? payload.iatMs : payload.iat * 1000,
+      ...(typeof payload.exp === "number" ? { exp: payload.exp } : {}),
       // Optional SAML org pin — see SessionClaims. Non-string values
       // (absent on password/passkey/OIDC sessions) stay absent.
       ...(typeof payload.ssoOrgId === "string" ? { ssoOrgId: payload.ssoOrgId } : {}),

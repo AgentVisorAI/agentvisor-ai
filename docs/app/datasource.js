@@ -2224,6 +2224,17 @@
     // ensures forgery via a form POST fails even if a proxy strips
     // Origin/Referer along the way.
     headers["X-Requested-With"] = "fetch";
+    // Workspace-context pin: stamp every request with the org this tab
+    // is rendering. Switching workspaces in ANOTHER tab replaces the
+    // browser-wide cookie; the server refuses mutations whose pin
+    // disagrees with the cookie's org (409 org_context_changed) so a
+    // stale tab's dialog can't retarget its side effects. app.js
+    // updates window.__avActiveOrgId on login/session-load/org-switch.
+    try {
+      if (typeof window !== "undefined" && window.__avActiveOrgId) {
+        headers["X-AV-Org"] = window.__avActiveOrgId;
+      }
+    } catch (e) {}
     var res = await fetch(apiUrl(path), {
       method: opts.method || "GET",
       credentials: "include",
