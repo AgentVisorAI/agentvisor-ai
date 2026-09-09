@@ -19,7 +19,7 @@ fn signed_receipt() -> (Receipt, String) {
         receipt_id: "rcpt-0001".to_owned(),
         session_id: "sess-0001".to_owned(),
         issued_at: 1_700_000_000_000,
-        issued_at_iso: "2023-11-14T22:13:20Z".to_owned(),
+        issued_at_iso: "2023-11-14T22:13:20.000Z".to_owned(),
         ai_agent: av_events::AgentIdentity {
             version: "1.0".to_owned(),
             charter: "billing".to_owned().into(),

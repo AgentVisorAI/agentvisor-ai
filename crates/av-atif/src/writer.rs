@@ -116,6 +116,14 @@ impl TrajectoryBuilder {
                 .ok_or(av_core::CoreError::Overflow {
                     context: "total_cached_tokens",
                 })?;
+            // JCS-safe bound alongside the overflow checks: receipt
+            // bodies canonicalize via JCS, which refuses integers past
+            // 2^53 — a builder-accepted total above the bound produced
+            // a strict-valid trajectory the daemon's recovery then
+            // refused to fold (unrecoverable-by-construction evidence).
+            av_core::error::check_jcs_safe(next_prompt)?;
+            av_core::error::check_jcs_safe(next_completion)?;
+            av_core::error::check_jcs_safe(next_cached)?;
             // Reject a non-finite or negative cost the same way tokens are
             // rejected on overflow: without this the aggregate silently
             // saturates to +∞ (or drifts negative), and a downstream Strict
@@ -362,7 +370,19 @@ mod tests {
         let mut b = TrajectoryBuilder::new(agent(), None);
         let mut s = step(Source::Agent);
         s.metrics = Some(metrics(u64::MAX, 0, 0, 0.0));
-        b.push_step(s).unwrap();
+        // u64::MAX is already past the JCS-safe bound: the first push
+        // must refuse (receipt bodies canonicalize via JCS, which
+        // rejects integers above 2^53 — accepting the step here made
+        // the artifact unrecoverable-by-construction downstream).
+        assert!(
+            b.push_step(s).is_err(),
+            "JCS-unsafe totals must refuse at the builder"
+        );
+        // Exactly AT the JCS bound (2^53) is accepted; one more token
+        // then trips the same JCS gate LOUDLY instead of wrapping.
+        let mut s_ok = step(Source::Agent);
+        s_ok.metrics = Some(metrics(9_007_199_254_740_992, 0, 0, 0.0));
+        b.push_step(s_ok).unwrap();
         let mut s2 = step(Source::Agent);
         s2.metrics = Some(metrics(1, 0, 0, 0.0));
         assert!(b.push_step(s2).is_err(), "overflow must not wrap silently");

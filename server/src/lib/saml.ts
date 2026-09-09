@@ -417,10 +417,27 @@ export async function consumeSamlResponse(
   // CSRF). The relayed Response's request id maps to a nonce minted
   // into the ATTACKER's browser, never the victim's. One-use: the
   // mapping dies on first consumption whatever the outcome.
-  // (validateInResponseTo=always guarantees `slot.consumed` on
-  // success; treat its absence as the same failure, fail-closed.)
-  const expectedTxn = slot.consumed ? txnNonceByRequestId.get(slot.consumed) : undefined;
-  if (slot.consumed) txnNonceByRequestId.delete(slot.consumed);
+  //
+  // node-saml consumes (removeAsync) the request id on MOST paths, but
+  // an assertion whose bearer SubjectConfirmationData is present with
+  // the InResponseTo ATTRIBUTE absent validates without any cache
+  // consumption (saml.js processValidlySignedAssertionAsync — the
+  // Response-level InResponseTo was get-checked only). The SAML Web
+  // SSO profile mandates the attribute, but a nonconformant IdP that
+  // logged in fine before this binding existed must not become
+  // permanently txn_mismatch-locked: fall back to the VALIDATED
+  // Response's InResponseTo (profile.inResponseTo) and burn it from
+  // the store ourselves, preserving one-use semantics either way.
+  let consumedRequestId = slot.consumed;
+  if (consumedRequestId === undefined) {
+    const responseInResponseTo = profile["inResponseTo"];
+    if (typeof responseInResponseTo === "string" && requestIdStore.has(responseInResponseTo)) {
+      requestIdStore.delete(responseInResponseTo);
+      consumedRequestId = responseInResponseTo;
+    }
+  }
+  const expectedTxn = consumedRequestId ? txnNonceByRequestId.get(consumedRequestId) : undefined;
+  if (consumedRequestId) txnNonceByRequestId.delete(consumedRequestId);
   const presentedBuf = Buffer.from(presentedTxnNonce ?? "", "utf8");
   const expectedBuf = Buffer.from(expectedTxn?.nonce ?? "", "utf8");
   if (

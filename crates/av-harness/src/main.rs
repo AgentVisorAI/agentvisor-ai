@@ -1975,6 +1975,20 @@ fn install_seed_exclusive(path: &Path, encoded: &str) -> Result<bool> {
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             // Guard drop below unlinks the tmp — no explicit remove
             // needed. Same for the generic Err arm.
+            //
+            // Re-establish dirent durability on EVERY boot that finds
+            // the seed already installed: the hard-fail arm above tells
+            // the operator a restart retries the durability sync, and
+            // this is where that retry actually happens (it also heals
+            // installs from builds that only warned). One fsync per
+            // boot — noise-free.
+            if let Err(sync_error) = av_core::fsutil::sync_directory(parent) {
+                return Err(anyhow::Error::new(sync_error).context(format!(
+                    "signing seed exists at {} but its parent directory fsync failed; \
+                     the seed file is intact — do NOT delete it; restart to retry",
+                    path.display()
+                )));
+            }
             Ok(false)
         }
         Err(error) => Err(error).with_context(|| format!("install signing seed {}", path.display())),

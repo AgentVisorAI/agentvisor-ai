@@ -188,13 +188,25 @@ async fn run_once(config: &ResolvedSyncConfig, dry_run: bool) -> Result<SyncSumm
 
     let mut bridge_failed = false;
     let mut bridge_incomplete = false;
+    // Sessions whose sync this pass was interrupted mid-delivery (the
+    // console dropped a batch): their receipts must defer and the
+    // global offset advance must hold, regardless of what the seq
+    // watermark claims (see BridgeSyncOutcome::fully_acked — the old
+    // watermark inference let a session's HISTORICAL high seq mask a
+    // drop that happened THIS pass, banking offsets past the dropped
+    // records forever).
+    let mut bridge_partial_sessions: std::collections::HashSet<String> = std::collections::HashSet::new();
     for candidate in bridge_candidates.candidates {
         summary.attempted += 1;
         let session_id = candidate.session.external_id.clone();
         match sync_bridge_candidate(&client, &mut state, candidate).await {
-            Ok(did_change) => {
+            Ok(outcome) => {
                 summary.succeeded += 1;
-                changed |= did_change;
+                changed |= outcome.changed;
+                if !outcome.fully_acked {
+                    bridge_incomplete = true;
+                    bridge_partial_sessions.insert(session_id.clone());
+                }
                 // A console-sealed session's remaining bridge records are
                 // terminally unconsumable — banking their offsets is
                 // correct and must not hold the global advance hostage.
@@ -204,6 +216,9 @@ async fn run_once(config: &ResolvedSyncConfig, dry_run: bool) -> Result<SyncSumm
                     .is_some_and(|session| session.receipt_synced);
                 if !sealed {
                     if let Some(max_seq) = bridge_pending_max_seq.get(&session_id) {
+                        // Defense-in-depth alongside fully_acked: also
+                        // hold the advance when the watermark says this
+                        // pass's pending events were not reached.
                         let (acknowledged, _, _) = acknowledged_through(&state, &session_id, *max_seq);
                         bridge_incomplete |= !acknowledged;
                     }
@@ -235,6 +250,20 @@ async fn run_once(config: &ResolvedSyncConfig, dry_run: bool) -> Result<SyncSumm
             eprintln!(
                 "warning: deferring receipt for {} — its event sync failed this pass and \
                  sealing would lock the missing events out permanently",
+                sanitize_for_terminal(&candidate.session_external_id)
+            );
+            continue;
+        }
+        // Pass-local delivery truth: the console dropped part of this
+        // session's bridge events THIS pass (clock skew). The seq-
+        // watermark gate below cannot see that — a historical high seq
+        // satisfies it — so sealing here would lock the dropped
+        // evidence out permanently.
+        if bridge_partial_sessions.contains(&candidate.session_external_id) {
+            summary.receipts_skipped += 1;
+            eprintln!(
+                "warning: deferring receipt for {} — the console dropped part of its bridge \
+                 events this pass; sealing now would lock that evidence out permanently",
                 sanitize_for_terminal(&candidate.session_external_id)
             );
             continue;
@@ -462,7 +491,7 @@ async fn sync_bridge_candidate(
     client: &ConsoleClient,
     state: &mut SyncState,
     candidate: BridgeSessionCandidate,
-) -> Result<bool> {
+) -> Result<BridgeSyncOutcome> {
     // Console-side seal is terminal — mirror the ATIF path's skip so a
     // post-seal bridge record can't make this session churn (and, via
     // the global bridge_incomplete flag, wedge offset progress for
@@ -472,24 +501,29 @@ async fn sync_bridge_candidate(
         .get(&candidate.session.external_id)
         .is_some_and(|session| session.receipt_synced)
     {
-        return Ok(false);
+        return Ok(BridgeSyncOutcome {
+            changed: false,
+            fully_acked: true,
+        });
     }
     let _: serde_json::Value = client.post_json("sessions", &candidate.session).await?;
     let mut events: Vec<IngestEvent> = candidate.events;
     // NO seq-watermark filter here, unlike the ATIF path: bridge seqs
-    // are `topic_idx × 1e6 + offset` — NOT chronological — so one
-    // high-base event (e.g. agent.compression at 3e6) raised the
-    // session watermark above every later low-base event (a session
-    // close at seq 1, tool calls at 1e6+x) and silently discarded them
-    // while the offset cursor advanced past their records: permanently
-    // missing evidence, then sealed by the receipt gate. The
+    // are offset-derived (see `bridge_seq`) — NOT chronological across
+    // topics — so one high-seq event raised the session watermark above
+    // every later lower-seq event and silently discarded them while the
+    // offset cursor advanced past their records: permanently missing
+    // evidence, then sealed by the receipt gate. The
     // per-(topic,partition) OFFSET cursor is the bridge watermark;
     // re-posts inside an unadvanced window are deduped server-side by
     // (sessionId, seq).
     events.sort_by_key(|event| event.seq);
     events.dedup_by_key(|event| event.seq);
     if events.is_empty() {
-        return Ok(false);
+        return Ok(BridgeSyncOutcome {
+            changed: false,
+            fully_acked: true,
+        });
     }
 
     let mut changed = false;
@@ -506,7 +540,9 @@ async fn sync_bridge_candidate(
             );
             // Terminal on the console — record it (mirrors the ATIF
             // path) so this session stops being rebuilt and stops
-            // holding the global offset advance hostage.
+            // holding the global offset advance hostage. Terminal ⇒
+            // counts as fully acked: the remaining records are
+            // unconsumable by design and their offsets must bank.
             let session_state = state
                 .sessions
                 .entry(candidate.session.external_id.clone())
@@ -514,7 +550,10 @@ async fn sync_bridge_candidate(
             session_state.receipt_synced = true;
             session_state.synced_any = true;
             changed = true;
-            break;
+            return Ok(BridgeSyncOutcome {
+                changed,
+                fully_acked: true,
+            });
         }
         if response.dropped_future.unwrap_or(0) > 0 || response.dropped_ancient.unwrap_or(0) > 0 {
             eprintln!(
@@ -525,7 +564,19 @@ async fn sync_bridge_candidate(
             // bump last_synced_seq past the dropped events, excluding
             // them from every future pass — permanently missing
             // evidence with only a one-line warning.
-            break;
+            //
+            // fully_acked = false is the PASS-LOCAL truth the caller
+            // must use for offset advance and receipt gating. The old
+            // inference (`last_synced_seq >= pending max_seq`) compared
+            // against a CROSS-TOPIC watermark: a session whose history
+            // included one high-seq event (old high topic base, or any
+            // earlier high offset) satisfied the comparison even though
+            // THIS pass just dropped events — the offsets then banked
+            // past the dropped records and the evidence was gone.
+            return Ok(BridgeSyncOutcome {
+                changed,
+                fully_acked: false,
+            });
         }
         if let Some(max_seq) = batch.iter().map(|event| event.seq).max() {
             let session_state = state
@@ -537,7 +588,31 @@ async fn sync_bridge_candidate(
             changed = true;
         }
     }
-    Ok(changed)
+    // Every batch acknowledged: pin the session's seq-mapping scheme so
+    // it stays fixed for the rest of its life (server dedups on
+    // (sessionId, seq); see SessionSyncState::bridge_seq_scheme).
+    let session_state = state
+        .sessions
+        .entry(candidate.session.external_id.clone())
+        .or_default();
+    if session_state.bridge_seq_scheme.is_none() {
+        session_state.bridge_seq_scheme = Some(candidate.seq_scheme);
+        changed = true;
+    }
+    Ok(BridgeSyncOutcome {
+        changed,
+        fully_acked: true,
+    })
+}
+
+/// Pass-local outcome of one bridge-session sync attempt.
+struct BridgeSyncOutcome {
+    changed: bool,
+    /// True iff every batch this pass attempted was acknowledged by the
+    /// console (or the session is console-sealed, a terminal state).
+    /// The AUTHORITATIVE completeness signal for offset advance and
+    /// receipt gating — never inferred from seq watermarks.
+    fully_acked: bool,
 }
 
 fn update_bridge_offsets(state: &mut SyncState, offsets: &BTreeMap<String, u64>) -> bool {
@@ -600,6 +675,20 @@ struct SessionSyncState {
     #[serde(alias = "events_synced")]
     synced_any: bool,
     atif_synced: bool,
+    /// Bridge seq-mapping scheme this session's events were posted
+    /// under. `(sessionId, seq)` is the server's dedup key, so the
+    /// mapping must stay FIXED for a session's whole life:
+    ///   * `Some(0)` / legacy — `topic_idx*1e6 + offset`, which
+    ///     COLLIDES across topics once any partition's offset reaches
+    ///     1e6 (and mass-collides at the MAX_SEQ clamp); kept only for
+    ///     sessions that already synced under it.
+    ///   * `Some(1)` — interleaved `offset*TOPICS + topic_idx`,
+    ///     collision-free across topics for the same session (a
+    ///     session's records sit in ONE partition per topic — the
+    ///     broker partitions by session key).
+    ///   * `None` — never bridge-synced; resolved at scan time
+    ///     (legacy iff the session already synced under legacy).
+    bridge_seq_scheme: Option<u8>,
 }
 
 /// The state file grows with one entry per session and is never pruned;
@@ -954,6 +1043,10 @@ struct BridgeScan {
 struct BridgeSessionCandidate {
     session: SessionUpsert,
     events: Vec<IngestEvent>,
+    /// The seq-mapping scheme every event in this candidate was mapped
+    /// under — persisted to state on successful sync so the session's
+    /// mapping stays fixed for life.
+    seq_scheme: u8,
 }
 
 struct BridgeSessionAccumulator {
@@ -964,6 +1057,7 @@ struct BridgeSessionAccumulator {
     closed_at: Option<String>,
     first_at: Option<String>,
     events: Vec<IngestEvent>,
+    seq_scheme: u8,
 }
 
 struct BridgeMappedEvent {
@@ -1036,10 +1130,18 @@ fn scan_bridge_candidates(
                     // them so a corrected clock re-delivers — banking
                     // unconditionally consumed them permanently with only
                     // a counter bump. Once a cursor is frozen, nothing
-                    // later in that (topic, partition) banks either
-                    // (banking a later mapped offset would skip the
-                    // frozen record on the next pass).
+                    // later in that (topic, partition) banks or maps —
+                    // but the tail is still SCANNED in collect-only mode:
+                    // every later record's session joins frozen_sessions,
+                    // because those sessions' unread evidence is just as
+                    // locked behind the freeze as the skewed record's own
+                    // session. Without this, a session whose records lay
+                    // AFTER the freeze point could pass the receipt gate
+                    // and seal that unread evidence out permanently.
                     if frozen_cursors.contains(&cursor_key) {
+                        if let Some(sid) = bridge_session_id(&stored.value) {
+                            scan.frozen_sessions.insert(sid);
+                        }
                         continue;
                     }
                     let mut bank = |offset: u64| {
@@ -1065,7 +1167,17 @@ fn scan_bridge_candidates(
                         bank(stored.offset);
                         continue;
                     }
-                    match bridge_record_to_event(topic_idx, topic, stored, now_ms) {
+                    // Seq-mapping scheme is FIXED per session (the server
+                    // dedups on (sessionId, seq)): an explicit stored
+                    // scheme wins; otherwise legacy iff the session
+                    // already synced events under the legacy mapping;
+                    // fresh sessions get the collision-free scheme 1.
+                    let seq_scheme = state
+                        .sessions
+                        .get(&session_id)
+                        .map(|session| session.bridge_seq_scheme.unwrap_or(u8::from(!session.synced_any)))
+                        .unwrap_or(1);
+                    match bridge_record_to_event(topic_idx, seq_scheme, topic, stored, now_ms) {
                         BridgeRecordMapping::Mapped(mapped) => {
                             bank(stored.offset);
                             let entry =
@@ -1079,6 +1191,7 @@ fn scan_bridge_candidates(
                                         closed_at: None,
                                         first_at: None,
                                         events: Vec::new(),
+                                        seq_scheme,
                                     });
                             entry.agent = mapped.agent;
                             if let Some(workflow) = mapped.workflow {
@@ -1132,15 +1245,34 @@ fn scan_bridge_candidates(
                                 stored.offset
                             );
                         }
+                        BridgeRecordMapping::SeqOverflow => {
+                            scan.events_outside_window = scan.events_outside_window.saturating_add(1);
+                            // Permanent property of the record's offset
+                            // (scheme-1 seq would exceed the server cap):
+                            // consume it loudly, same posture as
+                            // AncientOrUndated — clamping collides,
+                            // freezing wedges the partition forever.
+                            bank(stored.offset);
+                            eprintln!(
+                                "warning: bridge record at {} offset {} maps beyond the \
+                                 console's maximum event seq; skipped (retained in the \
+                                 bridge log as evidence)",
+                                sanitize_for_terminal(&cursor_key),
+                                stored.offset
+                            );
+                        }
                         BridgeRecordMapping::Skipped => bank(stored.offset),
                     }
                 }
-                // A frozen cursor's tail can't bank or map — stop paging
-                // this partition instead of re-reading every remaining
-                // page on every pass (watch-mode churn).
-                if frozen_cursors.contains(&cursor_key) {
-                    break;
-                }
+                // A frozen cursor's tail keeps being SCANNED (collect-only:
+                // the loop head adds every later record's session to
+                // frozen_sessions so the receipt gate defers them — see
+                // the freeze-barrier comment there) but banks/maps
+                // nothing. The re-read cost per pass is bounded by the
+                // partition tail and only paid in the abnormal, loudly-
+                // warned clock-skew state; stopping early instead let
+                // sessions in unfetched pages seal their unread evidence
+                // out permanently.
                 let next = page
                     .last()
                     .and_then(|event| event.offset.checked_add(1))
@@ -1177,6 +1309,7 @@ fn scan_bridge_candidates(
                     closed_at: session.closed_at,
                 },
                 events: session.events,
+                seq_scheme: session.seq_scheme,
             })
         })
         .collect();
@@ -1215,11 +1348,17 @@ enum BridgeRecordMapping {
     /// like the pre-freeze behavior, so one bad record cannot
     /// head-of-line-block its whole partition forever.
     AncientOrUndated,
+    /// Scheme-1 seq mapping would exceed the server's MAX_SEQ cap
+    /// (partition offset beyond ~MAX_SEQ/TOPICS). Permanent property of
+    /// the record's offset — banked with a loud warning like
+    /// AncientOrUndated (clamping collides; freezing wedges).
+    SeqOverflow,
     Skipped,
 }
 
 fn bridge_record_to_event(
     topic_idx: usize,
+    seq_scheme: u8,
     topic: &str,
     stored: &av_bridge::StoredEvent,
     now_ms: u64,
@@ -1237,7 +1376,14 @@ fn bridge_record_to_event(
     if occurred_ms > now_ms.saturating_add(INGEST_FUTURE_SKEW_MS) {
         return BridgeRecordMapping::FutureSkew;
     }
-    let seq = bridge_seq(topic_idx, stored.offset);
+    let Some(seq) = bridge_seq(seq_scheme, topic_idx, stored.offset) else {
+        // Scheme-1 refusal: the interleaved seq would exceed the
+        // server's MAX_SEQ cap (a partition offset beyond ~16.6M).
+        // Clamping would collide; freezing would wedge the partition
+        // forever. Treated like AncientOrUndated by the caller: banked
+        // with a loud warning, retained in the bridge log as evidence.
+        return BridgeRecordMapping::SeqOverflow;
+    };
     let agent = bounded_nonempty(
         value
             .pointer("/ai_agent/charter/name")
@@ -1427,11 +1573,34 @@ fn bridge_occurred_at(value: &serde_json::Value, stored_at: u64) -> Option<(u64,
     Some((ms, iso))
 }
 
-fn bridge_seq(topic_idx: usize, offset: u64) -> u64 {
-    let base = u64::try_from(topic_idx)
-        .unwrap_or(u64::MAX)
-        .saturating_mul(BRIDGE_SEQ_STRIDE);
-    base.saturating_add(offset).min(MAX_SEQ)
+fn bridge_seq(scheme: u8, topic_idx: usize, offset: u64) -> Option<u64> {
+    let topic = u64::try_from(topic_idx).unwrap_or(u64::MAX);
+    if scheme == 0 {
+        // Legacy mapping, kept ONLY for sessions that already posted
+        // events under it (the server dedups on (sessionId, seq), so a
+        // session's mapping can never change). Known-broken shapes —
+        // documented, bounded to legacy sessions: cross-topic collision
+        // once a partition's offset reaches BRIDGE_SEQ_STRIDE, and the
+        // MAX_SEQ clamp collapsing everything past the cap onto one
+        // seq. Colliding events dedup client-side (evidence loss with
+        // a stable shape rather than server 400s).
+        return Some(
+            topic
+                .saturating_mul(BRIDGE_SEQ_STRIDE)
+                .saturating_add(offset)
+                .min(MAX_SEQ),
+        );
+    }
+    // Scheme 1: interleave — collision-free across topics for any
+    // offset (distinct (topic, offset) → distinct seq), monotone in
+    // offset within a topic. A session's records live in one partition
+    // per topic (broker partitions by session key), so (topic, offset)
+    // is unique per session. Refuse (None) instead of clamping when
+    // the result would exceed the server's MAX_SEQ — a clamp CREATES
+    // the collision class this scheme exists to remove.
+    let topics = u64::try_from(BRIDGE_TOPICS.len()).unwrap_or(u64::MAX);
+    let seq = offset.checked_mul(topics)?.checked_add(topic)?;
+    (seq <= MAX_SEQ).then_some(seq)
 }
 
 fn workflow_from_str(value: &str) -> Option<Workflow> {
@@ -2448,6 +2617,7 @@ mod tests {
                 receipt_synced: true,
                 synced_any: true,
                 atif_synced: true,
+                bridge_seq_scheme: Some(1),
             },
         );
         state.pubkey_hex_synced = Some("ab".repeat(32));
@@ -2469,11 +2639,38 @@ mod tests {
         assert_eq!(restored.bridge_topic_offsets.get("agent.session/p0"), Some(&7));
     }
 
+    /// Scheme 0 (legacy, only for sessions that already synced under
+    /// it): deterministic, but collides across topics at the stride and
+    /// mass-collides at the MAX_SEQ clamp. Scheme 1: interleaved and
+    /// collision-free — distinct (topic, offset) always yields a
+    /// distinct seq — refusing (None) past the server cap instead of
+    /// clamping onto it.
     #[test]
-    fn bridge_seq_is_deterministic_and_capped() {
-        assert_eq!(bridge_seq(1, 7), 1_000_007);
-        assert_eq!(bridge_seq(1, 7), bridge_seq(1, 7));
-        assert_eq!(bridge_seq(200, 1), MAX_SEQ);
+    fn bridge_seq_is_deterministic_and_collision_free() {
+        // Legacy shapes preserved verbatim.
+        assert_eq!(bridge_seq(0, 1, 7), Some(1_000_007));
+        assert_eq!(bridge_seq(0, 1, 7), bridge_seq(0, 1, 7));
+        assert_eq!(bridge_seq(0, 200, 1), Some(MAX_SEQ));
+        // Legacy collision this scheme is being replaced for:
+        assert_eq!(bridge_seq(0, 0, 1_000_000), bridge_seq(0, 1, 0));
+
+        // Scheme 1: no cross-topic collisions at any offset.
+        assert_eq!(bridge_seq(1, 0, 0), Some(0));
+        assert_eq!(bridge_seq(1, 1, 0), Some(1));
+        assert_eq!(bridge_seq(1, 0, 1_000_000), Some(6_000_000));
+        assert_ne!(bridge_seq(1, 0, 1_000_000), bridge_seq(1, 1, 0));
+        let mut seen = std::collections::HashSet::new();
+        for topic_idx in 0..BRIDGE_TOPICS.len() {
+            for offset in [0u64, 1, 999_999, 1_000_000, 5_000_000] {
+                assert!(
+                    seen.insert(bridge_seq(1, topic_idx, offset).unwrap()),
+                    "collision at topic {topic_idx} offset {offset}"
+                );
+            }
+        }
+        // Past the server cap: refuse, never clamp (clamping collides).
+        assert_eq!(bridge_seq(1, 0, MAX_SEQ), None);
+        assert_eq!(bridge_seq(1, 5, u64::MAX), None);
     }
 
     #[test]
@@ -2503,7 +2700,7 @@ mod tests {
             }),
         );
         let BridgeRecordMapping::Mapped(mapped) =
-            bridge_record_to_event(1, "agent.tool_call", &tool, 1_800_000_000_000)
+            bridge_record_to_event(1, 0, "agent.tool_call", &tool, 1_800_000_000_000)
         else {
             panic!("tool event should map");
         };
@@ -2535,7 +2732,7 @@ mod tests {
             }),
         );
         let BridgeRecordMapping::Mapped(mapped) =
-            bridge_record_to_event(0, "agent.session", &opened, 1_800_000_000_000)
+            bridge_record_to_event(0, 0, "agent.session", &opened, 1_800_000_000_000)
         else {
             panic!("session event should map");
         };
@@ -2624,6 +2821,7 @@ mod tests {
                 receipt_synced: false,
                 synced_any: true,
                 atif_synced: true,
+                bridge_seq_scheme: None,
             },
         );
         let atif_ids = BTreeSet::from(["unsigned-s".to_owned()]);
@@ -2715,7 +2913,7 @@ mod tests {
         };
         let bidi = payload_for("vendor\u{202E}allow");
         let BridgeRecordMapping::Mapped(mapped) =
-            bridge_record_to_event(1, "agent.tool_call", &bidi, 1_800_000_000_000)
+            bridge_record_to_event(1, 0, "agent.tool_call", &bidi, 1_800_000_000_000)
         else {
             panic!("tool event should map");
         };
@@ -2723,7 +2921,7 @@ mod tests {
 
         let empties = payload_for("\u{202E}\u{200B}");
         let BridgeRecordMapping::Mapped(mapped) =
-            bridge_record_to_event(1, "agent.tool_call", &empties, 1_800_000_000_000)
+            bridge_record_to_event(1, 0, "agent.tool_call", &empties, 1_800_000_000_000)
         else {
             panic!("tool event should map");
         };
@@ -2855,6 +3053,82 @@ mod tests {
             format!("manifest_version: 1\nname: test-bridge\ntopics:\n{topics}"),
         )
         .unwrap();
+    }
+
+    /// A frozen cursor is a SEAL BARRIER for every session with records
+    /// at or after the freeze point — not just the skewed record's own
+    /// session. Records behind the freeze never became pending events
+    /// this pass, so the receipt gate's seq check cannot see them; only
+    /// membership in `frozen_sessions` defers those seals. The old
+    /// shape froze the cursor and stopped scanning, so a session whose
+    /// records lay AFTER the freeze could seal its unread evidence out
+    /// permanently.
+    #[test]
+    fn frozen_cursor_is_a_seal_barrier_for_every_later_session() {
+        let dir = test_tempdir("bridge-freeze");
+        write_bridge_manifest(dir.path());
+        let far_future = av_core::time::now_ms() + 6 * 60 * 60 * 1000;
+        let session_record = |offset: u64, sid: &str, uid: &str, time: u64| {
+            stored_bridge_event(
+                "agent.session",
+                offset,
+                json!({
+                    "metadata": {"uid": uid, "sequence": 0},
+                    "class_name": "agent.session",
+                    "time": time,
+                    "time_iso": av_core::time::iso8601_ms(time),
+                    "status_id": 1,
+                    "session_uid": sid,
+                    "ai_agent": {
+                        "version": "1.0.0",
+                        "charter": {"name": "agent", "type_id": 1},
+                        "instance_uid": "inst"
+                    },
+                    "payload": {"action": "opened", "workflow": "signed"}
+                }),
+            )
+        };
+        // Offset 0: normal record for session A (maps + banks).
+        append_bridge_event(
+            dir.path(),
+            "agent.session",
+            session_record(0, "session-a", "evt-a", 1_767_225_600_000),
+        );
+        // Offset 1: future-skewed record for session A — freezes the cursor.
+        append_bridge_event(
+            dir.path(),
+            "agent.session",
+            session_record(1, "session-a", "evt-a-skew", far_future),
+        );
+        // Offset 2: NORMAL record for session B, behind the freeze.
+        append_bridge_event(
+            dir.path(),
+            "agent.session",
+            session_record(2, "session-b", "evt-b", 1_767_225_700_000),
+        );
+
+        let state = SyncState::default();
+        let scan = scan_bridge_candidates(dir.path(), &state, &BTreeSet::new());
+        assert!(
+            scan.frozen_sessions.contains("session-a"),
+            "the skewed record's own session must freeze"
+        );
+        assert!(
+            scan.frozen_sessions.contains("session-b"),
+            "sessions with records BEHIND the freeze must join the seal barrier"
+        );
+        assert!(
+            !scan
+                .candidates
+                .iter()
+                .any(|c| c.session.external_id == "session-b"),
+            "records behind the freeze must not become pending events"
+        );
+        assert_eq!(
+            scan.max_seen_offsets.get("agent.session/p0"),
+            Some(&0),
+            "nothing at or past the freeze point may bank"
+        );
     }
 
     fn stored_bridge_event(_topic: &str, offset: u64, value: Value) -> av_bridge::StoredEvent {

@@ -793,10 +793,10 @@ mod tests {
             receipt_id: "test-receipt".to_owned(),
             session_id: session.id.clone(),
             issued_at: 1_700_000_000_000,
-            issued_at_iso: "2023-11-14T22:13:20Z".to_owned(),
+            issued_at_iso: "2023-11-14T22:13:20.000Z".to_owned(),
             ai_agent: session.identity.clone(),
             subject: ReceiptSubject::EventChain {
-                chain_head: "abc123".to_owned(),
+                chain_head: "ab".repeat(32),
                 event_count: 1,
             },
             tool_calls: ToolCallSummary::default(),

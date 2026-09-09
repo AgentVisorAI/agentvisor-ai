@@ -201,7 +201,87 @@ const ALLOWED_RECEIPT_TOP_LEVEL_KEYS: &[&str] = &[
 
 impl<'de> Deserialize<'de> for Receipt {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        use serde::de::{Error as _, MapAccess, Visitor};
+        use serde::de::{DeserializeSeed, Error as _, MapAccess, SeqAccess, Visitor};
+
+        /// Recursively-checked JSON value: refuses duplicate keys and
+        /// explicit `null`s at EVERY depth while parsing. The top-level
+        /// duplicate guard below is not enough — `next_value::<Value>()`
+        /// collapses NESTED duplicates last-wins (serde_json), so a
+        /// hostile issuer could ship `"prompt_tokens":0,
+        /// "prompt_tokens":100` inside `cost`: the signature verifies
+        /// (canonicalization sees the collapsed value) while a
+        /// first-wins parser shows an auditor the other number — the
+        /// exact equivocation the top-level guard exists to refuse.
+        /// Explicit nulls are refused for the same display-vs-canonical
+        /// reason: every optional field is written with
+        /// `skip_serializing_if`, so a null can only be a planted
+        /// artifact that vanishes on reserialization.
+        /// (`Receipt::from_json_slice` enforces both at the bytes level;
+        /// this closes the plain `serde_json::from_*::<Receipt>` path.)
+        struct CheckedValue;
+        struct CheckedValueVisitor;
+        impl<'de> Visitor<'de> for CheckedValueVisitor {
+            type Value = serde_json::Value;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a JSON value without duplicate keys or nulls")
+            }
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Self::Value, E> {
+                Ok(serde_json::Value::Bool(v))
+            }
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                Ok(serde_json::Value::from(v))
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                Ok(serde_json::Value::from(v))
+            }
+            fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Self::Value, E> {
+                Ok(serde_json::Value::from(v))
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(serde_json::Value::String(v.to_owned()))
+            }
+            fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+                Ok(serde_json::Value::String(v))
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Err(E::custom(
+                    "explicit null in Receipt; optional fields are omitted when absent, \
+                     so a null is a planted artifact that would vanish on reserialization",
+                ))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut items = Vec::new();
+                while let Some(item) = seq.next_element_seed(CheckedValue)? {
+                    items.push(item);
+                }
+                Ok(serde_json::Value::Array(items))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut object = serde_json::Map::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if object.contains_key(&key) {
+                        return Err(A::Error::custom(format!(
+                            "duplicate field `{key}` nested in Receipt; parsers disagree on \
+                             duplicate-key semantics, so accepting one would let a hostile \
+                             issuer sign one interpretation while auditors read the other"
+                        )));
+                    }
+                    let value = map.next_value_seed(CheckedValue)?;
+                    object.insert(key, value);
+                }
+                Ok(serde_json::Value::Object(object))
+            }
+        }
+        impl<'de> DeserializeSeed<'de> for CheckedValue {
+            type Value = serde_json::Value;
+            fn deserialize<D2: serde::Deserializer<'de>>(
+                self,
+                deserializer: D2,
+            ) -> Result<Self::Value, D2::Error> {
+                deserializer.deserialize_any(CheckedValueVisitor)
+            }
+        }
+
         // Custom visitor so we can reject duplicate keys explicitly.
         // `serde_json::Map::deserialize` silently collapses duplicate
         // keys (last-wins) — RFC 8259 leaves the behaviour undefined
@@ -238,7 +318,7 @@ impl<'de> Deserialize<'de> for Receipt {
                              auditor's parser reports the other"
                         )));
                     }
-                    let value: serde_json::Value = map.next_value()?;
+                    let value = map.next_value_seed(CheckedValue)?;
                     raw.insert(key, value);
                 }
                 let signature_value = raw
@@ -344,6 +424,34 @@ impl Receipt {
     /// signing format, so no issuance path can produce a legacy v1
     /// signature.
     pub fn issue(mut body: ReceiptBody, signer: &dyn Signer) -> Result<Self, ReceiptError> {
+        body.receipt_version = RECEIPT_VERSION;
+        body.key_id = signer.key_id().to_owned();
+        body.public_key_b64 = base64::engine::general_purpose::STANDARD.encode(signer.public_key_bytes());
+        let canon = canonicalize(&serde_json::to_value(&body)?)?;
+        let message = signing_message(body.receipt_version, &canon)?;
+        let sig = signer.sign(&message);
+        let receipt = Self {
+            body,
+            signature_b64: base64::engine::general_purpose::STANDARD.encode(sig),
+        };
+        // Never mint a receipt this crate's own verifier refuses:
+        // issuance used to sign ANY canonicalizable body (empty
+        // session_id, retroactive:false trajectory subjects,
+        // inconsistent timestamps, allowed+blocked > total) and the
+        // dead receipt only surfaced when a verifier finally ran —
+        // long after the session evidence that could have re-minted
+        // it was gone. verify_embedded runs the full semantic
+        // invariant set plus the signature round-trip (~one Ed25519
+        // verify per session close — noise next to the sign itself).
+        receipt.verify_embedded()?;
+        Ok(receipt)
+    }
+
+    /// Sign WITHOUT the issue-time validation — test-only, for pinning
+    /// that `verify` refuses hostile-keyholder receipts that `issue`
+    /// now refuses to mint in the first place.
+    #[cfg(test)]
+    pub(crate) fn issue_unchecked(mut body: ReceiptBody, signer: &dyn Signer) -> Result<Self, ReceiptError> {
         body.receipt_version = RECEIPT_VERSION;
         body.key_id = signer.key_id().to_owned();
         body.public_key_b64 = base64::engine::general_purpose::STANDARD.encode(signer.public_key_bytes());
@@ -494,6 +602,35 @@ impl Receipt {
                     "{field} is empty (schema requires minLength 1)"
                 )));
             }
+        }
+        // Schema parity, upper bound: the shipped schemas pin
+        // `maxLength: 128` (code points) on the identifier fields, and
+        // RFC 3339 `date-time` cannot express years past 9999. A
+        // keyholder could otherwise sign a 10-KB session_id or a
+        // year-10000 timestamp that this verifier accepted while every
+        // schema-based verifier refused — the same split-verdict class
+        // as the emptiness checks above, in the other direction.
+        for (field, value) in [
+            ("receipt_id", self.body.receipt_id.as_str()),
+            ("session_id", self.body.session_id.as_str()),
+            ("ai_agent.version", self.body.ai_agent.version.as_str()),
+            ("ai_agent.charter.name", self.body.ai_agent.charter.name.as_str()),
+            ("ai_agent.instance_uid", self.body.ai_agent.instance_uid.as_str()),
+        ] {
+            if value.chars().count() > 128 {
+                return Err(ReceiptError::SemanticInvariant(format!(
+                    "{field} exceeds 128 characters (schema maxLength)"
+                )));
+            }
+        }
+        // 9999-12-31T23:59:59.999Z in epoch ms — the last instant RFC
+        // 3339 date-time (and iso8601_ms's 24-char shape) can carry.
+        const MAX_ISSUED_AT_MS: u64 = 253_402_300_799_999;
+        if self.body.issued_at > MAX_ISSUED_AT_MS {
+            return Err(ReceiptError::SemanticInvariant(format!(
+                "issued_at {} is beyond year 9999 (RFC 3339 date-time cannot express it)",
+                self.body.issued_at
+            )));
         }
         let digest_ok = |digest: &str| {
             digest.len() == 64
@@ -1011,7 +1148,7 @@ mod tests {
         let make = |retroactive| {
             let mut body = body();
             body.subject = subject(retroactive);
-            Receipt::issue(body, &signer).unwrap()
+            Receipt::issue_unchecked(body, &signer).unwrap()
         };
 
         let forged = make(false);
@@ -1491,7 +1628,7 @@ mod tests {
                 "ai_agent.charter.name" => b.ai_agent.charter.name = String::new(),
                 _ => b.ai_agent.instance_uid = String::new(),
             }
-            let receipt = Receipt::issue(b, &signer).unwrap();
+            let receipt = Receipt::issue_unchecked(b, &signer).unwrap();
             assert!(
                 matches!(
                     receipt.verify_embedded(),
@@ -1552,7 +1689,7 @@ mod tests {
                 allowed,
                 blocked,
             };
-            let receipt = Receipt::issue(b, &signer).unwrap();
+            let receipt = Receipt::issue_unchecked(b, &signer).unwrap();
             assert!(
                 matches!(
                     receipt.verify(&ring),
@@ -1573,7 +1710,7 @@ mod tests {
                 allowed,
                 blocked,
             };
-            let receipt = Receipt::issue(b, &signer).unwrap();
+            let receipt = Receipt::issue_unchecked(b, &signer).unwrap();
             receipt.verify(&ring).unwrap();
         }
     }
@@ -1623,7 +1760,10 @@ mod tests {
                 chain_head: bad_head.clone(),
                 event_count: 1,
             };
-            let error = Receipt::issue(body, &signer).unwrap().verify(&ring).unwrap_err();
+            let error = Receipt::issue_unchecked(body, &signer)
+                .unwrap()
+                .verify(&ring)
+                .unwrap_err();
             assert!(
                 matches!(error, ReceiptError::SemanticInvariant(ref m) if m.contains("chain_head")),
                 "chain_head {bad_head:?} must fail: {error:?}"
@@ -1641,7 +1781,10 @@ mod tests {
         let mut wired = body();
         wired.stop_reason_id = 92;
         wired.stop_reason = "Stop".to_owned();
-        let error = Receipt::issue(wired, &signer).unwrap().verify(&ring).unwrap_err();
+        let error = Receipt::issue_unchecked(wired, &signer)
+            .unwrap()
+            .verify(&ring)
+            .unwrap_err();
         assert!(
             matches!(error, ReceiptError::SemanticInvariant(ref m) if m.contains("canonical caption")),
             "cross-wired caption must fail verify: {error:?}"
@@ -1650,12 +1793,18 @@ mod tests {
         let mut native = body();
         native.stop_reason_id = 1;
         native.stop_reason = "stop".to_owned();
-        Receipt::issue(native, &signer).unwrap().verify(&ring).unwrap();
+        Receipt::issue_unchecked(native, &signer)
+            .unwrap()
+            .verify(&ring)
+            .unwrap();
         // Canonical pairing passes.
         let mut canonical = body();
         canonical.stop_reason_id = 1;
         canonical.stop_reason = "Stop".to_owned();
-        Receipt::issue(canonical, &signer).unwrap().verify(&ring).unwrap();
+        Receipt::issue_unchecked(canonical, &signer)
+            .unwrap()
+            .verify(&ring)
+            .unwrap();
     }
 
     /// Cross-machine stress: two independently-issued receipts (simulating

@@ -178,6 +178,13 @@ export function ipInCidr(ip: string, cidr: ParsedCidr): boolean {
   return clientForms(ip).some((form) => formInCidr(form, cidr));
 }
 
+/**
+ * Malformed allowlist rows already warned about, so the warn below
+ * fires once per distinct value per process (bounded — a hostile flood
+ * of distinct malformed rows is capped by the PATCH validator).
+ */
+const warnedMalformedCidrs = new Set<string>();
+
 export function ipMatchesAny(ip: string, cidrs: string[]): boolean {
   if (cidrs.length === 0) return true; // empty = allow-all
   const forms = clientForms(ip);
@@ -187,8 +194,22 @@ export function ipMatchesAny(ip: string, cidrs: string[]): boolean {
       const parsed = parseCidr(c);
       if (forms.some((form) => formInCidr(form, parsed))) return true;
     } catch {
-      // Malformed row in DB — skip. PATCH refuses malformed inputs so
-      // this shouldn't happen in practice.
+      // Malformed row — SKIPPED (fail-closed: it can allow nobody).
+      // The PATCH validator refuses malformed inputs today, but rows
+      // stored under older, laxer parsing (multi-slash, hex/exponent
+      // prefixes — shapes that used to match EVERYTHING) go from
+      // allow-all to inert at upgrade. That direction is correct; the
+      // warn is the operational breadcrumb, because an org whose list
+      // was ONLY such rows flips to deny-all and locks its operators
+      // out of the console (recovery = fix the row in the DB).
+      if (warnedMalformedCidrs.size < 1024 && !warnedMalformedCidrs.has(c)) {
+        warnedMalformedCidrs.add(c);
+        // eslint-disable-next-line no-console
+        console.warn(
+          `ip-allowlist: skipping malformed CIDR ${JSON.stringify(c)} — stored under older ` +
+            "parsing rules; it matches nobody until corrected (PATCH /org/ip-allowlist)",
+        );
+      }
     }
   }
   return false;

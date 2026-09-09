@@ -11,6 +11,7 @@
 //! newer or third-party writers).
 
 use crate::model::SUPPORTED_VERSIONS;
+use av_core::error::JCS_SAFE_MAX;
 use serde_json::Value;
 
 /// Validation mode.
@@ -881,12 +882,25 @@ fn validate_trajectory_obj(
                     "total_steps",
                 ] {
                     if let Some(v) = m.get(f) {
-                        if !v.is_u64() {
-                            issue!(
+                        match v.as_u64() {
+                            // JCS-safe bound: the daemon's recovery
+                            // path refuses counters above 2^53
+                            // (receipts canonicalize via JCS), so a
+                            // strict-valid trajectory carrying one
+                            // was unrecoverable-by-construction —
+                            // strict validity and daemon
+                            // recoverability must agree.
+                            Some(n) if n <= JCS_SAFE_MAX => {}
+                            Some(_) => issue!(
+                                issues,
+                                format!("{path}.final_metrics.{f}"),
+                                "exceeds the JCS-safe integer bound (2^53)"
+                            ),
+                            None => issue!(
                                 issues,
                                 format!("{path}.final_metrics.{f}"),
                                 "must be a non-negative integer"
-                            );
+                            ),
                         }
                     }
                 }
@@ -907,6 +921,36 @@ fn validate_trajectory_obj(
                 }
             }
             None => issue!(issues, format!("{path}.final_metrics"), "must be an object"),
+        }
+    }
+
+    // Strict-mode aggregate sanity: total_steps must equal the step
+    // count (both in-tree writers set it that way, and a summary that
+    // miscounts its own steps is machine-detectably contradictory).
+    // Token-total reconciliation against step sums was ATTEMPTED here
+    // and deliberately dropped: the daemon's close path builds
+    // final_metrics from the session's live usage fold, which is
+    // legitimately decoupled from per-step metrics blocks in BOTH
+    // directions (fold counts usage on steps that carry no metrics
+    // block; test-pinned close paths produce totals below step sums) —
+    // refusing either direction quarantined real sessions at close.
+    // Cross-checking token totals needs a semantic redesign of what
+    // final_metrics attests, not a validator arm; see the findings
+    // ledger.
+    if matches!(mode, Mode::Strict) {
+        if let (Some(Value::Object(m)), Some(Value::Array(steps))) =
+            (obj.get("final_metrics"), obj.get("steps"))
+        {
+            if let Some(total_steps) = m.get("total_steps").and_then(Value::as_u64) {
+                if u128::from(total_steps) != u128::try_from(steps.len()).unwrap_or(u128::MAX) {
+                    issue!(
+                        issues,
+                        format!("{path}.final_metrics.total_steps"),
+                        "is {total_steps} but the trajectory carries {} steps",
+                        steps.len()
+                    );
+                }
+            }
         }
     }
 
@@ -1338,6 +1382,23 @@ fn validate_step(
                                     if !has_id && !has_path {
                                         issue!(issues, ref_path, "must set trajectory_id or trajectory_path");
                                     }
+                                    // Schema parity: the shipped schema
+                                    // pins minLength 1 on a PRESENT
+                                    // trajectory_path; an empty string
+                                    // riding beside a resolvable id
+                                    // validated here but failed every
+                                    // schema-based verifier.
+                                    if reference
+                                        .get("trajectory_path")
+                                        .and_then(Value::as_str)
+                                        .is_some_and(str::is_empty)
+                                    {
+                                        issue!(
+                                            issues,
+                                            ref_path,
+                                            "trajectory_path must not be an empty string when present"
+                                        );
+                                    }
                                     // If `trajectory_id` names an
                                     // embedded delegation, it MUST
                                     // resolve. A dangling id is
@@ -1430,8 +1491,17 @@ fn validate_step(
                 check_unknown_fields(m, METRICS_FIELDS, &mpath, mode, issues);
                 for f in ["prompt_tokens", "completion_tokens", "cached_tokens"] {
                     if let Some(v) = m.get(f) {
-                        if !v.is_u64() {
-                            issue!(issues, format!("{mpath}.{f}"), "must be a non-negative integer");
+                        match v.as_u64() {
+                            // Same JCS-safe bound as final_metrics: the
+                            // daemon folds step counters into receipt
+                            // bodies, which refuse integers past 2^53.
+                            Some(n) if n <= JCS_SAFE_MAX => {}
+                            Some(_) => issue!(
+                                issues,
+                                format!("{mpath}.{f}"),
+                                "exceeds the JCS-safe integer bound (2^53)"
+                            ),
+                            None => issue!(issues, format!("{mpath}.{f}"), "must be a non-negative integer"),
                         }
                     }
                 }

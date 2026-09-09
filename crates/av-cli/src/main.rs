@@ -491,6 +491,18 @@ fn install_seed_exclusive(path: &Path, encoded: &str) -> Result<bool> {
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             // Guard's Drop unlinks the tmp; no manual removal needed.
+            // Re-establish dirent durability on every run that finds
+            // the seed already installed — this is where the hard-fail
+            // arm's "re-run to retry the durability sync" actually
+            // happens (and it heals installs from builds that only
+            // warned).
+            av_core::fsutil::sync_directory(parent).with_context(|| {
+                format!(
+                    "signing seed exists at {} but its parent directory fsync failed; \
+                     the seed file is intact — do NOT delete it; re-run to retry",
+                    path.display()
+                )
+            })?;
             Ok(false)
         }
         Err(error) => Err(error).with_context(|| format!("install key {}", path.display())),
