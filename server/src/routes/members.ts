@@ -867,7 +867,17 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
     // request from body.data.password (they own the credential
     // they just set) and cannot have prior passkeys by
     // construction.
-    const isPreexistingUser = user !== null;
+    //
+    // "Created THIS request" must be decided from what the
+    // transaction actually DID, not from this pre-tx read: the
+    // read runs ~100 ms before the tx (argon2 below deliberately
+    // sits between them), and the in-tx upsert's ON CONFLICT arm
+    // happily returns a row some CONCURRENT request created in
+    // that window (e.g. the victim finishing their own legitimate
+    // signup/accept). Minting off the stale snapshot would hand
+    // the racer's session cookie to this caller — the exact
+    // pre-existing-user mint this block exists to refuse. See
+    // `createdUserThisRequest` inside the tx.
     let newUserPasswordHash: string | null = null;
     if (!user) {
       if (!body.data.password) {
@@ -913,6 +923,7 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
     // ON CONFLICT returns the concurrent winner's row exactly like
     // the R80 F5 requery used to.
     const INVITE_NOT_CONSUMABLE = "__invite_not_consumable__";
+    let createdUserThisRequest = false;
     try {
       user = await db.$transaction(async (tx) => {
         const consumed = await tx.invite.updateMany({
@@ -928,9 +939,9 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
         if (consumed.count === 0) {
           throw new Error(INVITE_NOT_CONSUMABLE);
         }
-        const grantee =
-          user ??
-          (await tx.user.upsert({
+        let grantee = user;
+        if (!grantee) {
+          grantee = await tx.user.upsert({
             where: { email: matched.email },
             create: {
               email: matched.email,
@@ -941,7 +952,18 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
               emailVerifiedAt: new Date(),
             },
             update: {},
-          }));
+          });
+          // Race-free created-by-us witness: only OUR create clause
+          // writes OUR freshly-salted argon2 hash, so the returned
+          // row carries it iff no concurrent request created the row
+          // first (ON CONFLICT's update:{} returns the winner's row
+          // unchanged). Gating the cookie mint on this — instead of
+          // the stale pre-tx read — closes the window where a racer
+          // (the victim completing their own signup) creates the
+          // account mid-argon2 and this request would otherwise mint
+          // a session for a user it did NOT create.
+          createdUserThisRequest = grantee.passwordHash === newUserPasswordHash;
+        }
         await tx.membership.upsert({
           where: { userId_orgId: { userId: grantee.id, orgId: matched.orgId } },
           create: {
@@ -976,16 +998,17 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
       throw err;
     }
 
-    // R121 F1: refuse to mint a session cookie for a pre-existing
-    // user (see the isPreexistingUser comment block above). Return
-    // requiresLogin so the SPA routes to /#/login where the user
-    // supplies their real password (and, if enrolled, completes
-    // the WebAuthn ceremony).
+    // R121 F1: refuse to mint a session cookie unless THIS request
+    // created the user (see the comment block above — pre-existing
+    // users, including ones created by a concurrent racer during
+    // this request's argon2 window, must authenticate at /#/login
+    // with their real credential + WebAuthn). Return requiresLogin
+    // so the SPA routes there.
     // R122 track A cosmetic: include org.name so the SPA toast
     // ("Welcome to <name>") renders the workspace name instead of
     // silently falling to "the workspace". `org` was already
     // loaded upstream at line 345 for the create-path email.
-    if (isPreexistingUser) {
+    if (!createdUserThisRequest) {
       const targetOrg = await db.org.findUnique({
         where: { id: matched.orgId },
         select: { name: true },

@@ -3090,7 +3090,11 @@ impl AbortFinalizingStream {
             }
             Ok(decision)
         });
-        self.pending_budget = Some(PendingBudget { task, continuation });
+        self.pending_budget = Some(PendingBudget {
+            task,
+            continuation,
+            delta,
+        });
     }
 
     fn submit_response_capture(
@@ -3346,6 +3350,15 @@ enum BudgetContinuation {
 struct PendingBudget {
     task: tokio::task::JoinHandle<Result<av_state::BudgetDecision, String>>,
     continuation: BudgetContinuation,
+    /// The completion-token delta this check would debit. `absorb_frame`
+    /// already folded it into `charged_completion_tokens`, but the debit
+    /// only lands when the task resolves `Allowed` — every other outcome
+    /// (mid-stream refusal, backend outage, drop-abort) must roll the
+    /// delta back out of `charged`, or the terminal over-charge refund
+    /// (`charged − reported`) credits tokens that were never debited
+    /// (same invariant as the drain-loop rollback in
+    /// `drain_protocol_frames`).
+    delta: u64,
 }
 
 #[derive(Default)]
@@ -3543,6 +3556,15 @@ impl Stream for AbortFinalizingStream {
             let failure = match result {
                 Ok(Ok(av_state::BudgetDecision::Allowed { .. })) => None,
                 Ok(Ok(av_state::BudgetDecision::Refused { limit, cap })) => {
+                    // The refused delta was never debited (check-and-spend
+                    // refuses without spending; the principal side is
+                    // refunded inside the task), but `absorb_frame` already
+                    // folded it into `charged_completion_tokens` — roll it
+                    // back or the terminal over-charge refund credits
+                    // tokens that were never spent (drain-loop rollback
+                    // invariant).
+                    self.charged_completion_tokens =
+                        self.charged_completion_tokens.saturating_sub(pending.delta);
                     // Genuine mid-stream cap exhaustion — the ONLY arm
                     // that latches. The Ok(Err(..)) arm below is the
                     // quota-backend outage (fail-closed refusal, not
@@ -3559,7 +3581,14 @@ impl Stream for AbortFinalizingStream {
                 }
                 // Backend outage: fail-closed refusal, not enforcement —
                 // attested Other, mirroring the no-latch decision above.
-                Ok(Err(reason)) => Some((av_events::StopReason::Other, reason)),
+                // The session debit did not land (the task's error arm
+                // refunds the principal side too) — same rollback as the
+                // Refused arm.
+                Ok(Err(reason)) => {
+                    self.charged_completion_tokens =
+                        self.charged_completion_tokens.saturating_sub(pending.delta);
+                    Some((av_events::StopReason::Other, reason))
+                }
                 Err(error) => {
                     self.session.mark_capture_failed();
                     self.pending_output.clear();
@@ -4245,6 +4274,17 @@ impl Drop for AbortFinalizingStream {
         // until that helper takes a cancellation argument.
         if let Some(pending) = self.pending_budget.take() {
             pending.task.abort();
+            // The aborted check's delta was folded into
+            // `charged_completion_tokens` by `absorb_frame` but its debit
+            // never landed (abort reliably cancels a queued blocking
+            // task). Roll it back so the terminal over-charge refund
+            // below cannot credit tokens that were never debited. If the
+            // abort raced a task already RUNNING on the blocking pool
+            // (no cancellation points), the debit may still land — the
+            // rollback then under-refunds by one delta, i.e. the ledger
+            // keeps a conservative over-debit, matching the documented
+            // principal-side posture. Never the reverse.
+            self.charged_completion_tokens = self.charged_completion_tokens.saturating_sub(pending.delta);
         }
         let (flush_reason, budget_delta) = match self.flush_protocol_buffer() {
             Ok(delta) => (None, delta),
@@ -4253,6 +4293,12 @@ impl Drop for AbortFinalizingStream {
                 (Some(format!("provider stream flush failed: {error}")), 0u64)
             }
         };
+        // The flushed tail's frames bumped `charged_completion_tokens`,
+        // but on the drop path no `begin_budget_check` follows — the
+        // delta is discarded, never debited. Same rollback as the
+        // drain-loop error arms, or the terminal refund credits the
+        // unbilled tail against debits that never happened.
+        self.charged_completion_tokens = self.charged_completion_tokens.saturating_sub(budget_delta);
         // Compose a per-response failure reason. `budget_incomplete`
         // dominates because it always implies the client disconnected
         // before the last chunk was billed; a garbled frame is next
@@ -6549,6 +6595,7 @@ mod tests {
             pending_budget: Some(PendingBudget {
                 task: budget_task,
                 continuation: BudgetContinuation::FinishSse,
+                delta: 0,
             }),
             captured_bytes: 100,
             completed: false,
@@ -6665,6 +6712,101 @@ mod tests {
             "an errored chunk's never-debited frame deltas must be rolled back \
              from charged_completion_tokens, or the terminal refund credits \
              tokens that were never debited"
+        );
+        provider.abort();
+    }
+
+    /// A mid-stream budget REFUSAL never debits its delta (check-and-
+    /// spend refuses without spending, and the task refunds the
+    /// principal side), but `absorb_frame` already folded that delta
+    /// into `charged_completion_tokens`. The Refused arm (and the
+    /// backend-outage arm, and drop-abort) must roll the delta back —
+    /// otherwise the terminal over-charge refund (`charged − reported`)
+    /// credits tokens that were never debited, silently loosening the
+    /// enforced budget below what the signed receipt attests.
+    #[tokio::test]
+    async fn refused_budget_check_rolls_back_undebited_charge() {
+        use futures::StreamExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let (state, provider) = test_state(directory.path()).await;
+        let identity = av_events::AgentIdentity {
+            version: "1".into(),
+            charter: "c".into(),
+            instance_uid: "i".into(),
+            ttl_remaining_s: None,
+        };
+        let session = state.sessions.get_or_open(
+            "refused-rollback",
+            crate::session::Workflow::Signed,
+            &identity,
+            &state.config.breaker,
+        );
+        let lease = crate::session::SessionLease::new(Arc::clone(&session));
+        let refused = tokio::spawn(async {
+            Ok::<_, String>(av_state::BudgetDecision::Refused {
+                limit: "tokens".to_owned(),
+                cap: 100,
+            })
+        });
+        let mut stream = AbortFinalizingStream {
+            inner: futures::stream::empty::<Result<Bytes, std::io::Error>>().boxed(),
+            session: Arc::clone(&session),
+            identity,
+            response_permit: None,
+            worker: state.worker.clone(),
+            store: Arc::clone(&state.store),
+            budget: state.config.budget.clone(),
+            billed_prompt_tokens: 0,
+            principal_budget: None,
+            provider_adapter: Arc::clone(&state.provider_adapter),
+            finalizer: state.finalizer.clone(),
+            _lease: lease,
+            response_marker: None,
+            response_attempt_id: "refused-rollback-attempt".into(),
+            response_message: String::new(),
+            response_reasoning: String::new(),
+            response_model: None,
+            response_finish_reason: None,
+            upstream_status: StatusCode::OK,
+            response_cost_usd_micros: 0,
+            response_tool_calls: std::collections::BTreeMap::new(),
+            response_metrics: av_events::EventMetrics::default(),
+            // 10 charged, of which the refused check's 4 were never
+            // debited (6 landed via earlier Allowed checks).
+            charged_completion_tokens: 10,
+            last_reported_completion_tokens: None,
+            last_reported_prompt_tokens: None,
+            last_reported_cached_tokens: None,
+            last_reported_cost_usd_micros: None,
+            saw_chunk: true,
+            // Short-circuits submit_response_capture so the test needs
+            // no worker permits; the arithmetic under test runs first.
+            capture_attempted: true,
+            is_sse: true,
+            protocol_buffer: Vec::new(),
+            frame_scratch: Vec::new(),
+            pending_output: std::collections::VecDeque::new(),
+            pending_budget: Some(PendingBudget {
+                task: refused,
+                continuation: BudgetContinuation::FinishSse,
+                delta: 4,
+            }),
+            captured_bytes: 0,
+            completed: false,
+            ephemeral: false,
+        };
+        let item = stream.next().await.expect("refusal must yield a terminal item");
+        let error = item.expect_err("a refused budget check must surface as an error");
+        assert_eq!(error.kind(), std::io::ErrorKind::QuotaExceeded);
+        assert_eq!(
+            stream.charged_completion_tokens, 6,
+            "the refused (never-debited) delta must be rolled back from \
+             charged_completion_tokens, or the terminal refund credits \
+             tokens that were never spent"
+        );
+        assert!(
+            stream.session.enforcement_tripped(),
+            "a genuine mid-stream refusal still latches enforcement"
         );
         provider.abort();
     }

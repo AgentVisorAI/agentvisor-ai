@@ -116,7 +116,7 @@ tests exercised.
 | Concurrent HTTP/2 streams (server-side) | 128 | Hyper default. |
 | Concurrent HTTP/2 streams (upstream) | 100 | Hyper default. |
 | Client request read timeout | none | Rely on upstream to terminate stuck streams. |
-| Upstream request read timeout | `upstream_read_timeout_s` | Unset = no bound; set this to your SLO. |
+| Upstream request read timeout | `upstream_read_timeout_s` | Unset = 60 s default; raise it (and the shutdown grace budgets) for longer streams. |
 
 ## Cryptography
 

@@ -51,6 +51,11 @@ reqwest = { workspace = true }
 # breaks identity tokens (TTL ≤900s) and console-sync windows.
 # Already in-tree transitively via hyper.
 httpdate = "1"
+# Pass-3 review: identifier fields synced to the hosted console are
+# gated server-side by /[\p{Cc}\p{Cf}]/u — client-side parity needs the
+# FULL Cf category (the curated av-core bidi list is deliberately
+# narrower). Tiny table-only crate, already in-tree transitively.
+unicode-general-category = "1"
 hex = { workspace = true }
 base64 = { workspace = true }
 zeroize = { workspace = true }

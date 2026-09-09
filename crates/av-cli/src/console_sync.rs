@@ -2165,13 +2165,36 @@ fn is_session_sidecar(path: &Path) -> bool {
 }
 
 fn bounded_nonempty(value: &str, max_units: usize, fallback: &str) -> String {
+    // Server-contract sanitation: every identifier this helper feeds
+    // (externalId / sessionExternalId / agent / tag / policyName) is
+    // gated server-side by `/[\p{Cc}\p{Cf}]/u` (ingest.ts
+    // noControlOrFormatChars), and one interior control/format char —
+    // an RLO bidi override in a tool name, a zero-width space in a
+    // model id, a raw control byte in a bridge record — 400s the WHOLE
+    // event batch. `post_json` treats 400 as a hard error, so the same
+    // batch re-POSTed and re-400'd every pass: a single agent-
+    // influenced character permanently wedged the session's entire
+    // audit trail out of the console. Strip exactly the classes the
+    // server refuses: Cc via `char::is_control` (the same set) and the
+    // FULL Cf category (av_core::text's curated bidi/zero-width list is
+    // deliberately narrower — e.g. U+06DD, U+070F, tag characters — so
+    // relying on it would reopen the wedge on the uncurated chars).
+    let cleaned: String = value
+        .chars()
+        .filter(|c| {
+            !c.is_control()
+                && unicode_general_category::get_general_category(*c)
+                    != unicode_general_category::GeneralCategory::Format
+        })
+        .collect();
     // JS-compatible trim: the server's zod `.trim().min(1)` uses
     // ECMAScript whitespace, which includes U+FEFF — Rust's
     // `char::is_whitespace` does not. A value that survives Rust's trim
     // but empties under the server's (e.g. a lone BOM in a bridge
     // payload's policy name) 400'd the WHOLE event batch and stuck the
-    // sync on it forever.
-    let trimmed = value.trim_matches(|c: char| c.is_whitespace() || c == '\u{FEFF}');
+    // sync on it forever. (U+FEFF is Cf, so the filter above already
+    // removed it; the trim keeps ordinary edge whitespace tidy.)
+    let trimmed = cleaned.trim_matches(|c: char| c.is_whitespace() || c == '\u{FEFF}');
     if trimmed.is_empty() {
         fallback.to_owned()
     } else {
@@ -2271,6 +2294,53 @@ mod tests {
         assert_eq!(truncated.chars().count(), 4_000);
         assert_eq!(truncated.encode_utf16().count(), MAX_BODY_UNITS);
         assert!(truncated.ends_with('😀'));
+    }
+
+    /// Server-contract parity for identifier fields: the ingest API
+    /// refuses `/[\p{Cc}\p{Cf}]/u` in externalId/agent/tag/policyName,
+    /// whole-batch-fatal, and `post_json` treats the 400 as a hard
+    /// error — so one interior control/format char in an agent-
+    /// influenced identifier (an RLO in a tool name, a zero-width space
+    /// in a model id) re-POSTed and re-400'd the same batch every pass,
+    /// permanently wedging that session's audit trail out of the
+    /// console. `bounded_nonempty` must strip the FULL refused classes,
+    /// not just the curated bidi list.
+    #[test]
+    fn identifier_sanitation_strips_every_server_refused_char_class() {
+        // Interior Cf chars the curated av-core list does NOT carry:
+        // U+06DD (ARABIC END OF AYAH), U+070F (SYRIAC ABBREVIATION
+        // MARK), U+E0041 (TAG LATIN CAPITAL LETTER A). Plus the classic
+        // RLO, a zero-width space, an interior BOM, and raw Cc bytes.
+        assert_eq!(
+            bounded_nonempty("deploy\u{202E}prod", MAX_TAG_UNITS, "tool"),
+            "deployprod",
+            "RLO bidi override must be stripped, not forwarded to a 400"
+        );
+        assert_eq!(
+            bounded_nonempty("gpt-4\u{200B}o\u{FEFF}x", MAX_TAG_UNITS, "tool"),
+            "gpt-4ox"
+        );
+        assert_eq!(
+            bounded_nonempty("a\u{06DD}b\u{070F}c\u{E0041}d", MAX_TAG_UNITS, "tool"),
+            "abcd",
+            "the FULL Cf category must be stripped — not only the curated bidi set"
+        );
+        assert_eq!(
+            bounded_nonempty("ok\u{0}really\u{1F}\u{7F}", MAX_TAG_UNITS, "tool"),
+            "okreally",
+            "raw Cc bytes from a bridge record must be stripped"
+        );
+        // A value that is NOTHING but refused chars falls back instead
+        // of shipping an empty identifier (min-length 1 server-side).
+        assert_eq!(
+            bounded_nonempty("\u{202E}\u{200B}\u{FEFF}", MAX_TAG_UNITS, "tool"),
+            "tool"
+        );
+        // Visible unicode is untouched (identifiers are not ASCII-only).
+        assert_eq!(
+            bounded_nonempty("café-Straße", MAX_TAG_UNITS, "tool"),
+            "café-Straße"
+        );
     }
 
     /// Block classification of an ATIF step must key on the structured

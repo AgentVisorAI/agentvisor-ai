@@ -275,6 +275,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+ "unicode-general-category",
  "zeroize",
 ]
 
