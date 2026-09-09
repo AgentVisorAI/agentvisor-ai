@@ -1317,8 +1317,11 @@ fn bridge_record_to_event(
                 .or_else(|| payload.get("policy_name"))
                 .and_then(serde_json::Value::as_str)
                 .map(|name| {
+                    // Same Cc/Cf strip as bounded_nonempty — a bidi
+                    // override here 400s (and wedges) the whole batch.
+                    let cleaned = strip_control_and_format(name);
                     bounded_text(
-                        name.trim_matches(|c: char| c.is_whitespace() || c == '\u{FEFF}'),
+                        cleaned.trim_matches(|c: char| c.is_whitespace() || c == '\u{FEFF}'),
                         MAX_AGENT_UNITS,
                     )
                 })
@@ -1776,9 +1779,11 @@ fn policy_from_step(step: &av_atif::Step) -> Option<String> {
             // string: bounded_nonempty's "policy" fallback would
             // invent an attribution the operator can't find in their
             // inventory, the exact thing this function's contract
-            // forbids.
+            // forbids. Same Cc/Cf strip as bounded_nonempty — a bidi
+            // override here 400s (and wedges) the whole batch.
+            let cleaned = strip_control_and_format(name);
             let bounded = bounded_text(
-                name.trim_matches(|c: char| c.is_whitespace() || c == '\u{FEFF}'),
+                cleaned.trim_matches(|c: char| c.is_whitespace() || c == '\u{FEFF}'),
                 MAX_AGENT_UNITS,
             );
             if bounded.is_empty() {
@@ -2164,29 +2169,35 @@ fn is_session_sidecar(path: &Path) -> bool {
         .is_some_and(|name| name.ends_with(".session.json"))
 }
 
-fn bounded_nonempty(value: &str, max_units: usize, fallback: &str) -> String {
-    // Server-contract sanitation: every identifier this helper feeds
-    // (externalId / sessionExternalId / agent / tag / policyName) is
-    // gated server-side by `/[\p{Cc}\p{Cf}]/u` (ingest.ts
-    // noControlOrFormatChars), and one interior control/format char —
-    // an RLO bidi override in a tool name, a zero-width space in a
-    // model id, a raw control byte in a bridge record — 400s the WHOLE
-    // event batch. `post_json` treats 400 as a hard error, so the same
-    // batch re-POSTed and re-400'd every pass: a single agent-
-    // influenced character permanently wedged the session's entire
-    // audit trail out of the console. Strip exactly the classes the
-    // server refuses: Cc via `char::is_control` (the same set) and the
-    // FULL Cf category (av_core::text's curated bidi/zero-width list is
-    // deliberately narrower — e.g. U+06DD, U+070F, tag characters — so
-    // relying on it would reopen the wedge on the uncurated chars).
-    let cleaned: String = value
+/// Strip exactly the character classes the server's identifier gate
+/// refuses (`/[\p{Cc}\p{Cf}]/u`): Cc via `char::is_control` and the
+/// full Cf general category. Shared by `bounded_nonempty` and the
+/// policy-name paths — ONE unsanitized interior char (an RLO bidi
+/// override in a bridge payload's policy name) 400s the whole event
+/// batch, and `post_json` treats 400 as a hard error, so the same
+/// batch re-POSTs and re-400s every pass: the session's audit trail
+/// wedges out of the console permanently.
+fn strip_control_and_format(value: &str) -> String {
+    value
         .chars()
         .filter(|c| {
             !c.is_control()
                 && unicode_general_category::get_general_category(*c)
                     != unicode_general_category::GeneralCategory::Format
         })
-        .collect();
+        .collect()
+}
+
+fn bounded_nonempty(value: &str, max_units: usize, fallback: &str) -> String {
+    // Server-contract sanitation: every identifier this helper feeds
+    // (externalId / sessionExternalId / agent / tag / policyName) is
+    // gated server-side by `/[\p{Cc}\p{Cf}]/u` (ingest.ts
+    // noControlOrFormatChars) — see `strip_control_and_format`. The
+    // FULL Cf category is stripped (av_core::text's curated
+    // bidi/zero-width list is deliberately narrower — e.g. U+06DD,
+    // U+070F, tag characters — so relying on it would reopen the
+    // wedge on the uncurated chars).
+    let cleaned = strip_control_and_format(value);
     // JS-compatible trim: the server's zod `.trim().min(1)` uses
     // ECMAScript whitespace, which includes U+FEFF — Rust's
     // `char::is_whitespace` does not. A value that survives Rust's trim
@@ -2665,6 +2676,61 @@ mod tests {
         assert_eq!(llm.add_prompt_tokens, 10);
         assert_eq!(llm.add_completion_tokens, 5);
         assert_eq!(llm.add_cost_usd_micros, 123);
+    }
+
+    /// Policy names must pass the same Cc/Cf strip as every other
+    /// identifier: the server refuses `/[\p{Cc}\p{Cf}]/u` on
+    /// policyName, and one bidi override (Cf) in a bridge payload's
+    /// policy attribution 400'd — and permanently wedged — the whole
+    /// event batch. Empty-after-strip yields NO attribution.
+    #[test]
+    fn policy_names_are_stripped_of_control_and_format_chars() {
+        assert_eq!(strip_control_and_format("p\u{202E}q"), "pq");
+        assert_eq!(strip_control_and_format("ok-name"), "ok-name");
+        let payload_for = |policy: &str| {
+            stored_bridge_event(
+                "agent.tool_call",
+                7,
+                json!({
+                    "metadata": {"uid": "evt-pol", "sequence": 3},
+                    "class_name": "agent.tool_call",
+                    "time": 1767225600000u64,
+                    "time_iso": "2026-01-01T00:00:00.000Z",
+                    "status_id": 2,
+                    "session_uid": "signed-s",
+                    "ai_agent": {
+                        "version": "1.0.0",
+                        "charter": {"name": "signed-agent", "type_id": 1},
+                        "instance_uid": "inst-1"
+                    },
+                    "payload": {
+                        "tool": "t",
+                        "allowed": false,
+                        "stage": "policy",
+                        "reason": "denied",
+                        "policy": policy,
+                    }
+                }),
+            )
+        };
+        let bidi = payload_for("vendor\u{202E}allow");
+        let BridgeRecordMapping::Mapped(mapped) =
+            bridge_record_to_event(1, "agent.tool_call", &bidi, 1_800_000_000_000)
+        else {
+            panic!("tool event should map");
+        };
+        assert_eq!(mapped.event.policy_name.as_deref(), Some("vendorallow"));
+
+        let empties = payload_for("\u{202E}\u{200B}");
+        let BridgeRecordMapping::Mapped(mapped) =
+            bridge_record_to_event(1, "agent.tool_call", &empties, 1_800_000_000_000)
+        else {
+            panic!("tool event should map");
+        };
+        assert_eq!(
+            mapped.event.policy_name, None,
+            "empty-after-strip must not attribute"
+        );
     }
 
     #[tokio::test]

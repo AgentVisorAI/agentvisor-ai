@@ -126,10 +126,16 @@ async function craftSignedResponse({
   return Buffer.from(responseXml, "utf8").toString("base64");
 }
 
-async function postToAcs(acsUrl, samlResponse) {
+async function postToAcs(acsUrl, samlResponse, txnCookie = null) {
   return fetch(acsUrl, {
     method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      // Browser-binding txn cookie from spInitiate — rides the
+      // cross-site IdP POST (SameSite=None). Omitted for probes that
+      // assert the unsolicited/relayed refusals.
+      ...(txnCookie ? { Cookie: txnCookie } : {}),
+    },
     body: new URLSearchParams({ SAMLResponse: samlResponse }).toString(),
     redirect: "manual",
   });
@@ -149,7 +155,11 @@ async function spInitiate(configId) {
   const xml = inflateRawSync(Buffer.from(req, "base64")).toString("utf8");
   const id = /ID="([^"]+)"/.exec(xml)?.[1];
   if (!id) throw new Error("no AuthnRequest ID");
-  return id;
+  // Browser-binding txn cookie: the ACS requires the ceremony to flow
+  // back through the browser that started it (login-CSRF fix).
+  const txnCookie = /(av_saml_txn=[^;]+)/.exec(res.headers.get("set-cookie") ?? "")?.[1];
+  if (!txnCookie) throw new Error("no av_saml_txn cookie from /login");
+  return { id, txnCookie };
 }
 
 async function main() {
@@ -174,7 +184,7 @@ async function main() {
 
   // ============ 1. Expired assertion ============
   console.log("\n[1] Expired assertion (NotOnOrAfter in past)");
-  const irt_expiredResp = await spInitiate(cfg.id);
+  const { id: irt_expiredResp, txnCookie: txn_irt_expiredResp } = await spInitiate(cfg.id);
   const expiredResp = await craftSignedResponse({
     inResponseTo: irt_expiredResp,
     privateKey: idp.privateKey,
@@ -186,7 +196,7 @@ async function main() {
     notBefore: new Date(Date.now() - 3600_000),
     notOnOrAfter: new Date(Date.now() - 1800_000),
   });
-  const r1 = await postToAcs(cfg.spAcsUrl, expiredResp);
+  const r1 = await postToAcs(cfg.spAcsUrl, expiredResp, txn_irt_expiredResp);
   const b1 = await r1.text();
   // R122 F2: ACS errors are browser-UX redirects (302 to
   // /app/#/login?err=<slug>), not bare 4xx JSON — /acs is always a
@@ -195,7 +205,7 @@ async function main() {
 
   // ============ 2. Wrong audience ============
   console.log("\n[2] Wrong audience");
-  const irt_wrongAudResp = await spInitiate(cfg.id);
+  const { id: irt_wrongAudResp, txnCookie: txn_irt_wrongAudResp } = await spInitiate(cfg.id);
   const wrongAudResp = await craftSignedResponse({
     inResponseTo: irt_wrongAudResp,
     privateKey: idp.privateKey,
@@ -205,14 +215,14 @@ async function main() {
     idpIssuer: "https://real-idp.example/entity",
     email: "u2@hardening.example",
   });
-  const r2 = await postToAcs(cfg.spAcsUrl, wrongAudResp);
+  const r2 = await postToAcs(cfg.spAcsUrl, wrongAudResp, txn_irt_wrongAudResp);
   const b2 = await r2.text();
   results.push({ drill: "wrong-audience", status: r2.status, expect: 302, body: (r2.headers.get("location") ?? b2).slice(0, 100), ok: r2.status === 302 && /err=saml_assertion/.test(r2.headers.get("location") ?? "") });
 
   // ============ 3. Wrong signing cert ============
   console.log("\n[3] Assertion signed by different key");
   const attacker = await generateIdpKeys("attacker-idp");
-  const irt_attackerResp = await spInitiate(cfg.id);
+  const { id: irt_attackerResp, txnCookie: txn_irt_attackerResp } = await spInitiate(cfg.id);
   const attackerResp = await craftSignedResponse({
     inResponseTo: irt_attackerResp,
     privateKey: attacker.privateKey, // Wrong key!
@@ -222,7 +232,7 @@ async function main() {
     idpIssuer: "https://real-idp.example/entity",
     email: "attacker@hardening.example",
   });
-  const r3 = await postToAcs(cfg.spAcsUrl, attackerResp);
+  const r3 = await postToAcs(cfg.spAcsUrl, attackerResp, txn_irt_attackerResp);
   const b3 = await r3.text();
   results.push({ drill: "wrong-signing-cert", status: r3.status, expect: 302, body: (r3.headers.get("location") ?? b3).slice(0, 100), ok: r3.status === 302 && /err=saml_assertion/.test(r3.headers.get("location") ?? "") });
 
@@ -233,7 +243,7 @@ async function main() {
   // logout messages, so consumeSamlResponse enforces the pin itself —
   // this leg would have minted a session before that check landed.
   console.log("\n[3b] Valid signature but Issuer of another tenant");
-  const irt_wrongIssuerResp = await spInitiate(cfg.id);
+  const { id: irt_wrongIssuerResp, txnCookie: txn_irt_wrongIssuerResp } = await spInitiate(cfg.id);
   const wrongIssuerResp = await craftSignedResponse({
     inResponseTo: irt_wrongIssuerResp,
     privateKey: idp.privateKey, // RIGHT key —
@@ -243,7 +253,7 @@ async function main() {
     idpIssuer: "https://other-tenant.example/entity", // — wrong Issuer
     email: "crosstenant@hardening.example",
   });
-  const r3b = await postToAcs(cfg.spAcsUrl, wrongIssuerResp);
+  const r3b = await postToAcs(cfg.spAcsUrl, wrongIssuerResp, txn_irt_wrongIssuerResp);
   const b3b = await r3b.text();
   const loc3b = r3b.headers.get("location") ?? "";
   const cookie3b = (r3b.headers.getSetCookie?.() ?? []).some((c) => c.startsWith("av_session="));
@@ -254,7 +264,7 @@ async function main() {
   // assertion carrying no ds:Signature at all and prove the knob is a
   // GUARANTEE (same probe philosophy as 3b).
   console.log("\n[3c] Assertion with no signature at all");
-  const irt_unsigned = await spInitiate(cfg.id);
+  const { id: irt_unsigned, txnCookie: txn_irt_unsigned } = await spInitiate(cfg.id);
   const unsignedResp = await craftSignedResponse({
     inResponseTo: irt_unsigned,
     privateKey: idp.privateKey,
@@ -265,11 +275,33 @@ async function main() {
     email: "unsigned@hardening.example",
     skipSignature: true,
   });
-  const r3c = await postToAcs(cfg.spAcsUrl, unsignedResp);
+  const r3c = await postToAcs(cfg.spAcsUrl, unsignedResp, txn_irt_unsigned);
   const b3c = await r3c.text();
   const loc3c = r3c.headers.get("location") ?? "";
   const cookie3c = (r3c.headers.getSetCookie?.() ?? []).some((c) => c.startsWith("av_session="));
   results.push({ drill: "unsigned-assertion", status: r3c.status, expect: 302, body: (loc3c || b3c).slice(0, 100), ok: r3c.status === 302 && /err=saml_assertion/.test(loc3c) && !cookie3c });
+
+  // ============ 3d. Relayed valid response without the browser txn ============
+  // Login-CSRF shape: an attacker completes /login + IdP auth
+  // THEMSELVES, then delivers their perfectly valid, unconsumed
+  // SAMLResponse through a victim's browser. The victim's browser holds
+  // no av_saml_txn for that request id, so the ACS must refuse — a
+  // VALID signature, issuer, audience and InResponseTo are not enough.
+  console.log("\n[3d] Valid response relayed without the initiating browser's txn cookie");
+  const { id: irt_relayed } = await spInitiate(cfg.id);
+  const relayedResp = await craftSignedResponse({
+    inResponseTo: irt_relayed,
+    privateKey: idp.privateKey,
+    certBody: idp.certBody,
+    audience: cfg.spEntityId,
+    acs: cfg.spAcsUrl,
+    idpIssuer: "https://real-idp.example/entity",
+    email: "relay-victim@hardening.example",
+  });
+  const r3d = await postToAcs(cfg.spAcsUrl, relayedResp /* no txn cookie */);
+  const loc3d = r3d.headers.get("location") ?? "";
+  const cookie3d = (r3d.headers.getSetCookie?.() ?? []).some((c) => c.startsWith("av_session="));
+  results.push({ drill: "relayed-response-refused", status: r3d.status, expect: 302, body: loc3d.slice(0, 100), ok: r3d.status === 302 && /err=saml_assertion_txn_mismatch/.test(loc3d) && !cookie3d });
 
   // ============ 4. Member can't CRUD ============
   console.log("\n[4] Member cannot CRUD SAML configs");
@@ -364,7 +396,7 @@ async function main() {
     },
     body: JSON.stringify({ jitEnabled: false }),
   });
-  const irt_jitOffResp = await spInitiate(cfg.id);
+  const { id: irt_jitOffResp, txnCookie: txn_irt_jitOffResp } = await spInitiate(cfg.id);
   const jitOffResp = await craftSignedResponse({
     inResponseTo: irt_jitOffResp,
     privateKey: idp.privateKey,
@@ -374,7 +406,7 @@ async function main() {
     idpIssuer: "https://real-idp.example/entity",
     email: "brandnew@hardening.example",
   });
-  const r5 = await postToAcs(cfg.spAcsUrl, jitOffResp);
+  const r5 = await postToAcs(cfg.spAcsUrl, jitOffResp, txn_irt_jitOffResp);
   const b5 = await r5.text();
   results.push({ drill: "jit-disabled", status: r5.status, expect: 302, body: (r5.headers.get("location") ?? b5).slice(0, 100), ok: r5.status === 302 && /err=saml/.test(r5.headers.get("location") ?? "") });
 

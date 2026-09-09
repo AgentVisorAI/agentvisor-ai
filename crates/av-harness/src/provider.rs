@@ -69,7 +69,10 @@ pub(crate) const SUPPORTED_PROVIDERS: &[&str] = &["openai", "anthropic", "gemini
 /// * `tool_use` blocks / `input_json_delta` → tool-call deltas keyed
 ///   by the content-block `index` (Anthropic has no choices array;
 ///   `choice_index` is always 0).
-/// * `usage.input_tokens` → prompt, `usage.output_tokens` →
+/// * `usage.input_tokens` + `usage.cache_creation_input_tokens` +
+///   `usage.cache_read_input_tokens` → prompt (Anthropic's
+///   `input_tokens` EXCLUDES the cache-accounted input; the checked
+///   sum is the true input volume), `usage.output_tokens` →
 ///   completion (Anthropic reports output cumulatively, matching the
 ///   `completion_reported` cumulative contract),
 ///   `usage.cache_read_input_tokens` → cached.
@@ -224,9 +227,37 @@ fn parse_anthropic_payload(
     let mut cached_tokens = None;
     if let Some(usage) = usage {
         usage_reported = true;
-        prompt_tokens = provider_u64(usage.get("input_tokens"), "input_tokens")?;
+        // Anthropic's `input_tokens` EXCLUDES the cache-accounted
+        // input: `cache_creation_input_tokens` and
+        // `cache_read_input_tokens` are siblings, and the true input
+        // volume is the sum of all three. Recording bare input_tokens
+        // understated prompt usage by the entire cached prefix (a
+        // 200k-token cached system prompt billed as ~10 prompt
+        // tokens), understating receipts AND letting sessions sail
+        // past prompt budgets. Checked addition; `provider_u64`
+        // already JCS-bounds each addend and the sum is re-bounded by
+        // the same gate downstream.
+        let input = provider_u64(usage.get("input_tokens"), "input_tokens")?;
+        let cache_creation = provider_u64(
+            usage.get("cache_creation_input_tokens"),
+            "cache_creation_input_tokens",
+        )?;
+        let cache_read = provider_u64(usage.get("cache_read_input_tokens"), "cache_read_input_tokens")?;
+        prompt_tokens = match (input, cache_creation, cache_read) {
+            (None, None, None) => None,
+            (a, b, c) => {
+                let sum = a
+                    .unwrap_or(0)
+                    .saturating_add(b.unwrap_or(0))
+                    .saturating_add(c.unwrap_or(0));
+                if sum > av_core::error::JCS_SAFE_MAX {
+                    return Err("provider input token sum exceeds JCS-safe bounds".to_owned());
+                }
+                Some(sum)
+            }
+        };
         completion_tokens = provider_u64(usage.get("output_tokens"), "output_tokens")?;
-        cached_tokens = provider_u64(usage.get("cache_read_input_tokens"), "cache_read_input_tokens")?;
+        cached_tokens = cache_read;
     }
     let model_name = value
         .get("model")
@@ -407,9 +438,10 @@ fn parse_anthropic_payload(
 /// * `functionCall` parts → tool-call deltas keyed by
 ///   (candidate index, part position); Gemini function calls arrive
 ///   complete, with `args` as a JSON object serialized verbatim.
-/// * `promptTokenCount` → prompt, `candidatesTokenCount` →
-///   completion (cumulative across frames), `cachedContentTokenCount`
-///   → cached.
+/// * `promptTokenCount` → prompt, `candidatesTokenCount` +
+///   `thoughtsTokenCount` → completion (cumulative across frames;
+///   thinking tokens are billed output and must count),
+///   `cachedContentTokenCount` → cached.
 /// * `finishReason` folds into the OpenAI-lowercase taxonomy the
 ///   audit chain understands: `STOP`→`stop`, `MAX_TOKENS`→
 ///   `max_tokens`, safety-class refusals → `content_filter`; other
@@ -525,7 +557,26 @@ impl ProviderAdapter for GoogleGeminiAdapter {
         if let Some(usage) = value.get("usageMetadata").filter(|usage| !usage.is_null()) {
             usage_reported = true;
             prompt_tokens = provider_u64(usage.get("promptTokenCount"), "promptTokenCount")?;
-            completion_tokens = provider_u64(usage.get("candidatesTokenCount"), "candidatesTokenCount")?;
+            // Gemini reports thinking tokens SEPARATELY:
+            // `candidatesTokenCount` covers only the visible candidate
+            // text, `thoughtsTokenCount` the (often much larger)
+            // reasoning budget — both are billed as output. Recording
+            // bare candidatesTokenCount understated completion usage
+            // by the whole thinking spend (a 1000-thought/10-text
+            // response accounted as 10), understating receipts and
+            // completion budgets.
+            let candidates = provider_u64(usage.get("candidatesTokenCount"), "candidatesTokenCount")?;
+            let thoughts = provider_u64(usage.get("thoughtsTokenCount"), "thoughtsTokenCount")?;
+            completion_tokens = match (candidates, thoughts) {
+                (None, None) => None,
+                (a, b) => {
+                    let sum = a.unwrap_or(0).saturating_add(b.unwrap_or(0));
+                    if sum > av_core::error::JCS_SAFE_MAX {
+                        return Err("provider completion token sum exceeds JCS-safe bounds".to_owned());
+                    }
+                    Some(sum)
+                }
+            };
             cached_tokens = provider_u64(usage.get("cachedContentTokenCount"), "cachedContentTokenCount")?;
         }
         let model_name = value
@@ -714,6 +765,45 @@ mod tests {
         }
     }
 
+    /// Provider-billed token categories the bare counters exclude must
+    /// fold into the authoritative totals: Gemini bills thinking
+    /// (`thoughtsTokenCount`) as output beside `candidatesTokenCount`,
+    /// and Anthropic bills `cache_creation_input_tokens` +
+    /// `cache_read_input_tokens` as input beside `input_tokens`.
+    /// Recording the bare counters understated receipts and let
+    /// sessions sail past token budgets by the whole thinking/cache
+    /// spend.
+    #[test]
+    fn billed_but_separate_token_categories_fold_into_totals() {
+        let gemini = adapter_for("gemini")
+            .unwrap()
+            .parse_sse_chunk(
+                "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]},\"finishReason\":\"STOP\",\"index\":0}],\"usageMetadata\":{\"promptTokenCount\":100,\"candidatesTokenCount\":10,\"thoughtsTokenCount\":1000}}",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(gemini.metrics.prompt_tokens, Some(100));
+        assert_eq!(
+            gemini.metrics.completion_tokens,
+            Some(1010),
+            "thinking tokens are billed output and must count"
+        );
+
+        let anthropic = adapter_for("anthropic")
+            .unwrap()
+            .parse_sse_chunk(
+                "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"m\",\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":100,\"cache_read_input_tokens\":1000,\"output_tokens\":1}}}",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            anthropic.metrics.prompt_tokens,
+            Some(1110),
+            "cache-creation and cache-read input are billed input and must count"
+        );
+        assert_eq!(anthropic.metrics.cached_tokens, Some(1000));
+    }
+
     /// The Gemini streaming dialect maps into the provider-neutral
     /// chunk: text and thought parts, complete functionCall parts,
     /// cumulative usageMetadata, SCREAMING_CASE finish reasons folded
@@ -865,7 +955,10 @@ mod tests {
             .unwrap();
         assert_eq!(start.model_name.as_deref(), Some("claude-sonnet-4-5"));
         assert!(start.usage_reported && start.completion_reported);
-        assert_eq!(start.metrics.prompt_tokens, Some(25));
+        // input_tokens (25) + cache_read_input_tokens (7): Anthropic's
+        // input_tokens EXCLUDES cache-accounted input, so the true
+        // prompt volume is the sum.
+        assert_eq!(start.metrics.prompt_tokens, Some(32));
         assert_eq!(start.metrics.completion_tokens, Some(1));
         assert_eq!(start.metrics.cached_tokens, Some(7));
         assert!(start.has_choices);

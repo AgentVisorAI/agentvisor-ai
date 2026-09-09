@@ -473,19 +473,20 @@ fn install_seed_exclusive(path: &Path, encoded: &str) -> Result<bool> {
             // no-op (unlinking a non-existent path would race with a
             // fresh keygen that happened to reuse the UUIDv7 tail).
             guard.disarm();
-            // Downgrade post-hard-link sync_directory
-            // failures to a warn. The seed is already installed at
-            // `path`; returning Err misleads the operator into
-            // thinking keygen failed and can prompt them to delete
-            // the "half-installed" file, which is actually the live
-            // seed. Same discipline as `write_atomic` in
-            // av_core::fsutil.
-            if let Err(error) = av_core::fsutil::sync_directory(parent) {
-                eprintln!(
-                    "warning: post-install directory fsync failed at {}: {error}; the seed is visible but its dirent may not survive an immediate power loss",
-                    parent.display()
-                );
-            }
+            // Durability is part of installation: without the parent
+            // fsync, a power loss can drop the dirent and the next
+            // keygen mints a DIFFERENT trust anchor. Fail with
+            // explicit operator guidance — the seed FILE at `path` is
+            // intact and must not be deleted; a re-run retries only
+            // the durability sync.
+            av_core::fsutil::sync_directory(parent).with_context(|| {
+                format!(
+                    "signing seed installed at {} but the parent directory fsync failed; \
+                     the seed file is intact — do NOT delete it; re-run to retry the \
+                     durability sync",
+                    path.display()
+                )
+            })?;
             Ok(true)
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {

@@ -114,6 +114,10 @@ async function main() {
   // InResponseTo, exactly like a live IdP would.
   const loginRes = await fetch(`${API}/api/v1/auth/saml/${config.id}/login`, { redirect: "manual" });
   if (loginRes.status !== 302) throw new Error("SP-initiated login start failed: " + loginRes.status);
+  // Browser-binding txn cookie: /login now sets av_saml_txn and the ACS
+  // requires it back — the ceremony must flow through ONE browser.
+  const txnCookie = /(av_saml_txn=[^;]+)/.exec(loginRes.headers.get("set-cookie") ?? "")?.[1];
+  if (!txnCookie) throw new Error("no av_saml_txn cookie from /login");
   const idpRedirect = new URL(loginRes.headers.get("location"));
   const samlRequestB64 = idpRedirect.searchParams.get("SAMLRequest");
   if (!samlRequestB64) throw new Error("no SAMLRequest in IdP redirect");
@@ -196,7 +200,10 @@ async function main() {
     method: "POST",
     headers: {
       "Content-Type": "application/x-www-form-urlencoded",
-      // IdP-posted requests are cross-site — no Origin, no cookie.
+      // IdP-posted requests are cross-site — no Origin. The txn cookie
+      // rides along (SameSite=None) because the ceremony started in
+      // this same "browser" at /login.
+      Cookie: txnCookie,
     },
     body: new URLSearchParams({ SAMLResponse: samlResponse, RelayState: relayState }).toString(),
     redirect: "manual",

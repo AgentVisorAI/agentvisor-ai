@@ -211,6 +211,17 @@ class Bus extends EventEmitter {
       });
       await publisher.connect();
 
+      // close() may have run while the connects above were in flight:
+      // it swept this.pgListener/pgPublisher (both still null at that
+      // point) and resolved — assigning here would resurrect two live
+      // PG sockets on a closed bus (isReady() flips back to true and
+      // the connections leak until process exit). Tear down instead.
+      if (this.closed) {
+        publisher.removeAllListeners();
+        publisher.on("error", () => {});
+        await publisher.end().catch(() => void 0);
+        throw new Error("bus_closed_during_connect");
+      }
       this.pgListener = listener;
       this.pgPublisher = publisher;
       this.reconnectDelayMs = 500; // reset backoff after a successful open

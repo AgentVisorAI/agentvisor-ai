@@ -1,5 +1,13 @@
 config_version = 1
 listen = "0.0.0.0:8484"
+# The container binds every interface, but the shipped compose file
+# publishes the port to the HOST LOOPBACK only (127.0.0.1:8484:8484) —
+# that outer port map is the layer controlling who reaches the
+# listener, which is exactly what this flag acknowledges. Required
+# because the operator dashboard (enabled by default) has no identity
+# gate of its own: on a genuinely public wildcard bind it would hand
+# any peer the session list and receipts even with require_identity.
+allow_wildcard_bind = true
 upstream_url = "http://host.docker.internal:4000"
 upstream_http2_prior_knowledge = false
 upstream_read_timeout_s = 300

@@ -30,6 +30,10 @@ import {
 } from "../lib/auth.js";
 import { requireSession } from "../lib/session-middleware.js";
 import { truncateWellFormed } from "../lib/strings.js";
+
+// Browser-binding transaction cookie for SP-initiated SAML logins —
+// see lib/saml.ts txnNonceByRequestId.
+const SAML_TXN_COOKIE = "av_saml_txn";
 import {
   buildLoginUrl,
   consumeSamlResponse,
@@ -237,7 +241,21 @@ export async function samlRoutes(app: FastifyInstance): Promise<void> {
     const relayState = typeof req.query.RelayState === "string"
       ? truncateWellFormed(req.query.RelayState, 1024)
       : null;
-    const url = await buildLoginUrl(cfg, relayState);
+    const { url, txnNonce } = await buildLoginUrl(cfg, relayState);
+    // Browser-binding transaction cookie (see lib/saml.ts
+    // txnNonceByRequestId): the ACS requires the consumed
+    // InResponseTo to map back to THIS browser's nonce, so an
+    // attacker cannot relay their own valid SAMLResponse through a
+    // victim's browser (login CSRF). SameSite=None because the ACS
+    // consumes it on a cross-site IdP form POST; scoped to the SAML
+    // routes; HMAC-signed like the OAuth state cookie (R95 F4).
+    reply.setCookie(SAML_TXN_COOKIE, txnNonce, {
+      ...SESSION_COOKIE_OPTS,
+      maxAge: 600,
+      path: "/api/v1/auth/saml",
+      sameSite: "none",
+      signed: true,
+    });
     return reply.redirect(url);
   });
 
@@ -283,7 +301,24 @@ export async function samlRoutes(app: FastifyInstance): Promise<void> {
         );
         return errRedirect("saml_config_uses_sha1_reject");
       }
-      const result = await consumeSamlResponse(cfg, req.body as never);
+      // Unsign the browser-binding txn cookie; tampered/absent both
+      // degrade to null and the consume refuses with txn_mismatch.
+      let presentedTxn: string | null = null;
+      const rawTxn = req.cookies[SAML_TXN_COOKIE];
+      if (typeof rawTxn === "string") {
+        const unsigned = req.unsignCookie(rawTxn);
+        if (unsigned.valid && unsigned.value) presentedTxn = unsigned.value;
+      }
+      // One-use whatever the outcome: a consumed (or refused) ceremony
+      // must not leave a replayable txn cookie behind.
+      reply.setCookie(SAML_TXN_COOKIE, "", {
+        ...SESSION_COOKIE_OPTS,
+        maxAge: 0,
+        path: "/api/v1/auth/saml",
+        sameSite: "none",
+        signed: true,
+      });
+      const result = await consumeSamlResponse(cfg, req.body as never, new Date(), presentedTxn);
       if (!result.ok) {
         req.log.warn(
           { orgId: cfg.orgId, configId: cfg.id, error: result.error },

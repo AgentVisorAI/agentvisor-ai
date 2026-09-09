@@ -112,11 +112,34 @@ pub async fn serve_with_client_silence_reaping(
             () = shutdown.as_mut() => break,
         };
         on_accept(&stream);
-        let io = TokioIo::new(stream);
         let router = router.clone();
         let reaps = Arc::clone(&stalled_reaps);
         let watcher = graceful.watcher();
         tokio::spawn(async move {
+            // First-byte deadline. Hyper-util's auto builder sits in
+            // protocol detection (ReadVersion) BEFORE either timed HTTP
+            // connection exists, so `header_read_timeout` does not
+            // cover a socket that connects and sends NOTHING — the
+            // classic slowloris shape held the socket and this task
+            // forever, exhausting fds without ever authenticating.
+            // Peek (not read — hyper must still see the bytes) for the
+            // first byte under the same header deadline. Residual: a
+            // client stalling MID-version-prefix (e.g. 5 bytes of the
+            // h2 preface) still parks in ReadVersion — closing that
+            // needs a detection deadline inside hyper-util; the
+            // zero-byte hold is the cheap, scripted attack.
+            let mut first_byte = [0u8; 1];
+            match tokio::time::timeout(header_read_timeout, stream.peek(&mut first_byte)).await {
+                Ok(Ok(n)) if n > 0 => {}
+                // Timeout, clean EOF, or socket error before any byte:
+                // reap. Same counter as the in-request silence reaps —
+                // it is the same "client went silent" class.
+                _ => {
+                    reaps.inc();
+                    return;
+                }
+            }
+            let io = TokioIo::new(stream);
             let mut builder = Builder::new(TokioExecutor::new());
             builder
                 .http1()
@@ -308,6 +331,30 @@ mod tests {
             "unexpected response to a reaped slow-header connection: {text:?}",
         );
         assert_eq!(reaps.get(), 0, "header-phase reap must not count as a body stall");
+    }
+
+    /// A socket that connects and sends NOTHING never leaves
+    /// hyper-util's protocol detection, which sits BEFORE either timed
+    /// HTTP connection — `header_read_timeout` never armed and the
+    /// zero-byte slowloris held the socket + task forever. The
+    /// first-byte peek deadline must close it at the header timeout
+    /// and count it as a silence reap.
+    #[tokio::test]
+    async fn zero_byte_connection_is_reaped_at_the_header_timeout() {
+        let (addr, reaps) = spawn_server().await;
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // Send nothing at all.
+        let response = read_to_close(&mut stream).await;
+        assert!(
+            response.is_empty(),
+            "a never-spoke connection must be dropped without a response, got {:?}",
+            String::from_utf8_lossy(&response)
+        );
+        assert_eq!(
+            reaps.get(),
+            1,
+            "the zero-byte hold counts as a client-silence reap"
+        );
     }
 
     /// Full headers + Content-Length, a few bytes, then silence: the

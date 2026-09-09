@@ -1161,6 +1161,36 @@ impl HarnessConfig {
                 ));
             }
         }
+        // The dashboard shares the public listener and carries NO
+        // identity gate of its own — `require_identity = true` protects
+        // the proxy API but the dashboard routes still hand any peer
+        // the session list, agent identities, and complete receipts.
+        // On a wildcard bind that is a tenant-data disclosure, not a
+        // dev convenience; require the same explicit
+        // `allow_wildcard_bind` acknowledgment the anonymous-proxy
+        // guard above uses (an outer network layer controlling access
+        // covers both concerns), or turn the dashboard off.
+        if self.dashboard_enabled && self.require_identity && !self.allow_wildcard_bind {
+            let host = self
+                .listen
+                .rsplit_once(':')
+                .map(|(h, _)| h.trim_start_matches('[').trim_end_matches(']'))
+                .unwrap_or("");
+            let is_wildcard = matches!(host, "*" | "")
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.to_canonical().is_unspecified());
+            if is_wildcard {
+                errors.push(format!(
+                    "listen {:?} binds every interface with dashboard_enabled = true: the \
+                     dashboard has no identity gate (require_identity covers only the proxy \
+                     API), so any peer can enumerate sessions and download receipts. Set \
+                     dashboard_enabled = false, pin listen, or set allow_wildcard_bind = \
+                     true if an outer network layer controls who reaches the listener.",
+                    self.listen
+                ));
+            }
+        }
         if self.reconcile_tick_s == 0 {
             errors.push("reconcile_tick_s must be greater than zero".into());
         }
@@ -3286,6 +3316,45 @@ spec:
         .unwrap();
     }
 
+    /// `require_identity = true` gates the proxy API but NOT the
+    /// dashboard routes — a wildcard bind with the dashboard on hands
+    /// any peer the session list and complete receipts. Same explicit
+    /// `allow_wildcard_bind` acknowledgment as the anonymous-proxy
+    /// guard; loopback binds and dashboard-off stay untouched.
+    #[test]
+    fn wildcard_bind_with_dashboard_requires_explicit_acknowledgment() {
+        let err = HarnessConfig::from_toml(
+            r#"upstream_url = "https://api"
+               listen = "0.0.0.0:8484"
+               require_identity = true
+               identity_hmac_secret_file = "/etc/av/hmac"
+               dashboard_enabled = true"#,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("dashboard") && err.contains("every interface"),
+            "wildcard + dashboard must refuse: {err}"
+        );
+        // Explicit acknowledgment or dashboard-off both boot.
+        HarnessConfig::from_toml(
+            r#"upstream_url = "https://api"
+               listen = "0.0.0.0:8484"
+               require_identity = true
+               identity_hmac_secret_file = "/etc/av/hmac"
+               dashboard_enabled = true
+               allow_wildcard_bind = true"#,
+        )
+        .unwrap();
+        HarnessConfig::from_toml(
+            r#"upstream_url = "https://api"
+               listen = "0.0.0.0:8484"
+               require_identity = true
+               identity_hmac_secret_file = "/etc/av/hmac"
+               dashboard_enabled = false"#,
+        )
+        .unwrap();
+    }
+
     /// A seconds interval > 1 day is almost certainly a unit-conversion
     /// error (someone thought the field was in milliseconds).
     #[test]
@@ -3468,11 +3537,17 @@ spec:
         .validate()
         .unwrap();
 
-        // require_identity=true with a JWKS / HMAC source likewise passes.
+        // require_identity=true with a JWKS / HMAC source likewise
+        // passes — headless (the default-on dashboard has no identity
+        // gate, so a wildcard bind additionally requires
+        // dashboard_enabled = false or the allow_wildcard_bind
+        // acknowledgment; see
+        // wildcard_bind_with_dashboard_requires_explicit_acknowledgment).
         HarnessConfig::from_toml(
             r#"upstream_url = "https://api.openai.com"
                listen = "0.0.0.0:8484"
                require_identity = true
+               dashboard_enabled = false
                identity_jwks_url = "https://idp/keys.json""#,
         )
         .unwrap()

@@ -28,6 +28,7 @@
  */
 
 import { SAML, ValidateInResponseTo } from "@node-saml/node-saml";
+import crypto from "node:crypto";
 import { truncateWellFormed } from "./strings.js";
 import type { SamlConfig } from "@prisma/client";
 import { db } from "../db.js";
@@ -185,6 +186,10 @@ export function isSha1Legacy(cfg: SamlConfig): boolean {
 /// window plus ceremony time; the sweep runs inline on every save so no
 /// timer is needed.
 const REQUEST_ID_TTL_MS = 10 * 60_000;
+// Small tolerance — 5 minutes matches the SAML errata guidance for
+// clock skew between SP and IdP. Shared by the adapter's validation
+// window and the replay-record lifetime padding.
+const ACCEPTED_CLOCK_SKEW_MS = 5 * 60_000;
 const requestIdStore = new Map<string, { value: string; createdAt: number }>();
 function sweepRequestIds(): void {
   const cutoff = Date.now() - REQUEST_ID_TTL_MS;
@@ -215,7 +220,60 @@ const sharedRequestIdCache = {
   },
 };
 
-function buildAdapter(cfg: SamlConfig): SAML {
+/**
+ * Browser-binding nonces for SP-initiated logins.
+ *
+ * `validateInResponseTo: always` proves the Response answers an
+ * AuthnRequest WE issued — but not that it came back through the SAME
+ * BROWSER that started the login. An attacker could start a login
+ * themselves, intercept their own (valid, unconsumed) SAMLResponse,
+ * and deliver it through the victim's browser: the request id exists
+ * in the shared store, so the victim silently receives the attacker's
+ * session (login CSRF → workspace of the attacker's choosing).
+ *
+ * /login now mints a random nonce per AuthnRequest, stores it here
+ * keyed by the request id, and sets it as a signed, SameSite=None
+ * cookie scoped to the SAML routes. The ACS requires the consumed
+ * Response's InResponseTo to map to the SAME nonce the posting
+ * browser presents — the attacker's relayed Response carries THEIR
+ * request id, which never matches a nonce minted into the victim's
+ * browser. One-use: the mapping is deleted on first consumption.
+ *
+ * In-memory like the request-id store above: same single-process
+ * posture; multi-instance deploys need sticky routing on /auth/saml/*.
+ */
+const txnNonceByRequestId = new Map<string, { nonce: string; createdAt: number }>();
+function sweepTxnNonces(): void {
+  const cutoff = Date.now() - REQUEST_ID_TTL_MS;
+  for (const [key, item] of txnNonceByRequestId) {
+    if (item.createdAt < cutoff) txnNonceByRequestId.delete(key);
+  }
+}
+
+/** Capture slot: records which request id the adapter saved/consumed. */
+interface RequestIdSlot {
+  saved?: string;
+  consumed?: string;
+}
+
+function slottedRequestIdCache(slot: RequestIdSlot): typeof sharedRequestIdCache {
+  return {
+    async saveAsync(key: string, value: string) {
+      slot.saved = key;
+      return sharedRequestIdCache.saveAsync(key, value);
+    },
+    async getAsync(key: string) {
+      return sharedRequestIdCache.getAsync(key);
+    },
+    async removeAsync(key: string | null) {
+      const removed = await sharedRequestIdCache.removeAsync(key);
+      if (removed !== null) slot.consumed = removed;
+      return removed;
+    },
+  };
+}
+
+function buildAdapter(cfg: SamlConfig, slot?: RequestIdSlot): SAML {
   const urls = spUrls(cfg);
   // R88 F5: reject pre-R88 rows still storing "sha1" — the
   // schema enum was tightened to {sha256, sha512} in R88, but
@@ -253,7 +311,7 @@ function buildAdapter(cfg: SamlConfig): SAML {
     // multi-instance deploys need sticky routing on /auth/saml/*.
     validateInResponseTo: ValidateInResponseTo.always,
     requestIdExpirationPeriodMs: REQUEST_ID_TTL_MS,
-    cacheProvider: sharedRequestIdCache,
+    cacheProvider: slot ? slottedRequestIdCache(slot) : sharedRequestIdCache,
     // IdP-side crypto.
     idpCert: cfg.x509Cert,
     // Pin the Issuer: without it, ANY assertion signed by the
@@ -275,7 +333,7 @@ function buildAdapter(cfg: SamlConfig): SAML {
       : undefined,
     // Small tolerance — 5 minutes matches the SAML errata guidance for
     // clock skew between SP and IdP.
-    acceptedClockSkewMs: 5 * 60_000,
+    acceptedClockSkewMs: ACCEPTED_CLOCK_SKEW_MS,
     // Extra hardening: don't accept unsigned assertions even if the IdP
     // is misconfigured. wantAssertionsSigned already handles this but
     // it doesn't hurt to be explicit.
@@ -287,17 +345,28 @@ function buildAdapter(cfg: SamlConfig): SAML {
  * Build the redirect URL to bounce the user to the IdP with a fresh
  * AuthnRequest. RelayState (opaque to the IdP) is preserved so we can
  * restore the caller's deep-link on the ACS.
+ *
+ * Also mints the browser-binding transaction nonce for this
+ * AuthnRequest (see `txnNonceByRequestId`); the route sets it as a
+ * signed cookie and the ACS requires it back.
  */
 export async function buildLoginUrl(
   cfg: SamlConfig,
   relayState: string | null,
-): Promise<string> {
-  const adapter = buildAdapter(cfg);
-  return adapter.getAuthorizeUrlAsync(
+): Promise<{ url: string; txnNonce: string }> {
+  const slot: RequestIdSlot = {};
+  const adapter = buildAdapter(cfg, slot);
+  const url = await adapter.getAuthorizeUrlAsync(
     relayState ?? "",
     undefined /* host */,
     {} /* options */,
   );
+  const txnNonce = crypto.randomBytes(16).toString("hex");
+  sweepTxnNonces();
+  if (slot.saved) {
+    txnNonceByRequestId.set(slot.saved, { nonce: txnNonce, createdAt: Date.now() });
+  }
+  return { url, txnNonce };
 }
 
 /**
@@ -312,11 +381,18 @@ export async function consumeSamlResponse(
   cfg: SamlConfig,
   body: { SAMLResponse?: unknown; RelayState?: unknown },
   now: Date = new Date(),
+  /**
+   * The browser-binding nonce presented by the posting browser (the
+   * unsigned value of the av_saml_txn cookie), or null when absent.
+   * See `txnNonceByRequestId`.
+   */
+  presentedTxnNonce: string | null = null,
 ): Promise<SamlResult> {
   if (typeof body.SAMLResponse !== "string") {
     return { ok: false, error: "no_saml_response" };
   }
-  const adapter = buildAdapter(cfg);
+  const slot: RequestIdSlot = {};
+  const adapter = buildAdapter(cfg, slot);
   let profile: Record<string, unknown> | null;
   try {
     const result = await adapter.validatePostResponseAsync({
@@ -331,6 +407,29 @@ export async function consumeSamlResponse(
     };
   }
   if (!profile) return { ok: false, error: "no_profile" };
+
+  // Browser binding: the consumed InResponseTo must map to the SAME
+  // nonce this browser was handed at /login. Without this, an attacker
+  // who completes a login against the org's IdP THEMSELVES and
+  // intercepts their own unconsumed SAMLResponse can deliver it
+  // through a victim's browser: InResponseTo matches a stored request
+  // id, so the victim silently receives the attacker's session (login
+  // CSRF). The relayed Response's request id maps to a nonce minted
+  // into the ATTACKER's browser, never the victim's. One-use: the
+  // mapping dies on first consumption whatever the outcome.
+  // (validateInResponseTo=always guarantees `slot.consumed` on
+  // success; treat its absence as the same failure, fail-closed.)
+  const expectedTxn = slot.consumed ? txnNonceByRequestId.get(slot.consumed) : undefined;
+  if (slot.consumed) txnNonceByRequestId.delete(slot.consumed);
+  const presentedBuf = Buffer.from(presentedTxnNonce ?? "", "utf8");
+  const expectedBuf = Buffer.from(expectedTxn?.nonce ?? "", "utf8");
+  if (
+    !expectedTxn ||
+    presentedBuf.length !== expectedBuf.length ||
+    !crypto.timingSafeEqual(presentedBuf, expectedBuf)
+  ) {
+    return { ok: false, error: "txn_mismatch" };
+  }
 
   // Enforce the Issuer pin on the LOGIN path. node-saml's `idpIssuer`
   // option (buildAdapter pins it to cfg.entityIdIdp) is only checked by
@@ -403,6 +502,38 @@ export async function consumeSamlResponse(
     return { ok: false, error: "no_stable_assertion_id" };
   }
 
+  // Validated-assertion XML — the same XSW-safe source
+  // extractAssertionId uses (node-saml returns ONLY the
+  // signature-verified, decrypted Assertion element).
+  const assertionXml =
+    typeof (profile as { getAssertionXml?: () => string }).getAssertionXml === "function"
+      ? (profile as { getAssertionXml: () => string }).getAssertionXml()
+      : "";
+
+  // Bearer Recipient pin. node-saml validates the bearer
+  // SubjectConfirmationData's InResponseTo and NotOnOrAfter but NOT its
+  // Recipient — an assertion legitimately signed for a DIFFERENT
+  // service (Recipient pointing at another ACS) was accepted here as
+  // long as issuer + audience matched, breaking the SAML bearer
+  // profile's delivery-endpoint binding. Enforce every Recipient
+  // present in the validated assertion against OUR ACS URL. An absent
+  // attribute stays accepted (the attack shape requires a mismatching
+  // value; a few IdPs omit it).
+  if (assertionXml) {
+    const acsUrl = spUrls(cfg).acsUrl;
+    const recipientRe =
+      /<(?:[\w-]+:)?SubjectConfirmationData\b[^>]*?\bRecipient\s*=\s*"([^"]*)"/g;
+    for (const m of assertionXml.matchAll(recipientRe)) {
+      if (m[1] !== acsUrl) {
+        return {
+          ok: false,
+          error: "recipient_mismatch",
+          detail: truncateWellFormed(m[1] ?? "", 200),
+        };
+      }
+    }
+  }
+
   const notOnOrAfterRaw = profile["notOnOrAfter"];
   const notOnOrAfter =
     notOnOrAfterRaw instanceof Date
@@ -413,6 +544,27 @@ export async function consumeSamlResponse(
 
   if (notOnOrAfter.getTime() < now.getTime()) {
     return { ok: false, error: "assertion_expired" };
+  }
+
+  // Replay-record lifetime: at least the assertion's own acceptance
+  // window. profile.notOnOrAfter is populated by node-saml only from
+  // the bearer SubjectConfirmationData — and is often ABSENT — so the
+  // old now+5min fallback expired replay records BEFORE the assertion
+  // itself: a 20-minute assertion could be swept from the table after
+  // five minutes and replayed inside a fresh, legitimately-issued
+  // Response wrapper (new InResponseTo, same signed assertion).
+  // Derive the window from every NotOnOrAfter in the VALIDATED
+  // assertion (Conditions + SubjectConfirmationData), padded by the
+  // adapter's accepted clock skew; never store less than the fallback.
+  let recordExpiry = new Date(Math.max(notOnOrAfter.getTime(), now.getTime() + 5 * 60_000));
+  if (assertionXml) {
+    let maxMs = recordExpiry.getTime();
+    const notAfterRe = /\bNotOnOrAfter\s*=\s*"([^"]+)"/g;
+    for (const m of assertionXml.matchAll(notAfterRe)) {
+      const t = new Date(m[1] ?? "").getTime();
+      if (Number.isFinite(t) && t > maxMs) maxMs = t;
+    }
+    recordExpiry = new Date(maxMs + ACCEPTED_CLOCK_SKEW_MS);
   }
 
   const seen = await db.samlReplayRecord.findUnique({
@@ -431,7 +583,7 @@ export async function consumeSamlResponse(
       data: {
         orgId: cfg.orgId,
         assertionId,
-        notOnOrAfter,
+        notOnOrAfter: recordExpiry,
       },
     });
   } catch (err) {

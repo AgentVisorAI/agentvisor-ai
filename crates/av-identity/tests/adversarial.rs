@@ -1072,6 +1072,42 @@ fn jwks_key_count_cap_is_exact() {
     );
 }
 
+/// An explicitly-empty `keys` array is authoritative revocation: the
+/// key owner withdrew every signing key. The old blanket "no Ed25519"
+/// error made revocation IMPOSSIBLE — every refresh failed and the
+/// cached keys kept verifying compromised-key tokens forever. Empty
+/// must retire every JWKS-tracked key (fail-closed refusal until keys
+/// reappear) while manually-registered keys survive; a NON-empty
+/// document with zero usable keys stays an error (broken rotation
+/// keeps last-known-good instead of dropping to refuse-everything).
+#[test]
+fn jwks_empty_keys_array_retires_jwks_tracked_keys() {
+    let manual = ed25519_keys("manual-k");
+    let donor = ed25519_keys("jwks-k");
+    let v = validator(&manual);
+    let genuine = serde_json::json!({
+        "keys": [{"kty": "OKP", "crv": "Ed25519", "kid": "jwks-k", "x": donor.public_x}]
+    });
+    assert_eq!(v.add_jwks(&genuine).unwrap(), 1);
+    let before = v.key_count();
+
+    let empty = serde_json::json!({ "keys": [] });
+    assert_eq!(
+        v.add_jwks(&empty).unwrap(),
+        0,
+        "explicit empty keys array is a valid, authoritative revocation"
+    );
+    assert_eq!(
+        v.key_count(),
+        before - 1,
+        "the JWKS-tracked key must be retired; the manual key must survive"
+    );
+
+    // Non-empty-but-unusable stays a refresh error (misconfig shape).
+    let rsa_only = serde_json::json!({ "keys": [{"kty": "RSA"}] });
+    assert!(matches!(v.add_jwks(&rsa_only), Err(IdentityError::Jwks(ref m)) if m.contains("no Ed25519")),);
+}
+
 #[test]
 fn jwks_filter_requires_both_okp_and_ed25519() {
     let keys = ed25519_keys("k1");

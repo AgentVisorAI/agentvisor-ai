@@ -64,7 +64,13 @@ function ipv6ToBigInt(ip: string): bigint {
 }
 
 export function parseCidr(cidr: string): ParsedCidr {
-  const [addr, prefixStr] = cidr.split("/");
+  const parts = cidr.split("/");
+  // Exactly one slash: "10.0.0.0/0/24" used to destructure into
+  // addr="10.0.0.0", prefix="0" — the trailing "/24" silently vanished
+  // and the stored rule matched EVERYTHING (allow-all from a typo'd
+  // row, the fail-open direction an allowlist must never take).
+  if (parts.length !== 2) throw new Error("missing_prefix");
+  const [addr, prefixStr] = parts;
   if (!addr || prefixStr === undefined) throw new Error("missing_prefix");
   // R203 F1: strict integer parse. Prior shape used
   // `parseInt(prefixStr, 10)` which returns:
@@ -98,6 +104,10 @@ export function parseCidr(cidr: string): ParsedCidr {
   // certainly not what a fat-fingered operator meant).
   if (prefixStr.trim().length === 0) throw new Error("bad_prefix");
   if (!Number.isInteger(prefix)) throw new Error("bad_prefix");
+  // Decimal digits only. Number() accepts hex/binary/octal literal
+  // strings — "0x0" parsed to 0 and turned a malformed row into a /0
+  // allow-all. A prefix is 1-3 decimal digits, nothing else.
+  if (!/^\d{1,3}$/.test(prefixStr.trim())) throw new Error("bad_prefix");
   const version = isIP(addr);
   if (version === 4) {
     if (prefix < 0 || prefix > 32) throw new Error("bad_prefix");
@@ -111,42 +121,71 @@ export function parseCidr(cidr: string): ParsedCidr {
 }
 
 /**
- * True if the given IP falls inside the CIDR.
- * IP version mismatch is a fast false — no cross-family matches.
+ * Every (version, value) form a client address legitimately embodies.
+ * IPv4-mapped IPv6 is detected NUMERICALLY (value inside ::ffff:0:0/96),
+ * so `::FFFF:192.0.2.1` (case), `::ffff:c000:201` (hex groups) and
+ * `::ffff:192.0.2.1` (dotted) all yield the same two forms. The old
+ * string `startsWith("::ffff:")` strip made equivalent encodings of one
+ * address take different allowlist decisions — and stripping DISCARDED
+ * the v6 form, so a dotted mapped client failed a ::ffff:0:0/96 rule
+ * the hex form matched. Symmetrically, a plain v4 client also gets its
+ * mapped-v6 form so operators can write either rule family.
  */
-export function ipInCidr(ip: string, cidr: ParsedCidr): boolean {
-  const clientVersion = isIP(ip);
-  if (clientVersion === 0) return false;
-  // Cross-family: v4 IP can still match a v6 CIDR that's actually a
-  // v4-mapped range like ::ffff:0:0/96. Simpler: convert v4-in-v6
-  // sentinels back to plain v4 when needed. For now, require exact
-  // family match — RFC 4291 says v4 should be tested with v4 CIDRs.
-  if (clientVersion !== cidr.version) return false;
-  let clientBig: bigint;
-  try {
-    clientBig = cidr.version === 4 ? ipv4ToBigInt(ip) : ipv6ToBigInt(ip);
-  } catch {
-    return false;
+const MAPPED_BASE = 0xffffn << 32n;
+function clientForms(ip: string): { version: 4 | 6; value: bigint }[] {
+  const version = isIP(ip);
+  if (version === 4) {
+    try {
+      const v4 = ipv4ToBigInt(ip);
+      return [
+        { version: 4, value: v4 },
+        { version: 6, value: MAPPED_BASE | v4 },
+      ];
+    } catch {
+      return [];
+    }
   }
+  if (version === 6) {
+    try {
+      const v6 = ipv6ToBigInt(ip);
+      const forms: { version: 4 | 6; value: bigint }[] = [{ version: 6, value: v6 }];
+      if (v6 >> 32n === 0xffffn) {
+        forms.push({ version: 4, value: v6 & 0xffffffffn });
+      }
+      return forms;
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
+function formInCidr(form: { version: 4 | 6; value: bigint }, cidr: ParsedCidr): boolean {
+  if (form.version !== cidr.version) return false;
   const bits = cidr.version === 4 ? 32 : 128;
   const shift = BigInt(bits - cidr.prefix);
   if (shift < 0n) return false;
   if (shift >= BigInt(bits)) return true; // /0 = match anything
-  return (clientBig >> shift) === (cidr.base >> shift);
+  return (form.value >> shift) === (cidr.base >> shift);
+}
+
+/**
+ * True if the given IP falls inside the CIDR.
+ * Cross-family matches only via the IPv4-mapped equivalence
+ * (see `clientForms`).
+ */
+export function ipInCidr(ip: string, cidr: ParsedCidr): boolean {
+  return clientForms(ip).some((form) => formInCidr(form, cidr));
 }
 
 export function ipMatchesAny(ip: string, cidrs: string[]): boolean {
   if (cidrs.length === 0) return true; // empty = allow-all
-  // Normalize v4-mapped v6 like ::ffff:1.2.3.4 into 1.2.3.4 for
-  // matching against v4 CIDRs (common on dual-stack listeners).
-  let ipToMatch = ip;
-  if (ip.startsWith("::ffff:")) {
-    const stripped = ip.slice("::ffff:".length);
-    if (isIP(stripped) === 4) ipToMatch = stripped;
-  }
+  const forms = clientForms(ip);
+  if (forms.length === 0) return false;
   for (const c of cidrs) {
     try {
-      if (ipInCidr(ipToMatch, parseCidr(c))) return true;
+      const parsed = parseCidr(c);
+      if (forms.some((form) => formInCidr(form, parsed))) return true;
     } catch {
       // Malformed row in DB — skip. PATCH refuses malformed inputs so
       // this shouldn't happen in practice.

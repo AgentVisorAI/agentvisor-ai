@@ -370,6 +370,27 @@ impl IdentityValidator {
             }
         }
         if parsed.is_empty() {
+            // An explicitly-EMPTY `keys` array is authoritative
+            // revocation: the key owner withdrew every signing key
+            // (compromise response). The old blanket error here made
+            // revocation impossible — every refresh failed and the
+            // cached keys verified compromised-key tokens forever.
+            // Retiring the JWKS-tracked keys fails closed: with no
+            // usable keys, every token is refused until the endpoint
+            // publishes keys again. A NON-empty document with zero
+            // usable Ed25519 OKP entries stays an error (that shape is
+            // a misconfigured endpoint — RSA-only, malformed — not a
+            // deliberate withdrawal), so a broken rotation keeps the
+            // last-known-good keys rather than dropping enforcement
+            // into refuse-everything.
+            if keys.is_empty() {
+                let mut loaded = self.keys.write();
+                let mut prior = self.jwks_kids.write();
+                for kid in prior.drain() {
+                    loaded.remove(&kid);
+                }
+                return Ok(0);
+            }
             return Err(IdentityError::Jwks("no Ed25519 OKP keys found".to_owned()));
         }
         let mut loaded = self.keys.write();

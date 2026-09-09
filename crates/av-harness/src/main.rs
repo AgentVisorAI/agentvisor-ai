@@ -1432,6 +1432,19 @@ async fn build_identity(
                 let validator = validator.as_ref();
                 let tick = std::panic::AssertUnwindSafe(async move {
                     match refresh_jwks(client, url, validator).await {
+                        Ok(0) => {
+                            // Authoritative revocation: the endpoint
+                            // published an explicitly-empty keys array
+                            // and every JWKS-tracked key was retired
+                            // (fail-closed: tokens now refuse until
+                            // keys reappear). Loud by design.
+                            tracing::warn!(
+                                "JWKS published an empty keys array; every JWKS-tracked \
+                                 verification key retired (manual keys untouched) — \
+                                 identity-required requests will refuse until the \
+                                 endpoint publishes keys again"
+                            );
+                        }
                         Ok(_) => {}
                         Err(error) => {
                             refresh_errors.inc();
@@ -1922,16 +1935,10 @@ fn install_seed_exclusive(path: &Path, encoded: &str) -> Result<bool> {
         .with_context(|| format!("sync signing seed temporary file {}", temporary.display()))?;
     match std::fs::hard_link(&temporary, path) {
         Ok(()) => {
-            // The seed IS installed at `path` at this
-            // point (hard_link committed). Degrade the remaining
-            // best-effort ops (tmp unlink, parent fsync) to warn
-            // rather than returning Err — otherwise a spurious EIO on
-            // sync_directory made the harness fail startup even
-            // though the seed was correctly installed, wasting one
-            // boot cycle to a misleading error. On next boot,
-            // hard_link → AlreadyExists → Ok(false) and the caller
-            // reads back the seed — self-corrects, but the noisy
-            // failure is now avoided at source.
+            // The seed IS installed at `path` at this point
+            // (hard_link committed). The tmp unlink stays best-effort
+            // (warn; guard drop retries) — but the parent-directory
+            // fsync below is NOT: see its comment.
             match std::fs::remove_file(&temporary) {
                 // Only a successful unlink may disarm the guard — an
                 // unconditional disarm made "guard drop will retry" a
@@ -1945,13 +1952,24 @@ fn install_seed_exclusive(path: &Path, encoded: &str) -> Result<bool> {
                     );
                 }
             }
-            if let Err(error) = av_core::fsutil::sync_directory(parent) {
-                tracing::warn!(
-                    dir = %av_core::fsutil::basename(parent),
-                    %error,
-                    "signing seed installed, but parent directory fsync failed; dirent may not survive an immediate power loss"
-                );
-            }
+            // Durability is part of key installation: the seed inode
+            // is fsynced, but without the parent-directory fsync the
+            // DIRENT naming it can vanish in a power loss — the next
+            // boot would then generate a DIFFERENT trust anchor and
+            // every receipt signed this run would verify against a key
+            // the daemon no longer holds (silent trust-anchor swap,
+            // the worst failure mode an evidence product has). Refuse
+            // to serve under a key whose installation isn't durable;
+            // the message steers the operator away from deleting the
+            // (intact) seed file.
+            av_core::fsutil::sync_directory(parent).with_context(|| {
+                format!(
+                    "signing seed installed at {} but the parent directory fsync failed; \
+                     the seed file is intact — do NOT delete it; restart to retry the \
+                     durability sync",
+                    path.display()
+                )
+            })?;
             Ok(true)
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
