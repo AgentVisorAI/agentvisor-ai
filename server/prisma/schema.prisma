@@ -82,6 +82,23 @@ model WebauthnCredential {
   @@map("webauthn_credentials")
 }
 
+// Server-side single-use record for WebAuthn ceremony challenges. The
+// challenge travels in a client-held (encrypted, signed) cookie, so
+// clearing that cookie on completion is client-honored only: a captured
+// verify request + cookies replayed within the 5-minute TTL re-minted a
+// session per replay (zero-counter authenticators never trip the clone
+// CAS). Inserting sha256(challenge) here with the primary key as the
+// uniqueness anchor makes consumption atomic — the second use hits
+// P2002 and is refused. Rows are garbage-collected opportunistically
+// after 2× the challenge TTL.
+model WebauthnCeremonyRecord {
+  challengeHash String   @id
+  usedAt        DateTime @default(now())
+
+  @@index([usedAt])
+  @@map("webauthn_ceremony_records")
+}
+
 // A tenant boundary — a team/company account. Every deployment, session,
 // receipt, and event belongs to exactly one org.
 model Org {

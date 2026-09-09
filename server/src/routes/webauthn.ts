@@ -31,6 +31,7 @@
  */
 
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
 import { z } from "zod";
 import {
   generateAuthenticationOptions,
@@ -104,7 +105,7 @@ function setChallengeCookie(
   name: string,
   bag: Record<string, unknown>,
 ): void {
-  reply.setCookie(name, JSON.stringify({ ...bag, iat: Math.floor(Date.now() / 1000) }), {
+  reply.setCookie(name, encryptBag({ ...bag, iat: Math.floor(Date.now() / 1000) }), {
     ...SESSION_COOKIE_OPTS,
     signed: true,
     maxAge: CHALLENGE_TTL_S,
@@ -112,6 +113,41 @@ function setChallengeCookie(
     // ride with unrelated requests.
     path: "/api/v1/auth/webauthn",
   });
+}
+
+// Challenge bags are ENCRYPTED, not just signed: the signed-plaintext
+// shape let the cookie's own holder read `userId: null` (decoy) vs a
+// string (real) straight out of their authenticate-challenge cookie —
+// a zero-interaction password-validity oracle that defeated the decoy
+// masking (submit candidate password to /login, carry the gate to
+// /authenticate/challenge, decode own cookie). AES-256-GCM with a key
+// derived from JWT_SECRET keeps the bag tamper-authenticated AND
+// opaque; real and decoy cookies are indistinguishable ciphertext.
+// (Residual, accepted: a caller holding the CORRECT password sees real
+// allowCredentials ids in the response body — post-password disclosure
+// of credential ids, not a validity oracle a wrong password can read.)
+const BAG_KEY = createHash("sha256").update(`webauthn-challenge-bag:${env.JWT_SECRET}`).digest();
+
+function encryptBag(bag: Record<string, unknown>): string {
+  const iv = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", BAG_KEY, iv);
+  const ciphertext = Buffer.concat([cipher.update(JSON.stringify(bag), "utf8"), cipher.final()]);
+  return Buffer.concat([iv, cipher.getAuthTag(), ciphertext]).toString("base64url");
+}
+
+function decryptBag(payload: string): Record<string, unknown> | null {
+  try {
+    const raw = Buffer.from(payload, "base64url");
+    if (raw.length < 12 + 16) return null;
+    const decipher = createDecipheriv("aes-256-gcm", BAG_KEY, raw.subarray(0, 12));
+    decipher.setAuthTag(raw.subarray(12, 28));
+    const plaintext = Buffer.concat([decipher.update(raw.subarray(28)), decipher.final()]);
+    const bag: unknown = JSON.parse(plaintext.toString("utf8"));
+    if (typeof bag !== "object" || bag === null) return null;
+    return bag as Record<string, unknown>;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -127,13 +163,8 @@ function readChallengeCookie(
   if (!raw) return null;
   const unsigned = req.unsignCookie(raw);
   if (!unsigned.valid || unsigned.value === null) return null;
-  let bag: unknown;
-  try {
-    bag = JSON.parse(unsigned.value);
-  } catch {
-    return null;
-  }
-  if (typeof bag !== "object" || bag === null) return null;
+  const bag = decryptBag(unsigned.value);
+  if (bag === null) return null;
   const iat = (bag as { iat?: unknown }).iat;
   if (typeof iat !== "number") return null;
   const age = Math.floor(Date.now() / 1000) - iat;
@@ -147,6 +178,30 @@ function clearChallengeCookie(reply: FastifyReply, name: string): void {
     maxAge: 0,
     path: "/api/v1/auth/webauthn",
   });
+}
+
+/**
+ * Atomically consume a ceremony challenge (register + authenticate).
+ * Returns false when this exact challenge was already consumed — the
+ * caller refuses with its uniform wire shape. Piggybacks a fire-and-
+ * forget sweep of rows older than 2× the challenge TTL (they can never
+ * be presented again — readChallengeCookie enforces the TTL first).
+ */
+async function consumeCeremonyChallenge(challenge: string | null): Promise<boolean> {
+  if (!challenge) return false;
+  const challengeHash = createHash("sha256").update(challenge).digest("hex");
+  try {
+    await db.webauthnCeremonyRecord.create({ data: { challengeHash } });
+  } catch (err) {
+    if (typeof err === "object" && err !== null && (err as { code?: string }).code === "P2002") {
+      return false;
+    }
+    throw err;
+  }
+  db.webauthnCeremonyRecord
+    .deleteMany({ where: { usedAt: { lt: new Date(Date.now() - 2 * CHALLENGE_TTL_S * 1000) } } })
+    .catch(() => undefined);
+  return true;
 }
 
 // Helpers for base64url <-> Uint8Array. SimpleWebAuthn talks base64url
@@ -399,6 +454,11 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
       clearChallengeCookie(reply, REG_CHALLENGE_COOKIE);
       return reply.code(400).send({ error: "not_verified" });
     }
+    if (!(await consumeCeremonyChallenge(cookieChallenge))) {
+      req.log.warn({ userId: claims.sub }, "webauthn_register_challenge_replayed");
+      clearChallengeCookie(reply, REG_CHALLENGE_COOKIE);
+      return reply.code(400).send({ error: "not_verified" });
+    }
     const info = verified.registrationInfo;
 
     // Persist the credential. If it already exists for this user (shouldn't
@@ -557,7 +617,7 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
     // backstop). Missing/expired/mismatched gates take the SAME decoy
     // path as unknown emails — no new wire, timing, or cookie-shape
     // oracle: mfaGateAuthorizes is a constant-time MAC check either way.
-    const useDecoy = realCreds.length === 0 || !mfaGateAuthorizes(req, user!.id);
+    const useDecoy = realCreds.length === 0 || !mfaGateAuthorizes(req, user!.id, user!.sessionRevokedAt);
     const allowCredentials = useDecoy
       ? await deriveDecoyCredentials(body.data.email)
       : realCreds.map((c) => ({
@@ -715,6 +775,19 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
       // R143 F1: same wire uniformity as the catch above.
       return reply.code(400).send({ error: "unknown_credential" });
     }
+    // Server-side single-use: consume the challenge BEFORE any state
+    // mutation or minting. The cookies are client-held, so the
+    // cookie-clearing below is advisory — a captured verify request
+    // (assertion + challenge + gate cookies) replayed within the TTL
+    // otherwise re-minted a full session per replay: zero-counter
+    // authenticators (explicitly allowed — many platform keys ship no
+    // counter) satisfy the clone CAS on every replay. Uniform wire
+    // shape on refusal; the forensic distinction lives in the log.
+    if (!(await consumeCeremonyChallenge(bag.challenge))) {
+      req.log.warn({ credId: cred.id }, "webauthn_auth_challenge_replayed");
+      clearChallengeCookie(reply, AUTH_CHALLENGE_COOKIE);
+      return reply.code(400).send({ error: "unknown_credential" });
+    }
 
     // Clone detection — signCount must strictly increase.
     const newCounter = BigInt(verified.authenticationInfo.newCounter);
@@ -740,7 +813,17 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
     // password-verified gate for THIS credential's user. Runs BEFORE
     // the counter bump so an ungated possession-only attempt mutates
     // nothing. Same uniform wire shape as every other failure leg.
-    if (!mfaGateAuthorizes(req, cred.userId)) {
+    // The CURRENT revocation floor rides into the gate MAC, so a fence
+    // bump (password reset/change, logout-all, credential revoke)
+    // between gate issuance and this check invalidates the gate —
+    // closing the retained-gate-across-reset window and shrinking the
+    // delete-credential-vs-mint race to the milliseconds between this
+    // read and the session mint below.
+    const gateOwner = await db.user.findUnique({
+      where: { id: cred.userId },
+      select: { sessionRevokedAt: true },
+    });
+    if (!gateOwner || !mfaGateAuthorizes(req, cred.userId, gateOwner.sessionRevokedAt)) {
       req.log.warn(
         { credId: cred.id, userId: cred.userId },
         "webauthn_auth_without_password_gate",

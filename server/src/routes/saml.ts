@@ -364,9 +364,16 @@ export async function samlRoutes(app: FastifyInstance): Promise<void> {
           const u = await tx.user.create({
                 data: {
                   email: result.email,
-                  // The org's configured IdP asserted this address —
-                  // mailbox control is proven at creation.
-                  emailVerifiedAt: new Date(),
+                  // Deliberately NOT emailVerifiedAt: the asserting IdP
+                  // is TENANT-configured (its admin can assert any
+                  // address), and emailVerifiedAt is the trust anchor
+                  // the OAuth pre-hijack gate relies on. A JIT row
+                  // verified at birth let an attacker's own IdP
+                  // pre-claim a victim email as "verified", so the
+                  // victim's later Google/Microsoft login merged into
+                  // the attacker-created account. SAML sign-in never
+                  // consults the flag; mailbox proofs stay reserved
+                  // for flows the mailbox owner performs.
                   // A JIT user has no password. Login endpoint uses the
                   // dummy hash on lookup miss so this doesn't create a
                   // timing side channel — but the row still needs a
@@ -396,24 +403,27 @@ export async function samlRoutes(app: FastifyInstance): Promise<void> {
         membership = provisioned.membership;
       }
 
-      // Existing users signing in through the org's configured IdP get
-      // the same mailbox-control proof JIT-created users get at birth —
-      // the IdP asserted this exact address. Without this backfill, a
-      // password-era account that later moved to SAML stayed
-      // "unverified" forever and the OAuth pre-hijack gate refused it,
-      // even though its mailbox is proven on every SSO sign-in.
-      if (user && !user.emailVerifiedAt) {
-        await db.user.update({
-          where: { id: user.id },
-          data: { emailVerifiedAt: new Date() },
-        });
-      }
+      // Tenant-configured SAML must NOT establish global mailbox
+      // verification: the org admin controls the IdP and can assert
+      // ANY email, so the old backfill here (and a verified-at-birth
+      // flag on JIT rows) let an attacker who pre-registered a
+      // victim's address flip it to "verified" through their own IdP —
+      // and emailVerifiedAt is exactly the gate the OAuth pre-hijack
+      // defense trusts before merging a Google/Microsoft login into an
+      // existing account. Mailbox verification stays reserved for
+      // proofs the mailbox owner performed (invite accept, email-change
+      // confirm, reset confirm). SAML sign-in itself never needs the
+      // flag.
 
-      // Everything lines up. Mint an av_session JWT.
+      // Everything lines up. Mint an av_session JWT, PINNED to this
+      // org (see SessionClaims.ssoOrgId): the asserting IdP speaks for
+      // this workspace only, so the session must not widen into the
+      // user's other orgs via /switch-org.
       const token = await mintSession({
         sub: user!.id,
         orgId: cfg.orgId,
         membershipRole: membership.role as "owner" | "admin" | "member",
+        ssoOrgId: cfg.orgId,
       });
       reply.setCookie(env.SESSION_COOKIE_NAME, token, SESSION_COOKIE_OPTS);
       writeAudit(

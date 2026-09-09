@@ -2363,17 +2363,19 @@ pub(crate) async fn persist_broker_ack(
     .map_err(|error| error.to_string())?
 }
 
-/// Byte cap for the per-session broker-ack journal read at recovery.
-/// The journal is append-only with NO write-side cap: one sealed ack
-/// line per published event (~0.3–0.6 KiB), so a long multi-turn
-/// session accumulates acks linearly. `MAX_CONTROL_BYTES` (1 MiB,
-/// ~2–3k acks) was silently too small: `read_capped` refuses oversize
-/// files outright, so the first restart after a session crossed the
-/// cap made EVERY `read_broker_ack` for it fail and recovery skip the
-/// session forever — its artifact could never be produced. 16 MiB
-/// (matching the `MAX_RECEIPT_BYTES` class) clears ~30–50k acks while
-/// still bounding a hostile plant.
-const MAX_ACK_JOURNAL_BYTES: u64 = 16 * 1024 * 1024;
+/// Per-RECORD bound for ack-journal lines. Individual sealed ack
+/// records are ~300 bytes, so 1 MiB (the MAX_CONTROL_BYTES class) is
+/// far above any legitimate record while keeping a hostile oversized
+/// line from ballooning memory. The journal FILE is deliberately
+/// unbounded: it grows one line per published event for the session's
+/// whole life, and every previous WHOLE-FILE cap here (1 MiB in the
+/// first shape, then 16 MiB) recreated the same outage one order of
+/// magnitude later — the first restart after a busy session crossed
+/// the cap made EVERY `read_broker_ack` for it fail and recovery
+/// skipped the session forever, stranding acknowledged evidence.
+/// Stream line-by-line instead so journal length can never invalidate
+/// the evidence inside it.
+const MAX_ACK_RECORD_BYTES: u64 = 1024 * 1024;
 
 pub(crate) async fn read_broker_ack(
     directory: &std::path::Path,
@@ -2382,23 +2384,53 @@ pub(crate) async fn read_broker_ack(
     journal_key: &[u8; 32],
 ) -> Result<Option<PublishAck>, String> {
     // New layout first: scan the per-session ack journal. Recovery-only
-    // path, so the linear scan per lookup is acceptable (the journal is
-    // capped at MAX_ACK_JOURNAL_BYTES, see above).
+    // path, so the linear scan per lookup is acceptable; memory is
+    // bounded per RECORD (see MAX_ACK_RECORD_BYTES), not per file.
     {
         let path = ack_journal_path(directory, session_id);
-        let bytes = match tokio::task::spawn_blocking({
-            let path = path.clone();
-            move || av_core::fsutil::read_capped(&path, MAX_ACK_JOURNAL_BYTES)
-        })
-        .await
-        .map_err(|error| error.to_string())?
-        {
-            Ok(bytes) => Some(bytes),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error.to_string()),
-        };
-        if let Some(bytes) = bytes {
-            for line in bytes.split(|byte| *byte == b'\n') {
+        let session = session_id.to_owned();
+        let uid = event_uid.to_owned();
+        let key = *journal_key;
+        let found = tokio::task::spawn_blocking(move || -> Result<Option<PublishAck>, String> {
+            use std::io::{BufRead as _, Read as _};
+            let file = match std::fs::File::open(&path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error.to_string()),
+            };
+            let mut reader = std::io::BufReader::new(file);
+            let mut buf: Vec<u8> = Vec::new();
+            loop {
+                buf.clear();
+                let read = {
+                    let mut limited = (&mut reader).take(MAX_ACK_RECORD_BYTES);
+                    limited
+                        .read_until(b'\n', &mut buf)
+                        .map_err(|error| error.to_string())?
+                };
+                if read == 0 {
+                    break;
+                }
+                if buf.last() != Some(&b'\n') && read as u64 == MAX_ACK_RECORD_BYTES {
+                    // Oversized line (hostile plant or corruption): drain
+                    // to its newline in bounded chunks and keep scanning —
+                    // one bad line must not poison the intact acks around
+                    // it (same skip posture as the MAC-failure arm below).
+                    loop {
+                        buf.clear();
+                        let drained = {
+                            let mut limited = (&mut reader).take(MAX_ACK_RECORD_BYTES);
+                            limited
+                                .read_until(b'\n', &mut buf)
+                                .map_err(|error| error.to_string())?
+                        };
+                        if drained == 0 || buf.last() == Some(&b'\n') {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                let line = buf.strip_suffix(b"\n").unwrap_or(&buf);
                 if line.is_empty() {
                     continue;
                 }
@@ -2406,14 +2438,19 @@ pub(crate) async fn read_broker_ack(
                 // must not poison the earlier, intact acks: skip lines
                 // that fail to open and keep scanning. "No ack found"
                 // degrades to a re-publish, exactly like a lost file.
-                let Ok(record) = crate::journal::open::<BrokerAckRecord>(journal_key, "broker-ack", 0, line)
-                else {
+                let Ok(record) = crate::journal::open::<BrokerAckRecord>(&key, "broker-ack", 0, line) else {
                     continue;
                 };
-                if record.session_id == session_id && record.event_uid == event_uid {
+                if record.session_id == session && record.event_uid == uid {
                     return Ok(Some(record.ack));
                 }
             }
+            Ok(None)
+        })
+        .await
+        .map_err(|error| error.to_string())??;
+        if found.is_some() {
+            return Ok(found);
         }
     }
     // Legacy layout fallback (older per-event files), so a
@@ -4310,5 +4347,75 @@ mod ack_journal_tests {
             .await
             .unwrap();
         assert_eq!(found.map(|ack| ack.offset), Some(7));
+    }
+
+    /// Journal LENGTH must never invalidate the evidence inside it.
+    /// Every previous whole-file read cap (1 MiB, then 16 MiB)
+    /// recreated the same outage one order of magnitude later: the
+    /// first restart after a busy session crossed the cap failed EVERY
+    /// ack lookup and recovery skipped the session forever. The scan
+    /// now streams per-record — an ack sitting past the old 16 MiB
+    /// mark must be found, and an oversized garbage line mid-file must
+    /// be skipped without poisoning its intact neighbors.
+    #[tokio::test]
+    async fn ack_scan_survives_journals_past_the_old_cap_and_oversized_lines() {
+        let directory = tempfile::tempdir().unwrap();
+        let key = [9u8; 32];
+        let ack = PublishAck {
+            topic: "t".to_owned(),
+            partition: 0,
+            offset: 42,
+        };
+        persist_broker_ack(directory.path(), "s1", "evt-first", &ack, &key)
+            .await
+            .unwrap();
+        let journal = ack_journal_path(directory.path(), "s1");
+        {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new().append(true).open(&journal).unwrap();
+            // An oversized single line (2 MiB > MAX_ACK_RECORD_BYTES)
+            // that must be drained and skipped, not fatal.
+            let oversized = vec![b'x'; 2 * 1024 * 1024];
+            file.write_all(&oversized).unwrap();
+            file.write_all(b"\n").unwrap();
+            // Bulk filler pushing the file past the old 16 MiB
+            // whole-file cap, as many well-formed-but-foreign lines.
+            let filler = vec![b'y'; 8 * 1024];
+            for _ in 0..2_200 {
+                file.write_all(&filler).unwrap();
+                file.write_all(b"\n").unwrap();
+            }
+        }
+        // The ack the session actually needs lands at the very end,
+        // past the old cap.
+        let tail_ack = PublishAck {
+            topic: "t".to_owned(),
+            partition: 0,
+            offset: 77,
+        };
+        persist_broker_ack(directory.path(), "s1", "evt-tail", &tail_ack, &key)
+            .await
+            .unwrap();
+        assert!(
+            std::fs::metadata(&journal).unwrap().len() > 16 * 1024 * 1024,
+            "test setup: journal must exceed the old whole-file cap",
+        );
+
+        let found = read_broker_ack(directory.path(), "s1", "evt-tail", &key)
+            .await
+            .unwrap();
+        assert_eq!(
+            found.map(|ack| ack.offset),
+            Some(77),
+            "an ack past the old 16 MiB cap must still be found",
+        );
+        let first = read_broker_ack(directory.path(), "s1", "evt-first", &key)
+            .await
+            .unwrap();
+        assert_eq!(
+            first.map(|ack| ack.offset),
+            Some(42),
+            "the oversized garbage line must not poison earlier acks",
+        );
     }
 }

@@ -361,7 +361,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     // endpoints treat a decoy/absent gate exactly like an unknown
     // email: decoy credentials, uniform failure.
     const mfaGateResponse = (verifiedUserId: string | null = null) => {
-      setMfaGateCookie(reply, verifiedUserId);
+      setMfaGateCookie(reply, verifiedUserId, user?.sessionRevokedAt ?? null);
       return reply.send({ mfaRequired: true });
     };
     if (!user || !ok) {
@@ -624,6 +624,28 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     if (!body.success) return reply.code(400).send({ error: "invalid_input" });
     if (body.data.orgId === claims.orgId) {
       return reply.code(400).send({ error: "already_active_org" });
+    }
+    // SAML-minted sessions are pinned to the org whose IdP asserted the
+    // identity (see SessionClaims.ssoOrgId): a tenant admin controls
+    // their own IdP and can assert any email, so letting such a session
+    // widen into the user's OTHER orgs made every multi-org member
+    // impersonable by any one of their workspaces' owners. The victim's
+    // other orgs stay reachable only via a global credential (password,
+    // passkey, OIDC) — i.e. a fresh /login.
+    if (claims.ssoOrgId && claims.ssoOrgId !== body.data.orgId) {
+      writeAudit(
+        {
+          orgId: claims.orgId,
+          event: "auth.org_switch_refused_sso_pinned",
+          actorId: claims.sub,
+          actorEmail: "",
+          target: body.data.orgId,
+          metadata: { ssoOrgId: claims.ssoOrgId },
+          req,
+        },
+        req.log,
+      );
+      return reply.code(403).send({ error: "sso_session_org_locked" });
     }
     const membership = await db.membership.findFirst({
       where: { userId: claims.sub, orgId: body.data.orgId },

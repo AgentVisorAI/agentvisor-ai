@@ -284,6 +284,32 @@ async function main() {
   const cloneBody = await clone.text();
   results.push({ drill: "clone-detected", status: clone.status, expect: 400, body: cloneBody.slice(0, 100) });
 
+  // ============ 4d. Captured-request replay refused ============
+  // The ceremony cookies are client-held, so cookie-clearing on a
+  // successful verify is advisory: pre-fix, a captured verify request
+  // (assertion + challenge cookie + gate cookie) replayed within the
+  // 5-minute TTL re-minted a full session per replay — zero-counter
+  // authenticators never trip the clone CAS, and even counter-bearing
+  // ones only trip it because THIS drill's authenticator increments.
+  // The server now consumes sha256(challenge) in
+  // webauthn_ceremony_records; replaying section 4's SUCCESSFUL verify
+  // byte-for-byte must be refused with the uniform wire shape and MUST
+  // NOT set av_session. (Reuses the section-4 request so this adds
+  // exactly one verify call to the rate-limit budget.)
+  console.log("[4d] Captured verify replay");
+  if (ok4.status !== 200) {
+    throw new Error("replay baseline: section 4's verify should have minted, got " + ok4.status);
+  }
+  const replayed = await fetch(`${API}/api/v1/auth/webauthn/authenticate/verify`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Origin: SPA_ORIGIN, "Sec-Fetch-Site": "same-origin", Cookie: `${authCookie4a}; ${gate4a}` },
+    body: JSON.stringify({ response: goodAssertion }),
+  });
+  if ((replayed.headers.get("set-cookie") ?? "").includes("av_session=")) {
+    throw new Error("replayed verify minted a SECOND session — challenge consumption bypassed!");
+  }
+  results.push({ drill: "verify-replay-refused", status: replayed.status, expect: 400 });
+
   // ============ 4c. Possession-only login refused ============
   // A registered authenticator WITHOUT a fresh password check must not
   // complete login: the ungated challenge serves decoy credentials and

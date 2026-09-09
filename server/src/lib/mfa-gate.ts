@@ -35,7 +35,7 @@ export const MFA_GATE_COOKIE = "av_mfa_gate";
 /** Matches the ceremony-challenge TTL: 5 minutes to touch the key. */
 export const MFA_GATE_TTL_S = 300;
 
-function gateMac(userId: string, iat: number, nonce: Buffer): Buffer {
+function gateMac(userId: string, iat: number, nonce: Buffer, revokedFloor: number): Buffer {
   const h = createHmac("sha256", env.JWT_SECRET);
   h.update("webauthn:mfa-gate:");
   h.update(userId);
@@ -43,7 +43,22 @@ function gateMac(userId: string, iat: number, nonce: Buffer): Buffer {
   h.update(String(iat));
   h.update(":");
   h.update(nonce);
+  h.update(":");
+  // The account's security-revocation floor at issuance. Verification
+  // recomputes with the CURRENT floor, so any fence bump — password
+  // reset, password change, logout-all, credential revocation —
+  // instantly invalidates every outstanding gate instead of letting a
+  // pre-reset password proof (attacker with the OLD password + a
+  // registered authenticator) finish a fresh ceremony for up to the
+  // 5-minute TTL after the victim break-glassed the account.
+  h.update(String(revokedFloor));
   return h.digest();
+}
+
+/** The gate's revocation-binding input: seconds floor of the user's
+ * sessionRevokedAt (0 when never revoked). */
+function revocationFloor(sessionRevokedAt: Date | null): number {
+  return sessionRevokedAt ? Math.floor(sessionRevokedAt.getTime() / 1000) : 0;
 }
 
 /**
@@ -52,7 +67,11 @@ function gateMac(userId: string, iat: number, nonce: Buffer): Buffer {
  * presence/absence cannot become the password-validity oracle R85 F3
  * closed on the response body.
  */
-export function setMfaGateCookie(reply: FastifyReply, verifiedUserId: string | null): void {
+export function setMfaGateCookie(
+  reply: FastifyReply,
+  verifiedUserId: string | null,
+  sessionRevokedAt: Date | null,
+): void {
   const iat = Math.floor(Date.now() / 1000);
   // Fresh per-cookie nonce, MAC'd for real gates. Without it the real
   // MAC was gateMac(userId, iat) — DETERMINISTIC within a second — so
@@ -63,7 +82,10 @@ export function setMfaGateCookie(reply: FastifyReply, verifiedUserId: string | n
   // scheme implements. With the nonce in the MAC input, real and decoy
   // cookies are both unique per issuance.
   const nonce = randomBytes(16);
-  const mac = verifiedUserId === null ? randomBytes(32) : gateMac(verifiedUserId, iat, nonce);
+  const mac =
+    verifiedUserId === null
+      ? randomBytes(32)
+      : gateMac(verifiedUserId, iat, nonce, revocationFloor(sessionRevokedAt));
   reply.setCookie(
     MFA_GATE_COOKIE,
     JSON.stringify({ mac: mac.toString("base64url"), iat, n: nonce.toString("base64url") }),
@@ -78,7 +100,11 @@ export function setMfaGateCookie(reply: FastifyReply, verifiedUserId: string | n
 
 /** True when the request carries a live gate proving a recent password
  * check for exactly `userId`. Constant-time MAC comparison. */
-export function mfaGateAuthorizes(req: FastifyRequest, userId: string): boolean {
+export function mfaGateAuthorizes(
+  req: FastifyRequest,
+  userId: string,
+  sessionRevokedAt: Date | null,
+): boolean {
   const raw = req.cookies[MFA_GATE_COOKIE];
   if (!raw) return false;
   const unsigned = req.unsignCookie(raw);
@@ -102,7 +128,7 @@ export function mfaGateAuthorizes(req: FastifyRequest, userId: string): boolean 
   } catch {
     return false;
   }
-  const expected = gateMac(userId, bag.iat, nonce);
+  const expected = gateMac(userId, bag.iat, nonce, revocationFloor(sessionRevokedAt));
   return presented.length === expected.length && timingSafeEqual(presented, expected);
 }
 

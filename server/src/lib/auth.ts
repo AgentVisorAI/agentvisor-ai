@@ -109,6 +109,19 @@ export interface SessionClaims {
   orgId: string; // active org
   membershipRole: "owner" | "admin" | "member";
   iat: number; // JWT issued-at, seconds since epoch — checked against user.sessionRevokedAt
+  /**
+   * Present iff this session was minted by a TENANT-configured IdP
+   * (SAML): the org whose IdP asserted the identity. Such a session is
+   * pinned to that org — /switch-org refuses to widen it. A tenant
+   * admin controls their own IdP and can assert ANY email; for a
+   * multi-org user (a consultant in the attacker's workspace and a
+   * sensitive client workspace) an unpinned SAML session was a
+   * cross-tenant impersonation primitive: authenticate the victim's
+   * email against your own IdP, then /switch-org into their other
+   * orgs with no victim credential involved. Global authenticators
+   * (password, passkey, Google/Microsoft OIDC) never set this.
+   */
+  ssoOrgId?: string;
 }
 
 // R83 F1: role-hierarchy rank used to enforce "no grant above your own".
@@ -175,6 +188,9 @@ export async function verifySession(
       orgId: payload.orgId,
       membershipRole: payload.membershipRole,
       iat: payload.iat,
+      // Optional SAML org pin — see SessionClaims. Non-string values
+      // (absent on password/passkey/OIDC sessions) stay absent.
+      ...(typeof payload.ssoOrgId === "string" ? { ssoOrgId: payload.ssoOrgId } : {}),
     };
   } catch {
     return null;
