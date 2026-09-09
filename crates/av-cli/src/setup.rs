@@ -1714,48 +1714,7 @@ pub async fn doctor(offline: bool) -> Result<()> {
         // known-weak) so a corrupt seed cannot survive doctor —
         // `av_harness::main::read_signer` refuses those at startup.
         let seed_path = seed_path_for(source.as_ref());
-        if seed_path.is_file() {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt as _;
-                match std::fs::symlink_metadata(&seed_path) {
-                    Ok(meta) if meta.file_type().is_symlink() => checks.push(Check::Fail(format!(
-                        "signing seed: {} is a symbolic link",
-                        seed_path.display()
-                    ))),
-                    Ok(meta) if meta.mode() & 0o077 != 0 => checks.push(Check::Fail(format!(
-                        "signing seed: {} is group/world accessible (chmod 600 it)",
-                        seed_path.display()
-                    ))),
-                    Ok(_) => match check_signing_seed_content(&seed_path) {
-                        Ok(()) => checks.push(Check::Pass(format!("signing seed: {}", seed_path.display()))),
-                        Err(reason) => checks.push(Check::Fail(format!(
-                            "signing seed: {}: {reason}",
-                            seed_path.display()
-                        ))),
-                    },
-                    Err(error) => {
-                        checks.push(Check::Fail(format!(
-                            "signing seed: {}: {error}",
-                            seed_path.display()
-                        )));
-                    }
-                }
-            }
-            #[cfg(not(unix))]
-            match check_signing_seed_content(&seed_path) {
-                Ok(()) => checks.push(Check::Pass(format!("signing seed: {}", seed_path.display()))),
-                Err(reason) => checks.push(Check::Fail(format!(
-                    "signing seed: {}: {reason}",
-                    seed_path.display()
-                ))),
-            }
-        } else {
-            checks.push(Check::Pass(format!(
-                "signing seed: {} will be generated on first run",
-                seed_path.display()
-            )));
-        }
+        checks.push(signing_seed_check(&seed_path));
 
         // 9. Data directories writable (created on demand by the server).
         for (label, dir) in [
@@ -2161,6 +2120,48 @@ fn seed_path_for(source: Option<&av_harness::config::ConfigSource>) -> PathBuf {
 /// A doctor that only checks file mode / symlink status lets a
 /// truncated or textbook-wrong seed pass, and the operator only
 /// discovers the problem when `avctl start` fails.
+/// Doctor's seed-path verdict, mirroring the daemon's own startup
+/// discipline (`install_seed_exclusive` + `read_signer` +
+/// `require_owner_only_mode`). Gate on `symlink_metadata`, not
+/// `is_file()`: `is_file()` FOLLOWS symlinks, so a symlink whose target
+/// is a directory or missing (dangling) skipped the symlink refusal and
+/// fell through to the "will be generated on first run" PASS — while
+/// startup hard-fails on ANY symlink at that path. Doctor-passes/
+/// startup-fails is the exact split this check exists to eliminate.
+fn signing_seed_check(seed_path: &Path) -> Check {
+    match std::fs::symlink_metadata(seed_path) {
+        Ok(meta) if meta.file_type().is_symlink() => Check::Fail(format!(
+            "signing seed: {} is a symbolic link",
+            seed_path.display()
+        )),
+        Ok(meta) if meta.is_file() => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                if meta.mode() & 0o077 != 0 {
+                    return Check::Fail(format!(
+                        "signing seed: {} is group/world accessible (chmod 600 it)",
+                        seed_path.display()
+                    ));
+                }
+            }
+            match check_signing_seed_content(seed_path) {
+                Ok(()) => Check::Pass(format!("signing seed: {}", seed_path.display())),
+                Err(reason) => Check::Fail(format!("signing seed: {}: {reason}", seed_path.display())),
+            }
+        }
+        Ok(_) => Check::Fail(format!(
+            "signing seed: {} exists but is not a regular file",
+            seed_path.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Check::Pass(format!(
+            "signing seed: {} will be generated on first run",
+            seed_path.display()
+        )),
+        Err(error) => Check::Fail(format!("signing seed: {}: {error}", seed_path.display())),
+    }
+}
+
 fn check_signing_seed_content(path: &Path) -> std::result::Result<(), String> {
     // Capped + zeroizing read: `read_to_string` was the one seed read
     // outside the discipline `read_signer`/pubkey use — a planted
@@ -3082,6 +3083,63 @@ mod tests {
     /// the address, not by string prefix: `[::1]:8484` is loopback (the
     /// old prefix test false-positived on it), `[::]`/`0.0.0.0` binds
     /// and concrete interface addresses are not.
+    /// Doctor's seed verdict must match the daemon's startup verdict for
+    /// every on-disk shape. The old `is_file()` gate FOLLOWED symlinks,
+    /// so a dangling symlink (or one pointing at a directory) skipped
+    /// the symlink refusal and PASSED as "will be generated on first
+    /// run" — while `install_seed_exclusive` + `read_signer` hard-fail
+    /// on any symlink at that path: doctor green, startup dead.
+    #[cfg(unix)]
+    #[test]
+    fn signing_seed_check_refuses_every_non_regular_shape() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Healthy seed: regular file, 0600, 32 random-ish hex bytes.
+        let good = dir.path().join("good.seed");
+        std::fs::write(&good, format!("{}\n", "a1".repeat(32))).unwrap();
+        std::fs::set_permissions(&good, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+        assert!(matches!(signing_seed_check(&good), Check::Pass(_)));
+
+        // Missing: legitimately generated on first run.
+        assert!(matches!(
+            signing_seed_check(&dir.path().join("absent.seed")),
+            Check::Pass(message) if message.contains("generated on first run")
+        ));
+
+        // Dangling symlink: startup refuses it; doctor must too.
+        let dangling = dir.path().join("dangling.seed");
+        std::os::unix::fs::symlink(dir.path().join("nope"), &dangling).unwrap();
+        assert!(matches!(
+            signing_seed_check(&dangling),
+            Check::Fail(message) if message.contains("symbolic link")
+        ));
+
+        // Symlink to a directory: same refusal.
+        let dir_link = dir.path().join("dirlink.seed");
+        std::os::unix::fs::symlink(dir.path(), &dir_link).unwrap();
+        assert!(matches!(
+            signing_seed_check(&dir_link),
+            Check::Fail(message) if message.contains("symbolic link")
+        ));
+
+        // A directory squatting on the seed path is not "absent".
+        let squatter = dir.path().join("dir.seed");
+        std::fs::create_dir(&squatter).unwrap();
+        assert!(matches!(
+            signing_seed_check(&squatter),
+            Check::Fail(message) if message.contains("not a regular file")
+        ));
+
+        // Symlink to a VALID seed file still refused (mirrors
+        // require_owner_only_mode's posture, not content quality).
+        let file_link = dir.path().join("filelink.seed");
+        std::os::unix::fs::symlink(&good, &file_link).unwrap();
+        assert!(matches!(
+            signing_seed_check(&file_link),
+            Check::Fail(message) if message.contains("symbolic link")
+        ));
+    }
+
     #[test]
     fn listen_is_loopback_classifies_by_address_not_prefix() {
         assert!(listen_is_loopback("127.0.0.1:8484"));

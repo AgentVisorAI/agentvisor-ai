@@ -857,10 +857,22 @@ export function startWebhookSweeper(logger?: FastifyBaseLogger): void {
              OR (status = 'pending' AND "nextRetryAt" IS NOT NULL
                  AND "nextRetryAt" <= (now() AT TIME ZONE 'UTC'))
              -- Pre-lease orphans (rows claimed by code that nulled
-             -- nextRetryAt while pending, then died). 15 min of age is
-             -- far past any legitimate in-flight window, so reclaiming
-             -- cannot double-deliver a live attempt.
+             -- nextRetryAt while pending, then died). Restricted to
+             -- FIRST-attempt rows: their createdAt ≈ claim time (the
+             -- create and the POST happen in the same request, in-flight
+             -- ≤ DELIVERY_TIMEOUT_MS), so 15 min of age genuinely means
+             -- the claimer died. Retry rows (attempt ≥ 2) are EXCLUDED:
+             -- their createdAt is the original enqueue time — during the
+             -- rolling deploy that ships this lease, an OLD-code replica
+             -- still claims retries with nextRetryAt = NULL, and a
+             -- ≥15-min-old row it is actively delivering would match an
+             -- age-on-createdAt arm instantly, double-POSTing with no
+             -- crash involved. Old-code retry orphans stay wedged (the
+             -- pre-fix status quo, visible in the drawer); every claim
+             -- made by THIS code carries a lease and heals via the arm
+             -- above.
              OR (status = 'pending' AND "nextRetryAt" IS NULL
+                 AND attempt <= 1
                  AND "createdAt" <= (now() AT TIME ZONE 'UTC') - interval '15 minutes'))
           ORDER BY "nextRetryAt" ASC
           LIMIT 20

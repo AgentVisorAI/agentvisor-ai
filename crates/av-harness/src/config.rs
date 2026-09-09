@@ -1140,10 +1140,14 @@ impl HarnessConfig {
             // `0:0:0:0:0:0:0:0`, `::ffff:0.0.0.0`, …) and a literal list
             // silently waves the non-canonical ones through — the exact
             // all-interfaces exposure this guard exists to refuse.
+            // `to_canonical()` first: the v4-mapped form `::ffff:0.0.0.0`
+            // parses as an Ipv6Addr whose own `is_unspecified()` is false,
+            // yet binding it produces the same any-interface listener as
+            // `::` (kernels treat the mapped-zero as INADDR_ANY).
             let is_wildcard = matches!(host, "*" | "")
                 || host
                     .parse::<std::net::IpAddr>()
-                    .is_ok_and(|ip| ip.is_unspecified());
+                    .is_ok_and(|ip| ip.to_canonical().is_unspecified());
             if is_wildcard {
                 errors.push(format!(
                     "listen {:?} binds every interface while require_identity = false: any \
@@ -3384,7 +3388,15 @@ spec:
         // Non-canonical spellings of the unspecified address are the
         // same all-interfaces bind and must be refused too — the prior
         // literal string match (`"0.0.0.0" | "::"`) waved these through.
-        for listen in ["[::0]:8484", "[0:0:0:0:0:0:0:0]:8484", "[0000::]:8484"] {
+        for listen in [
+            "[::0]:8484",
+            "[0:0:0:0:0:0:0:0]:8484",
+            "[0000::]:8484",
+            // v4-mapped zero: parses as a non-unspecified Ipv6Addr but
+            // binds INADDR_ANY — needs to_canonical() to classify.
+            "[::ffff:0.0.0.0]:8484",
+            "[::ffff:0:0]:8484",
+        ] {
             let err = HarnessConfig::from_toml(&format!(
                 r#"upstream_url = "https://api.openai.com"
                    listen = "{listen}"
