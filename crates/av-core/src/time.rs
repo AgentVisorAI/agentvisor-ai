@@ -82,6 +82,29 @@ mod tests {
         assert_eq!(iso8601_ms(1_786_320_000_000), "2026-08-10T00:00:00.000Z");
     }
 
+    /// Round-23 mutation finding: `iso8601_ms` takes u64, so the
+    /// negative-era branch of Hinnant's civil_from_days (`z - 146_096`)
+    /// is unreachable through the public API and its mutants survived.
+    /// The algorithm is deliberately kept general (i64) — pin the
+    /// pre-epoch branch directly so a future signed-epoch caller
+    /// inherits verified math, and pin the era boundaries the public
+    /// path CAN reach.
+    #[test]
+    fn civil_from_days_handles_negative_days_and_era_boundaries() {
+        // Day -1 = the day before the epoch.
+        assert_eq!(civil_from_days(-1), (1969, 12, 31));
+        // z == 0 boundary (day -719,468) = 0000-03-01, the era origin.
+        assert_eq!(civil_from_days(-719_468), (0, 3, 1));
+        // One day earlier crosses into the NEGATIVE-era branch: year 0
+        // is a proleptic leap year, so it's 0000-02-29.
+        assert_eq!(civil_from_days(-719_469), (0, 2, 29));
+        // Reachable era boundaries: century leap (2000-02-29) and the
+        // 2100 non-leap century (2100-02-28 is the last Feb day).
+        assert_eq!(civil_from_days(11_016), (2000, 2, 29));
+        assert_eq!(civil_from_days(47_540), (2100, 2, 28));
+        assert_eq!(civil_from_days(47_541), (2100, 3, 1));
+    }
+
     #[test]
     fn leap_year_feb_29() {
         // 2024-02-29T12:34:56.789Z == 1709210096789
