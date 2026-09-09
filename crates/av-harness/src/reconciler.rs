@@ -2944,7 +2944,20 @@ impl Finalizer {
                         .map_err(FinalizeError::atif_source)?,
                 )
                 .map_err(FinalizeError::atif_source)?;
-                trajectory.trajectory_id.clone_from(&existing.trajectory_id);
+                // `trajectory_id` is freshly minted by the rebuild while
+                // the artifact keeps its close-time id, so the two
+                // legitimately disagree — normalize it on the comparison
+                // COPIES below, like ttl/enforcement. It must NOT be
+                // copied onto `trajectory` itself: doing so made the
+                // archive branch below dead code (its
+                // `archive_conflicting_atif` early-returns when the
+                // existing artifact's id equals `new_trajectory_id`), so
+                // a recycled id's prior-incarnation artifact was silently
+                // OVERWRITTEN instead of archived, and the stale
+                // `.atif-auth` sidecar (sealed over the old bytes) then
+                // failed `ensure_atif_provenance` on every subsequent
+                // tick — permanent churn, journal never cleaned.
+                //
                 // `ttl_remaining_s` is
                 // recomputed at every token validation, so close-time
                 // ATIF (last REFRESHED identity) and recovery-rebuilt
@@ -2955,11 +2968,11 @@ impl Finalizer {
                 // compares version/charter/instance_uid only — mirror
                 // that here by normalizing the ttl on comparison COPIES
                 // (never the artifact we might persist), same
-                // normalization class as the trajectory_id clone_from
-                // above and the stop_reason normalization.
+                // normalization class as the stop_reason normalization.
                 let differs = {
                     let mut lhs = trajectory.clone();
                     let mut rhs = existing.clone();
+                    lhs.trajectory_id.clone_from(&rhs.trajectory_id);
                     normalize_extra_ttl(&mut lhs);
                     normalize_extra_ttl(&mut rhs);
                     normalize_extra_enforcement(&mut lhs);
@@ -5921,6 +5934,215 @@ mod tests {
         let primary: Receipt =
             serde_json::from_slice(&std::fs::read(finalizer.receipt_path(&session.id)).unwrap()).unwrap();
         assert_eq!(primary.body.receipt_id, second.body.receipt_id);
+    }
+
+    /// Recovery consolidation of a recycled unsigned id: when the step
+    /// journal genuinely differs from the prior incarnation's on-disk
+    /// artifact, the prior artifact + its `.atif-auth` sidecar must be
+    /// ARCHIVED (not overwritten), the consolidated trajectory must keep
+    /// its fresh id, and the primary sidecar must re-seal over the new
+    /// bytes. A pre-fix `clone_from` copied the on-disk id onto the
+    /// rebuilt trajectory BEFORE the archive call, so
+    /// `archive_conflicting_atif` early-returned (ids equal), the prior
+    /// evidence was destroyed in place, and the surviving stale sidecar
+    /// failed `ensure_atif_provenance` on every later tick — permanent
+    /// churn, journal never cleaned. Re-running consolidation over an
+    /// identical journal (crash after write, before journal removal)
+    /// must stay idempotent: no second archive, artifact untouched.
+    #[tokio::test]
+    async fn consolidation_archives_prior_incarnation_atif_on_recycled_unsigned_id() {
+        use av_events::{EventClass, OcsfEventBuilder, StatusId};
+
+        let directory = tempfile::tempdir().unwrap();
+        let finalizer = finalizer(directory.path());
+        let signer: Arc<dyn Signer> = Arc::new(Ed25519Signer::from_seed(&[7; 32]));
+        let journal_key = crate::journal::key_from_signer(signer.as_ref());
+        let session_id = "recycled-unsigned-consolidation";
+        let identity = AgentIdentity {
+            version: "1".to_owned(),
+            charter: "test".into(),
+            instance_uid: "instance-1".to_owned(),
+            ttl_remaining_s: Some(600),
+        };
+        let digest = av_core::digest::sha256_hex(session_id.as_bytes());
+        let stem = &digest[..32];
+        let final_path = directory.path().join(format!("{stem}.json"));
+        let step = |message: &str| av_atif::Step {
+            step_id: 1,
+            timestamp: Some(av_core::time::now_iso8601()),
+            source: av_atif::Source::User,
+            message: serde_json::json!(message),
+            reasoning_effort: None,
+            reasoning_content: None,
+            model_name: None,
+            tool_calls: None,
+            observation: None,
+            metrics: None,
+            is_copied_context: None,
+            llm_call_count: None,
+            extra: None,
+        };
+
+        // Prior incarnation's finalized artifact (id "t-old") + a
+        // provenance sidecar sealed over exactly those bytes.
+        let agent = av_atif::Agent {
+            name: "agentvisor-ai-harness".into(),
+            version: identity.version.clone(),
+            model_name: None,
+            tool_definitions: None,
+            extra: None,
+        };
+        let mut prior_builder = av_atif::TrajectoryBuilder::new(agent, Some(session_id.to_owned()));
+        prior_builder.push_step(step("prior-incarnation")).unwrap();
+        let mut prior = prior_builder.finish();
+        prior.trajectory_id = Some("t-old".to_owned());
+        let prior_bytes = serde_json::to_vec(&prior).unwrap();
+        std::fs::write(&final_path, &prior_bytes).unwrap();
+        let prior_provenance = AtifProvenance {
+            session_id: session_id.to_owned(),
+            digest: av_core::digest::sha256_hex(&prior_bytes),
+        };
+        let sealed = crate::journal::seal(&journal_key, "atif-provenance", 0, &prior_provenance).unwrap();
+        std::fs::write(final_path.with_extension("atif-auth"), &sealed).unwrap();
+
+        // Second incarnation's un-consolidated step journal: sealed
+        // metadata sidecar + one journaled unsigned record + broker ack.
+        let metadata_payload = serde_json::json!({
+            "journal_version": 2,
+            "session_id": session_id,
+            "identity": identity,
+            "workflow": "unsigned",
+        });
+        let metadata_sealed = crate::journal::seal(&journal_key, "metadata", 0, &metadata_payload).unwrap();
+        let metadata_path = directory.path().join(format!("{stem}.session.json"));
+        std::fs::write(&metadata_path, &metadata_sealed).unwrap();
+        let event = OcsfEventBuilder::new(
+            EventClass::Compression,
+            session_id.to_owned(),
+            identity.clone(),
+            0,
+        )
+        .status(StatusId::Success)
+        .payload(serde_json::json!({}))
+        .build()
+        .unwrap();
+        let event_uid = event.metadata.uid.clone();
+        let record = crate::worker::ActiveJournalRecord {
+            event: serde_json::to_value(&event).unwrap(),
+            identity: identity.clone(),
+            atif_step: Some(step("second-incarnation")),
+            tool_calls: 0,
+            tool_allowed: 0,
+            prompt_token_correction: 0,
+            tool_blocked: 0,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cached_tokens: 0,
+            cost_usd_micros: 0,
+            stop_reason_id: None,
+            response_attempt: None,
+        };
+        let domain = format!("{session_id}:active");
+        let record_sealed = crate::journal::seal(&journal_key, &domain, 0, &record).unwrap();
+        let journal_path = directory.path().join(format!("{stem}.events.ndjson"));
+        let mut journal_line = record_sealed.clone();
+        journal_line.push(b'\n');
+        std::fs::write(&journal_path, &journal_line).unwrap();
+        crate::worker::persist_broker_ack(
+            directory.path(),
+            session_id,
+            &event_uid,
+            &PublishAck {
+                topic: EventClass::Compression.topic().to_owned(),
+                partition: 0,
+                offset: 1,
+            },
+            &journal_key,
+        )
+        .await
+        .unwrap();
+        let ack_path = directory.path().join(format!("{stem}.acks.ndjson"));
+        let ack_bytes = std::fs::read(&ack_path).unwrap();
+
+        let registry = crate::session::SessionRegistry::new();
+        finalizer
+            .consolidate_step_journals(&registry, &Default::default())
+            .await
+            .unwrap();
+
+        let archived_path = final_path.with_extension("archived-t-old");
+        let archived: av_atif::Trajectory =
+            serde_json::from_slice(&std::fs::read(&archived_path).unwrap()).unwrap();
+        assert_eq!(
+            archived.trajectory_id.as_deref(),
+            Some("t-old"),
+            "prior incarnation's artifact must be archived, not destroyed",
+        );
+        let mut archived_sidecar = archived_path.clone();
+        archived_sidecar.as_mut_os_string().push(".atif-auth");
+        assert!(
+            archived_sidecar.exists(),
+            "stale sidecar must move with the archive"
+        );
+        let new_bytes = std::fs::read(&final_path).unwrap();
+        let consolidated: av_atif::Trajectory = serde_json::from_slice(&new_bytes).unwrap();
+        assert_ne!(
+            consolidated.trajectory_id.as_deref(),
+            Some("t-old"),
+            "consolidated trajectory keeps its fresh id so the archive branch stays live",
+        );
+        let resealed: AtifProvenance = crate::journal::open(
+            &journal_key,
+            "atif-provenance",
+            0,
+            &std::fs::read(final_path.with_extension("atif-auth")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            resealed.digest,
+            av_core::digest::sha256_hex(&new_bytes),
+            "primary provenance must re-seal over the consolidated bytes",
+        );
+        assert!(
+            !journal_path.exists(),
+            "step journal must be cleaned after consolidation"
+        );
+        assert!(
+            !metadata_path.exists(),
+            "metadata sidecar must be cleaned after consolidation"
+        );
+        assert!(
+            registry.get(session_id).is_none(),
+            "consolidation claim must be released for the adoption scan",
+        );
+
+        // Crash window replay: same journal consolidated again over the
+        // artifact it already produced. The freshly-minted rebuild id
+        // legitimately differs from the persisted one — after id
+        // normalization the content is identical, so nothing is archived
+        // or rewritten and the journal is simply cleaned.
+        std::fs::write(&metadata_path, &metadata_sealed).unwrap();
+        std::fs::write(&journal_path, &journal_line).unwrap();
+        std::fs::write(&ack_path, &ack_bytes).unwrap();
+        finalizer
+            .consolidate_step_journals(&registry, &Default::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(&final_path).unwrap(),
+            new_bytes,
+            "identical-content replay must not rewrite the artifact",
+        );
+        let archives = std::fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains("archived-"))
+            .count();
+        assert_eq!(
+            archives, 2,
+            "replay must not archive again (primary + sidecar from the first pass only)",
+        );
+        assert!(!journal_path.exists(), "replayed journal must still be cleaned");
     }
 
     /// ATIF trajectory paths share the sha256(session_id) keying, so a

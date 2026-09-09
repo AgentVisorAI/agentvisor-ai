@@ -1012,7 +1012,14 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
   // the same response (same shape as /change-password) so "other
   // devices" is exactly the semantics. API keys are untouched — this
   // is about browser cookies, not automation credentials.
-  app.post("/logout-all", async (req, reply) => {
+  app.post("/logout-all", {
+    // Same shape as the sibling step-up endpoints (/change-password,
+    // /me/export, /me/delete-account, passkey enroll/revoke): cookie-only
+    // bucket, 5/min bounds argon2 grinding against a stolen cookie —
+    // without it this endpoint fell to the global 300/min backstop, a
+    // 60× wider window for password probing via the step-up check.
+    config: { rateLimit: perIpCookieOnly(5, 60_000) },
+  }, async (req, reply) => {
     const claims = requireSession(req, reply);
     if (!claims) return;
     if (claims.sub.startsWith("apikey:")) {

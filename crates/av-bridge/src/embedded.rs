@@ -238,14 +238,25 @@ impl EmbeddedBroker {
                 // returning the wrong record.
                 //
                 // Mirror `enforce_retention`'s policy for
-                // unparseable-but-kept lines: any UID whose offset
-                // falls in the [min, max] offset range of surviving
-                // parseable records is kept, because it may correspond
-                // to an unparseable-but-authentic line at that offset.
+                // unparseable-but-kept lines: when unparseable lines
+                // exist, any UID whose offset falls in the surviving
+                // offset range is kept, because it may correspond to an
+                // unparseable-but-authentic line at that offset.
                 // Without this parity, an unparseable segment record
                 // after a crash would drop its sidecar entry, letting
                 // the next publish_idempotent re-append a duplicate
                 // that the following retention pass would choke on.
+                // When the segment is FULLY parseable, `live_uids` is
+                // authoritative — `publish_with_uid` refuses idempotent
+                // publishes whose value lacks `metadata.uid`, so every
+                // surviving record's UID is re-derivable — and the
+                // range must not be consulted at all: keeping a
+                // non-live middle-offset UID (retention crash between
+                // segment rename and sidecar rewrite, e.g. after a
+                // wall-clock regression expired a middle record)
+                // resurrects exactly the stale-ack → wrong-record-fetch
+                // mapping the retention path abandoned this range
+                // heuristic for.
                 if !seen_event_uids.is_empty() {
                     let mut live_uids =
                         std::collections::HashSet::<String>::with_capacity(seen_event_uids.len());
@@ -285,10 +296,16 @@ impl EmbeddedBroker {
                     // offset information at all — keep every sidecar
                     // entry (conservative: at worst a stale ack that
                     // the fetch-side digest checks catch) rather than
-                    // dropping evidence.
-                    let offset_range = if have_parseable_line {
+                    // dropping evidence. And when there are NO
+                    // unparseable lines the range is not consulted:
+                    // a fully-parseable segment makes `live_uids`
+                    // authoritative, so every non-live UID is
+                    // definitively stale and must drop.
+                    let offset_range = if unparseable_lines == 0 {
+                        None
+                    } else if have_parseable_line {
                         Some((min_offset, max_offset.saturating_add(unparseable_lines)))
-                    } else if unparseable_lines > 0 {
+                    } else {
                         tracing::warn!(
                             topic = %t.name,
                             partition = p,
@@ -296,8 +313,6 @@ impl EmbeddedBroker {
                             "segment has only unparseable lines; keeping all sidecar UID entries"
                         );
                         Some((0, u64::MAX))
-                    } else {
-                        None
                     };
                     let before = seen_event_uids.len();
                     seen_event_uids.retain(|uid, offset| {

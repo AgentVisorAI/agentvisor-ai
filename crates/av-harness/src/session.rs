@@ -1049,7 +1049,10 @@ impl SessionRegistry {
     /// (quarantined) sessions also stay: they are bounded by real crash
     /// events and their in-registry seal is what keeps the fail-closed
     /// refusal cheap. Without eviction the registry grows by one entry per
-    /// client-chosen session id for the process lifetime.
+    /// client-chosen session id for the process lifetime. The three
+    /// client-mintable retained classes (enforcement-latched,
+    /// capture-failed, empty-unsigned quarantine) are each bounded by an
+    /// overflow cap below.
     pub fn evict_finalized(&self, idle_s: u64) -> Vec<Arc<Session>> {
         // Idle comparison uses the monotonic clock so a
         // forward wall-clock jump (VM resume, NTP correction) cannot
@@ -1147,6 +1150,43 @@ impl SessionRegistry {
                  artifact re-inserts on the next recovery tick)"
             );
             for session in capture_failed.into_iter().take(excess) {
+                self.sessions.remove(&session.id);
+                evicted.push(session);
+            }
+        }
+        // Overflow pass: cap empty-unsigned quarantine retention. These
+        // are the reconciler's "no captured steps" refusals — retained
+        // so the same-id refusal stays cheap and the incident evidence
+        // survives, but they are client-mintable at line rate (open an
+        // unsigned session with a fresh id, submit no work, let the
+        // idle sweep close it) and, having captured nothing, they leave
+        // NO spool artifact behind: nothing on disk re-inserts or
+        // collides after eviction. Without a cap the registry grows by
+        // one permanent `Arc<Session>` per aborted admission for the
+        // process lifetime. Same accepted tradeoff as the two sibling
+        // caps: beyond the cap, evict oldest-first and let the evicted
+        // ids' refusal expire.
+        const MAX_EMPTY_UNSIGNED_RETAINED: usize = 4096;
+        let mut empty_quarantined: Vec<Arc<Session>> = self
+            .sessions
+            .iter()
+            .filter(|entry| {
+                entry.is_empty_unsigned_quarantine()
+                    && entry.active_streams.load(Ordering::Acquire) == 0
+                    && entry.pending_jobs.load(Ordering::Acquire) == 0
+            })
+            .map(|entry| Arc::clone(&entry))
+            .collect();
+        if empty_quarantined.len() > MAX_EMPTY_UNSIGNED_RETAINED {
+            empty_quarantined.sort_by_key(|session| std::cmp::Reverse(session.idle_duration()));
+            let excess = empty_quarantined.len() - MAX_EMPTY_UNSIGNED_RETAINED;
+            tracing::warn!(
+                excess,
+                cap = MAX_EMPTY_UNSIGNED_RETAINED,
+                "empty-unsigned quarantined sessions exceed the retention cap; evicting \
+                 oldest (their same-id refusal expires; no on-disk artifact is affected)"
+            );
+            for session in empty_quarantined.into_iter().take(excess) {
                 self.sessions.remove(&session.id);
                 evicted.push(session);
             }
@@ -1997,6 +2037,48 @@ mod tests {
             assert!(r.get(id).is_some(), "{id} must stay resident");
         }
         drop(lease);
+    }
+
+    /// Empty-unsigned quarantines (unsigned close refused for zero
+    /// captured steps) are retained for evidence and cheap same-id
+    /// refusal, but they are client-mintable at line rate and leave no
+    /// spool artifact — the overflow cap must bound them, evicting
+    /// oldest-first, while every sibling class stays untouched.
+    #[test]
+    fn evict_finalized_caps_empty_unsigned_quarantines() {
+        let r = SessionRegistry::new();
+        const CAP: usize = 4096;
+        for n in 0..CAP + 2 {
+            let s = r.get_or_open(
+                &format!("empty-{n}"),
+                Workflow::Unsigned,
+                &identity(),
+                &Default::default(),
+            );
+            s.try_close();
+            // The reconciler's zero-step refusal seals the session
+            // without writing an ATIF artifact: artifact_committed set,
+            // atif_path never set, close_complete never set.
+            s.mark_artifact_committed();
+            assert!(s.is_empty_unsigned_quarantine());
+            s.set_idle_for_testing(10);
+        }
+        // The two oldest entries must go; make idle age observable.
+        r.get("empty-0").unwrap().set_idle_for_testing(100);
+        r.get("empty-1").unwrap().set_idle_for_testing(50);
+
+        let evicted = r.evict_finalized(u64::MAX);
+        let mut evicted_ids: Vec<String> = evicted.iter().map(|s| s.id.clone()).collect();
+        evicted_ids.sort();
+        assert_eq!(
+            evicted_ids,
+            vec!["empty-0".to_owned(), "empty-1".to_owned()],
+            "exactly the two oldest over-cap quarantines are evicted",
+        );
+        assert!(r.get("empty-0").is_none());
+        assert!(r.get("empty-1").is_none());
+        assert!(r.get("empty-2").is_some(), "under-cap quarantines stay resident");
+        assert!(r.get(&format!("empty-{}", CAP + 1)).is_some());
     }
 
     /// A session touched millions of times a second under normal operation

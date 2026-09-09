@@ -892,9 +892,15 @@ fn config_validate(path: &Path, structural_only: bool) -> Result<()> {
             );
         }
     }
+    // `config.listen` is operator-supplied text with no control-byte
+    // restriction (validate() only shape-checks the port suffix) — the
+    // same CVE-2003-0063 class as `manifest.name` above; a crafted
+    // config could otherwise land raw ANSI escapes in the operator
+    // terminal.
     println!(
         "valid config_version={} listen={}",
-        config.config_version, config.listen
+        config.config_version,
+        sanitize_for_terminal(&config.listen)
     );
     Ok(())
 }

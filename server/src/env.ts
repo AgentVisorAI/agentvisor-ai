@@ -222,6 +222,11 @@ const Env = z.object({
   // IPs (or IP prefixes) allowed to scrape /metrics. Empty = allow
   // everyone (dev). In production keep this scoped to the scraper's
   // egress addresses so we don't leak traffic patterns.
+  // Bare IPs get the same /32 (v4) / /128 (v6) sugar the org
+  // allowlist PATCH applies (routes/org.ts): `ipMatchesAny` skips any
+  // entry `parseCidr` refuses, and `parseCidr` requires a prefix — a
+  // bare `10.0.0.5` here previously never matched anything, silently
+  // 403ing the documented exact-IP form for the legitimate scraper.
   ALLOW_METRICS_IPS: z
     .string()
     .default("")
@@ -229,7 +234,8 @@ const Env = z.object({
       v
         .split(",")
         .map((s) => s.trim())
-        .filter(Boolean),
+        .filter(Boolean)
+        .map((s) => (s.includes("/") ? s : s.includes(":") ? `${s}/128` : `${s}/32`)),
     ),
   // Public base URL of the console. Used to build OAuth redirect_uri
   // and password-reset links. e.g. https://agentvisorai.me

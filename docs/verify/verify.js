@@ -32,7 +32,13 @@
     // #data= SHARE-LINK envelope only — signature/pubkey fields go
     // through this strict gate first.
     function isStrictStandardB64(s) {
-      return typeof s === "string" && s.length % 4 === 0 && /^[A-Za-z0-9+/]*={0,2}$/.test(s);
+      if (typeof s !== "string" || s.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(s)) return false;
+      // Canonical-encoding parity: non-zero trailing bits (and odd
+      // padding shapes) decode identically under atob() but Rust's
+      // STANDARD engine refuses them — one file must never verify
+      // differently across the toolchain. Round-tripping through
+      // decode→encode accepts exactly the canonical encodings.
+      try { return btoa(atob(s)) === s; } catch { return false; }
     }
     function firstDuplicateKey(text) {
       // Minimal walker over ALREADY-JSON.parse-able text: tracks key
@@ -44,14 +50,23 @@
       function skipWs() { while (i < n && /[ \t\n\r]/.test(text[i])) i++; }
       function readString() {
         i++;
-        let out = "";
+        const start = i;
         while (i < n) {
-          const c = text[i];
-          if (c === "\\") { out += text[i] + (text[i + 1] ?? ""); i += 2; continue; }
-          if (c === '"') { i++; return out; }
-          out += c; i++;
+          if (text[i] === "\\") { i += 2; continue; }
+          if (text[i] === '"') {
+            const raw = text.slice(start, i);
+            i++;
+            // Decode JSON string escapes so duplicate detection happens
+            // in the same domain as serde's decoded-key comparison:
+            // "\u0073ession_id" and "session_id" are the SAME key to the
+            // Rust verifier and must collide here too — comparing raw
+            // escape text let an escaped duplicate slip past this gate
+            // while JSON.parse silently kept the last value.
+            try { return JSON.parse('"' + raw + '"'); } catch { return raw; }
+          }
+          i++;
         }
-        return out;
+        return text.slice(start);
       }
       while (i < n) {
         skipWs();
@@ -510,6 +525,30 @@
         if (!isStrictStandardB64(bundle.public_key_b64)) {
           render({ kind: "err", message: "public_key_b64 is not strict standard base64 — the Rust verifier refuses this file; refusing here too." });
           return;
+        }
+        // Rust-parity subset of `verify_semantic_invariants`
+        // (crates/av-receipts/src/receipt.rs): the unambiguous shape
+        // pins that previously split verdicts — Rust flatly refuses
+        // these while this page showed a positive-leaning card. The
+        // derivational checks (issued_at_iso recomputation, stop-reason
+        // cross-wiring, tool-call sums) stay Rust/CLI-only.
+        if (bundle.receipt_version !== 1 && bundle.receipt_version !== 2) {
+          render({ kind: "err", message: "receipt_version " + JSON.stringify(bundle.receipt_version) + " is not a supported version (1 or 2) — the Rust verifier refuses this file; refusing here too." });
+          return;
+        }
+        const subject = bundle.subject;
+        if (subject && typeof subject === "object") {
+          const digest = subject.kind === "event_chain" ? subject.chain_head
+            : subject.kind === "atif_trajectory" ? subject.trajectory_digest
+            : undefined;
+          if (digest !== undefined && !/^[0-9a-f]{64}$/.test(String(digest))) {
+            render({ kind: "err", message: "subject digest is not a lowercase 64-hex digest — the Rust verifier refuses this file; refusing here too." });
+            return;
+          }
+          if (subject.kind === "atif_trajectory" && subject.retroactive !== true) {
+            render({ kind: "err", message: "AtifTrajectory.retroactive must be true — the Rust verifier refuses this file; refusing here too." });
+            return;
+          }
         }
       }
       try {

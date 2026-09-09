@@ -1556,6 +1556,13 @@ fn is_iso8601(s: &str, require_offset: bool) -> bool {
     if !(1..=12).contains(&month) || hour > 23 || min > 59 || sec > 60 {
         return false;
     }
+    // RFC 3339 (the schema's `format: date-time`) only admits the leap
+    // second `:60` at end-of-day (`23:59:60`); `jsonschema` with format
+    // assertions rejects `:60` at any other hour/minute. Accepting it
+    // here would break the strict-valid ⇒ schema-valid invariant.
+    if sec == 60 && !(hour == 23 && min == 59) {
+        return false;
+    }
     let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
     let dim = match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
@@ -1782,6 +1789,14 @@ mod tests {
             "2025-01-32T00:00:00Z",
             "2025-01-15T24:00:00Z",
             "2025-01-15T10:61:00Z",
+            // Leap second anywhere but end-of-day: RFC 3339 (and the
+            // shipped schema's format assertion) only allow `:60` at
+            // `23:59:60`. `sec > 60` alone let `12:30:60` through,
+            // breaking strict-valid ⇒ schema-valid.
+            "2026-06-15T12:30:60Z",
+            "2026-06-15T12:30:60.5Z",
+            "2026-06-15T23:58:60Z",
+            "2026-06-15T22:59:60Z",
             "2025-01-15T10:30:00.Z",
             "2025-01-15T10:30:00ZZ",
             "2025-01-15T10:30:00+5:30",
