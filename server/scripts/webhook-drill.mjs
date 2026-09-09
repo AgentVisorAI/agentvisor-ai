@@ -24,7 +24,7 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 
 const BASE = process.env.BASE ?? "http://127.0.0.1:8747";
 const PG_CONTAINER = process.env.PG_CONTAINER ?? "av-pg-r47";
-const RECV_PORT = 44117;
+const RECV_PORT = 21117;
 const nonce = Math.random().toString(36).slice(2, 6);
 
 let capture = [];

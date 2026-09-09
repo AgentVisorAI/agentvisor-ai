@@ -24,7 +24,7 @@ import { execSync } from "node:child_process";
 const PG_CONTAINER = process.env.PG_CONTAINER ?? "av-pg-r48";
 
 const BASE = process.env.BASE ?? "http://127.0.0.1:8748";
-const RECV_PORT = 44118;
+const RECV_PORT = 21118;
 const nonce = Math.random().toString(36).slice(2, 6);
 
 let capture = [];

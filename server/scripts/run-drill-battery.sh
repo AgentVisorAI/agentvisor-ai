@@ -36,7 +36,7 @@ run_drill() {
   local rc=1 out=""
   if [[ $up == 1 ]]; then
     # 87xx drills read BASE, 43xx/44xx drills read API_BASE; export both.
-    out=$(BASE="http://127.0.0.1:$port" API_BASE="http://127.0.0.1:$port" IDP_PORT=60498 node "scripts/$name.mjs" 2>&1); rc=$?
+    out=$(BASE="http://127.0.0.1:$port" API_BASE="http://127.0.0.1:$port" IDP_PORT=20498 node "scripts/$name.mjs" 2>&1); rc=$?
   else
     out="server for $name never became healthy; log tail:"$'\n'"$(tail -5 "/tmp/drill-$name.log")"
   fi
@@ -47,26 +47,29 @@ run_drill() {
     PASS=$((PASS+1)); echo "PASS  $name"
   else
     FAIL=$((FAIL+1)); FAILED_NAMES="$FAILED_NAMES $name"
-    echo "FAIL  $name (rc=$rc)"; echo "$out" | tail -20
+    # Full output, not a tail: the drills print their failing check
+    # exactly once, usually well above the last 20 lines (cleanup logs
+    # sit between), so a truncated echo makes CI flakes undiagnosable.
+    echo "FAIL  $name (rc=$rc)"; echo "$out"
   fi
 }
 
 # name|port[|extra-env...] — | because env values carry URLs with colons
 ALL_DRILLS=(
-  "apikey-drill|60745"
-  "apikey-hardening|60745"
-  "invite-drill|60445"
-  "invite-hardening|60446"
-  "ip-allowlist-drill|60750"
-  "retention-drill|60749|DISABLE_RETENTION_SWEEPER=true"
-  "saml-drill|60440"
-  "saml-hardening|60441"
-  "webauthn-drill|60443"
-  "webauthn-hardening|60444"
-  "webhook-drill|60747|ALLOW_INTERNAL_WEBHOOK_TARGETS=true|WEBHOOK_SWEEPER_INTERVAL_MS=1000"
-  "webhook-hardening|60748|ALLOW_INTERNAL_WEBHOOK_TARGETS=true|WEBHOOK_SWEEPER_INTERVAL_MS=1000"
-  "webhook-adapter-drill|60752|ALLOW_INTERNAL_WEBHOOK_TARGETS=true|WEBHOOK_SWEEPER_INTERVAL_MS=1000"
-  "oidc-drill|60499|OIDC_ISSUER_URL=http://127.0.0.1:60498|OIDC_CLIENT_ID=av-console|OIDC_CLIENT_SECRET=drill-secret-123|OIDC_DISPLAY_NAME=Keycloak"
+  "apikey-drill|20745"
+  "apikey-hardening|20745"
+  "invite-drill|20445"
+  "invite-hardening|20446"
+  "ip-allowlist-drill|20750"
+  "retention-drill|20749|DISABLE_RETENTION_SWEEPER=true"
+  "saml-drill|20440"
+  "saml-hardening|20441"
+  "webauthn-drill|20443"
+  "webauthn-hardening|20444"
+  "webhook-drill|20747|ALLOW_INTERNAL_WEBHOOK_TARGETS=true|WEBHOOK_SWEEPER_INTERVAL_MS=1000"
+  "webhook-hardening|20748|ALLOW_INTERNAL_WEBHOOK_TARGETS=true|WEBHOOK_SWEEPER_INTERVAL_MS=1000"
+  "webhook-adapter-drill|20752|ALLOW_INTERNAL_WEBHOOK_TARGETS=true|WEBHOOK_SWEEPER_INTERVAL_MS=1000"
+  "oidc-drill|20499|OIDC_ISSUER_URL=http://127.0.0.1:20498|OIDC_CLIENT_ID=av-console|OIDC_CLIENT_SECRET=drill-secret-123|OIDC_DISPLAY_NAME=Keycloak"
 )
 
 selected=("$@")
