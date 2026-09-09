@@ -223,8 +223,8 @@ impl EmbeddedBroker {
                 let path = dir.join(format!("p{p}.jsonl"));
                 let watermark_path = dir.join(format!("p{p}.next-offset"));
                 let idempotency_path = dir.join(format!("p{p}.event-uids.jsonl"));
-                let (segment_offset, torn) = recover_segment(&path)?;
                 let persisted_offset = read_high_water(&watermark_path)?;
+                let (segment_offset, torn) = recover_segment(&path, persisted_offset)?;
                 let mut seen_event_uids = recover_event_uids(&idempotency_path)?;
                 recover_segment_event_uids(&path, &mut seen_event_uids)?;
                 // Post-reconciliation drop: any UID whose offset does
@@ -917,7 +917,7 @@ fn load_validators(
 /// allocation left in startup recovery. Each line is capped; a line
 /// above the cap fails the open loudly (fail closed, like a corrupt
 /// watermark) rather than risking the allocation.
-fn recover_segment(path: &Path) -> Result<(u64, u64), BusError> {
+fn recover_segment(path: &Path, persisted_offset: u64) -> Result<(u64, u64), BusError> {
     /// Generous per-record bound: the harness caps request bodies at
     /// 16 MiB, so no legitimately published event line approaches this.
     const MAX_SEGMENT_LINE_BYTES: u64 = 16 * 1024 * 1024;
@@ -931,6 +931,8 @@ fn recover_segment(path: &Path) -> Result<(u64, u64), BusError> {
     let mut buf: Vec<u8> = Vec::new();
     let mut complete_len: u64 = 0;
     let mut next_offset = 0u64;
+    let mut parseable_lines = 0u64;
+    let mut unparseable_lines = 0u64;
     let mut torn = false;
     loop {
         buf.clear();
@@ -959,7 +961,10 @@ fn recover_segment(path: &Path) -> Result<(u64, u64), BusError> {
             continue;
         }
         match serde_json::from_slice::<StoredEvent>(line) {
-            Ok(event) => next_offset = next_offset.max(event.offset.saturating_add(1)),
+            Ok(event) => {
+                parseable_lines = parseable_lines.saturating_add(1);
+                next_offset = next_offset.max(event.offset.saturating_add(1));
+            }
             // A single unparseable middle line must not brick the broker.
             // The corrupted bytes are left on disk as forensic evidence;
             // subsequent publishes append past the surviving max offset.
@@ -970,6 +975,7 @@ fn recover_segment(path: &Path) -> Result<(u64, u64), BusError> {
             // reused that line's live offset (offset collision in the
             // audit stream).
             Err(error) => {
+                unparseable_lines = unparseable_lines.saturating_add(1);
                 next_offset = next_offset.saturating_add(1);
                 tracing::warn!(
                     %error,
@@ -978,6 +984,30 @@ fn recover_segment(path: &Path) -> Result<(u64, u64), BusError> {
                 );
             }
         }
+    }
+    // Unparseable lines advance `next_offset` RELATIVE to the running
+    // value while parseable lines anchor it to the ABSOLUTE offsets
+    // stored in the records. Segment lines are appended in contiguous
+    // offset order, so mixing the two is exact whenever at least one
+    // line parses — but a segment with ONLY unparseable complete lines
+    // yields a bare line count with no anchor. When retention has ever
+    // rewritten this segment (persisted watermark > 0) the true first
+    // offset is unknowable: `max(count, watermark)` masks any records
+    // appended after the last watermark persist, and the next publish
+    // would re-stamp an acknowledged offset (offset collision in the
+    // audit stream, with the stale sidecar UID re-homing acks onto the
+    // new record). Fail closed like the oversized-record arm above —
+    // the operator moves the segment aside for forensics and the
+    // partition reopens at the watermark. A never-rewritten segment
+    // (watermark 0) starts at absolute offset 0, so the count IS the
+    // anchor and recovery stays exact.
+    if unparseable_lines > 0 && parseable_lines == 0 && persisted_offset > 0 {
+        return Err(BusError::Backend(format!(
+            "segment {} contains only unparseable records ({unparseable_lines}) but the \
+             partition has a retention watermark ({persisted_offset}); absolute offsets are \
+             unrecoverable — refusing to open the partition (move the segment aside to repair)",
+            av_core::fsutil::basename(path)
+        )));
     }
     if torn {
         // In-place truncate + fsync: unlike the old whole-file
@@ -1460,6 +1490,15 @@ impl EmbeddedBroker {
             stored_at: av_core::time::now_ms(),
         };
         let line = serde_json::to_string(&record)?;
+        // Compute the successor BEFORE any bytes touch the disk: at the
+        // (tamper-shaped) u64::MAX boundary the old post-append check
+        // returned an error AFTER the record was durably fsynced without
+        // ever advancing `next_offset`, so every retry appended another
+        // record stamped with the same colliding offset.
+        let next_after_append = part
+            .next_offset
+            .checked_add(1)
+            .ok_or_else(|| BusError::Backend("embedded offset overflow".to_owned()))?;
         // Capture the durable length before appending so a failed append can
         // be repaired. Without the truncate-on-error below, two failure
         // modes leave the partition permanently inconsistent while the same
@@ -1492,10 +1531,7 @@ impl EmbeddedBroker {
             }
             return Err(BusError::Io(error));
         }
-        part.next_offset = part
-            .next_offset
-            .checked_add(1)
-            .ok_or_else(|| BusError::Backend("embedded offset overflow".to_owned()))?;
+        part.next_offset = next_after_append;
         if let Some(uid) = event_uid {
             part.seen_event_uids.insert(uid.to_owned(), offset);
             // The sidecar is a rebuildable cache: `open()` reconciles it
@@ -1771,7 +1807,7 @@ mod tests {
         }
         lines.push_str("{corrupt-but-complete\n");
         fs::write(&path, &lines).unwrap();
-        let (next_offset, torn) = recover_segment(&path).unwrap();
+        let (next_offset, torn) = recover_segment(&path, 0).unwrap();
         assert_eq!(torn, 0, "a complete corrupt line is kept, not a torn tail");
         assert_eq!(next_offset, 3, "the corrupt line at offset 2 must be counted");
     }
@@ -1789,9 +1825,37 @@ mod tests {
         lines.push_str(&serde_json::to_string(&stored(2)).unwrap());
         lines.push('\n');
         fs::write(&path, &lines).unwrap();
-        let (next_offset, torn) = recover_segment(&path).unwrap();
+        let (next_offset, torn) = recover_segment(&path, 0).unwrap();
         assert_eq!(torn, 0);
         assert_eq!(next_offset, 3);
+    }
+
+    /// A segment whose complete lines are ALL unparseable yields a bare
+    /// line count with no absolute anchor. When retention has rewritten
+    /// the segment before (watermark > 0) the count can mask records
+    /// appended after the last watermark persist — `max(count, watermark)`
+    /// would re-stamp an acknowledged offset on the next publish. That
+    /// state must refuse to open. A never-rewritten segment (watermark 0)
+    /// starts at absolute offset 0, so the count is exact and recovery
+    /// proceeds.
+    #[test]
+    fn recover_segment_refuses_all_corrupt_lines_behind_a_retention_watermark() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p0.jsonl");
+        fs::write(&path, "{corrupt-one\n{corrupt-two\n").unwrap();
+
+        let error = recover_segment(&path, 100).unwrap_err();
+        assert!(
+            error.to_string().contains("only unparseable records"),
+            "expected the ambiguity refusal, got: {error}"
+        );
+
+        let (next_offset, torn) = recover_segment(&path, 0).unwrap();
+        assert_eq!(torn, 0);
+        assert_eq!(
+            next_offset, 2,
+            "with no watermark the segment starts at absolute 0 and the count is exact"
+        );
     }
 
     /// The sidecar recovery's oversized-line skip must stay O(cap) in

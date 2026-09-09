@@ -1,6 +1,7 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
-import { createHash, createPublicKey, verify as cryptoVerify } from "node:crypto";
+import { createHash, createPublicKey, randomUUID, verify as cryptoVerify } from "node:crypto";
+import { Prisma } from "@prisma/client";
 import { db } from "../db.js";
 import { verifyPassword } from "../lib/auth.js";
 import { bus } from "../lib/bus.js";
@@ -734,28 +735,34 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
       // createMany.count went to 0 — but BOTH called session.update
       // with the full deltas. Session totals silently doubled; the
       // finalized receipt then signed the inflated numbers, breaking
-      // the compliance story. Fix: replace createMany with per-row
-      // create() so P2002 unique violations identify which seqs are
-      // OURS. Rollup deltas are computed only over the actually-
-      // inserted subset; concurrent duplicates count once. Cost is N
-      // round trips per batch, but ingest batches are small (10-100
-      // events typical) and event throughput is bounded by the
-      // daemon's tick anyway.
-      // R93 F2 + R94 F1: wrap the per-row inserts AND the rollup
-      // update in ONE transaction so a mid-batch failure (P1001
-      // connection lost, P2024 pool timeout, statement timeout,
-      // DB restart) rolls back every row that already succeeded.
-      // Prior R93 shape ran the per-row create() loop OUTSIDE any
-      // transaction — a failure at row 6/10 committed rows 1..5
-      // and skipped the rollup update, so the daemon's next retry
-      // pulled rows 1..5 into `existingSeqs`, skipped their
-      // deltas as "already applied", and PERMANENTLY under-
-      // counted promptTokens/costUsdMicros/toolsBlocked. The
-      // sealed receipt then signed the undercount, breaking the
-      // compliance story from the OTHER direction. With the tx
-      // wrapper, either every fresh row + the rollup increment
-      // commit together, or nothing does — the daemon retries a
-      // clean slate.
+      // the compliance story. Fix: single INSERT … ON CONFLICT
+      // ("sessionId","seq") DO NOTHING RETURNING seq, so the database
+      // itself reports which seqs are OURS. Rollup deltas are computed
+      // only over the actually-inserted subset; concurrent duplicates
+      // count once.
+      //
+      // Why raw SQL and not a per-row create() loop catching P2002:
+      // PostgreSQL aborts the ENTIRE transaction after any statement
+      // error (25P02 "current transaction is aborted") — Prisma issues
+      // no savepoints inside interactive transactions, so catching the
+      // loser's P2002 and continuing made every subsequent statement
+      // (the remaining inserts + the guarded rollup) fail, 500ing the
+      // whole batch exactly in the benign concurrent-retry case this
+      // path exists to absorb. ON CONFLICT DO NOTHING never raises, so
+      // the tx stays healthy. Ids are minted client-side because the
+      // schema's cuid() default is Prisma-client-side, not a DB
+      // default.
+      // R93 F2 + R94 F1: the insert AND the rollup update share ONE
+      // transaction so a mid-batch failure (P1001 connection lost,
+      // P2024 pool timeout, statement timeout, DB restart) rolls back
+      // every row that already succeeded. A partial commit would make
+      // the daemon's next retry pull the committed rows into
+      // `existingSeqs`, skip their deltas as "already applied", and
+      // PERMANENTLY under-count promptTokens/costUsdMicros/
+      // toolsBlocked — the sealed receipt then signs the undercount,
+      // breaking the compliance story from the OTHER direction. With
+      // the tx wrapper, either every fresh row + the rollup increment
+      // commit together, or nothing does.
       const insertedSeqs = new Set<number>();
       let dPrompt = 0;
       let dCompletion = 0;
@@ -788,22 +795,19 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
       let sealedMidTx = false;
       try {
         await db.$transaction(async (tx) => {
-          for (const row of rows) {
-            try {
-              await tx.event.create({ data: row });
-              insertedSeqs.add(row.seq);
-            } catch (err) {
-              if (
-                typeof err === "object" &&
-                err !== null &&
-                (err as { code?: string }).code === "P2002"
-              ) {
-                // Concurrent batch already inserted this seq. Skip
-                // silently — matches prior skipDuplicates behavior.
-                continue;
-              }
-              throw err;
-            }
+          const returned = await tx.$queryRaw<{ seq: number }[]>`
+            INSERT INTO "events"
+              ("id", "sessionId", "seq", "kind", "tag", "body", "sub", "policyName", "occurredAt", "journalCount")
+            VALUES ${Prisma.join(
+              rows.map(
+                (row) =>
+                  Prisma.sql`(${randomUUID()}, ${row.sessionId}, ${row.seq}, ${row.kind}, ${row.tag}, ${row.body}, ${row.sub ?? null}, ${row.policyName ?? null}, ${row.occurredAt}, ${row.journalCount})`,
+              ),
+            )}
+            ON CONFLICT ("sessionId", "seq") DO NOTHING
+            RETURNING "seq"`;
+          for (const row of returned) {
+            insertedSeqs.add(row.seq);
           }
           for (const e of fresh) {
             if (!insertedSeqs.has(e.seq)) continue;
@@ -1100,6 +1104,9 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
       receipt_id?: unknown;
       session_id?: unknown;
       subject?: { kind?: unknown; event_count?: unknown };
+      issued_at?: unknown;
+      stop_reason_id?: unknown;
+      stop_reason?: unknown;
     };
     try {
       signedBody = JSON.parse(r.body) as typeof signedBody;
@@ -1139,6 +1146,81 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
             receiptId: r.receiptId,
             bodySessionId: typeof signedBody.session_id === "string" ? signedBody.session_id : null,
             bodyReceiptId: typeof signedBody.receipt_id === "string" ? signedBody.receipt_id : null,
+          },
+          req,
+        },
+        req.log,
+      );
+      return reply.code(400).send({ error: "receipt_body_binding_mismatch" });
+    }
+    // Signed-body-first sealing metadata. issuedAt / stopReasonId /
+    // stopReason become queryable columns and the console's rendered
+    // truth for a sealed session, but they arrive in the UNSIGNED
+    // envelope: a token holder could seal a legitimately-signed body
+    // alongside a contradictory envelope (issuedAt in 2099, "Stop"
+    // instead of the signed budget-exceeded caption). First-write-wins
+    // then made the lie immutable AND 409'd the honest daemon's retry
+    // (its envelope differs byte-for-byte from the attacker's). Every
+    // real receipt body (receipt-v1/v2 schemas) carries issued_at
+    // (epoch ms) / stop_reason_id / stop_reason as REQUIRED fields, so
+    // when present the signed values ARE the row — the envelope copy
+    // is reduced to a fallback for fieldless test blobs, which carry
+    // nothing to contradict. Signed values of the wrong type or
+    // outside the columns' vetted envelope ranges are refused outright
+    // (a signature over garbage metadata is attacker-shaped, never a
+    // production daemon).
+    let sealIssuedAt = r.issuedAt;
+    let sealStopReasonId = r.stopReasonId;
+    let sealStopReason = r.stopReason;
+    let sealMetadataViolation: string | null = null;
+    if (signedBody.issued_at !== undefined) {
+      const ms = signedBody.issued_at;
+      if (typeof ms !== "number" || !Number.isSafeInteger(ms) || ms < 0) {
+        sealMetadataViolation = "issued_at";
+      } else {
+        sealIssuedAt = new Date(ms);
+        if (Number.isNaN(sealIssuedAt.getTime())) sealMetadataViolation = "issued_at";
+      }
+    }
+    if (signedBody.stop_reason_id !== undefined) {
+      const id = signedBody.stop_reason_id;
+      if (typeof id !== "number" || !Number.isInteger(id) || id < 0 || id > 1_000_000) {
+        sealMetadataViolation = "stop_reason_id";
+      } else {
+        sealStopReasonId = id;
+      }
+    }
+    if (signedBody.stop_reason !== undefined) {
+      if (typeof signedBody.stop_reason !== "string") {
+        sealMetadataViolation = "stop_reason";
+      } else {
+        // Same 80-unit display bound the envelope schema enforces (the
+        // daemon truncates its own envelope copy identically).
+        sealStopReason = signedBody.stop_reason.slice(0, 80);
+      }
+    }
+    if (sealMetadataViolation !== null) {
+      req.log.warn(
+        {
+          deploymentId: daemon.deploymentId,
+          sessionExternalId: r.sessionExternalId,
+          receiptId: r.receiptId,
+          field: sealMetadataViolation,
+        },
+        "ingest_receipt_signed_metadata_invalid",
+      );
+      writeAudit(
+        {
+          orgId: daemon.orgId,
+          event: "deployment.receipt_body_binding_mismatch",
+          actorId: `daemon:${daemon.deploymentId}`,
+          actorEmail: `daemon@${daemon.deploymentId}`,
+          target: r.sessionExternalId,
+          metadata: {
+            deploymentId: daemon.deploymentId,
+            sessionExternalId: r.sessionExternalId,
+            receiptId: r.receiptId,
+            invalidSignedField: sealMetadataViolation,
           },
           req,
         },
@@ -1210,7 +1292,7 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
         existingReceipt.sigB64 !== r.sigB64 ||
         existingReceipt.keyIdHint !== proposedKeyIdHint ||
         existingReceipt.eventCount !== r.eventCount ||
-        existingReceipt.issuedAt.getTime() !== r.issuedAt.getTime();
+        existingReceipt.issuedAt.getTime() !== sealIssuedAt.getTime();
       if (differs) {
         req.log.warn(
           {
@@ -1296,15 +1378,15 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
               sigB64: r.sigB64,
               keyIdHint: r.keyIdHex.slice(0, 8),
               eventCount: r.eventCount,
-              issuedAt: r.issuedAt,
+              issuedAt: sealIssuedAt,
             },
           });
           await tx.session.update({
             where: { id: session.id },
             data: {
               status: "sealed",
-              stopReasonId: r.stopReasonId,
-              stopReason: r.stopReason,
+              stopReasonId: sealStopReasonId,
+              stopReason: sealStopReason,
             },
           });
         });
@@ -1343,7 +1425,7 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
           raced.sigB64 === r.sigB64 &&
           raced.keyIdHint === r.keyIdHex.slice(0, 8) &&
           raced.eventCount === r.eventCount &&
-          raced.issuedAt.getTime() === r.issuedAt.getTime();
+          raced.issuedAt.getTime() === sealIssuedAt.getTime();
         if (!identical) {
           req.log.warn(
             {

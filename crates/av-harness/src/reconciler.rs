@@ -871,6 +871,21 @@ pub fn prune_sealed_atif_blocking(
         if !sidecar.exists() {
             continue;
         }
+        // A durable `.promote` marker is a signed statement of intent:
+        // "this artifact must become a receipt". Promotion writes the
+        // marker BEFORE receipt persistence, so a transient persist
+        // failure legitimately leaves marker + artifact on disk until
+        // the background retry succeeds. Pruning the pair here would
+        // destroy the only evidence the pending promotion can ever be
+        // satisfied from — the retry then fails forever on a missing
+        // sidecar while the marker survives every sweep (retention
+        // ignores non-json extensions), converting a recoverable
+        // I/O blip into permanent evidence loss. Age is irrelevant:
+        // an artifact past max_age with a live marker is still owed
+        // its receipt.
+        if path.with_extension("promote").exists() {
+            continue;
+        }
         let metadata = match entry.metadata() {
             Ok(m) => m,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -3496,6 +3511,35 @@ impl Finalizer {
                         continue;
                     }
                 };
+            // Orphaned marker: both the artifact and its provenance
+            // sidecar are gone (external deletion, or a pre-fix
+            // retention sweep that pruned a pending pair). No retry
+            // can ever satisfy this promotion — the trajectory bytes
+            // the marker's digest binds no longer exist. Left in
+            // place it re-fails every tick forever (and for sessions
+            // absent from the registry it silently pins the scan
+            // budget). Quarantine it under a `.promote.orphaned`
+            // name: recurrence stops, the sealed payload survives as
+            // forensic evidence of the unsatisfied promotion.
+            let artifact = path.with_extension("json");
+            if !artifact.exists() && !path.with_extension("atif-auth").exists() {
+                let quarantined = path.with_extension("promote.orphaned");
+                match std::fs::rename(&path, &quarantined) {
+                    Ok(()) => tracing::error!(
+                        session = %marker.session_id,
+                        marker = %av_core::fsutil::basename(&path),
+                        "promotion marker orphaned: artifact and provenance are gone; \
+                         quarantined marker — the promised receipt can never be issued"
+                    ),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => tracing::warn!(
+                        %error,
+                        marker = %av_core::fsutil::basename(&path),
+                        "failed to quarantine orphaned promotion marker"
+                    ),
+                }
+                continue;
+            }
             let Some(session) = sessions.get(&marker.session_id) else {
                 continue;
             };
@@ -8705,6 +8749,75 @@ mod tests {
     /// leave younger pairs alone. Unpaired remnants (crash-torn or
     /// attacker-planted) belong to the reconciler quarantine sweep and
     /// must not be touched by retention.
+    /// A `.promote` marker whose artifact AND provenance sidecar are
+    /// both gone can never be satisfied: the digest-bound trajectory
+    /// bytes no longer exist. The retry sweep must quarantine it
+    /// (rename to `.promote.orphaned`) instead of re-failing forever —
+    /// and must NOT quarantine a marker whose evidence pair is still
+    /// on disk merely because its session is absent from the registry
+    /// (post-restart markers are recovered later, when the session
+    /// reappears).
+    #[tokio::test(flavor = "current_thread")]
+    async fn promotion_retry_quarantines_markers_whose_evidence_is_gone() {
+        let directory = tempfile::tempdir().unwrap();
+        let finalizer = finalizer(directory.path());
+        let spool = directory.path();
+
+        let orphan_marker = spool.join("gone.promote");
+        let sealed = crate::journal::seal(
+            &finalizer.journal_key,
+            "promotion-marker",
+            0,
+            &PromotionMarker {
+                session_id: "session-gone".to_owned(),
+                trajectory_digest: av_core::digest::sha256_hex(b"vanished bytes"),
+            },
+        )
+        .unwrap();
+        std::fs::write(&orphan_marker, &sealed).unwrap();
+
+        // Evidence still on disk, session merely not in the registry:
+        // recoverable state, must be left exactly where it is.
+        let kept_marker = spool.join("kept.promote");
+        let kept_sealed = crate::journal::seal(
+            &finalizer.journal_key,
+            "promotion-marker",
+            0,
+            &PromotionMarker {
+                session_id: "session-kept".to_owned(),
+                trajectory_digest: av_core::digest::sha256_hex(b"{}"),
+            },
+        )
+        .unwrap();
+        std::fs::write(&kept_marker, &kept_sealed).unwrap();
+        std::fs::write(spool.join("kept.json"), b"{}").unwrap();
+        std::fs::write(spool.join("kept.atif-auth"), b"provenance").unwrap();
+
+        let registry = SessionRegistry::new();
+        let promoted = finalizer.retry_marked_promotions(&registry).await.unwrap();
+        assert_eq!(promoted, 0);
+
+        assert!(
+            !orphan_marker.exists(),
+            "an unsatisfiable marker must not keep its .promote name (retry-forever loop)"
+        );
+        assert!(
+            spool.join("gone.promote.orphaned").exists(),
+            "the sealed marker payload must survive quarantine as forensic evidence"
+        );
+        assert!(
+            kept_marker.exists(),
+            "a marker whose evidence pair exists is recoverable and must be left alone"
+        );
+        assert!(!spool.join("kept.promote.orphaned").exists());
+
+        // Idempotence: a second sweep finds nothing left to quarantine
+        // and must not error on the already-renamed marker.
+        let promoted = finalizer.retry_marked_promotions(&registry).await.unwrap();
+        assert_eq!(promoted, 0);
+        assert!(spool.join("gone.promote.orphaned").exists());
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn retention_prunes_only_old_paired_evidence() {
         let temp = tempfile::tempdir().unwrap();
@@ -8740,6 +8853,18 @@ mod tests {
         let orphan_json = spool.join("ccc.json");
         std::fs::write(&orphan_json, b"{}").unwrap();
 
+        // Aged pair with a pending promotion marker: promotion wrote
+        // its durable intent before receipt persistence failed
+        // transiently — the artifact is OWED a receipt and must
+        // survive every sweep until the marker is consumed, no
+        // matter how old the pair is.
+        let marked_json = spool.join("fff.json");
+        let marked_sc = spool.join("fff.atif-auth");
+        let marked_promote = spool.join("fff.promote");
+        std::fs::write(&marked_json, b"{}").unwrap();
+        std::fs::write(&marked_sc, b"provenance").unwrap();
+        std::fs::write(&marked_promote, b"pending promotion").unwrap();
+
         // Live step-journal `.session.json` sibling (never in scope).
         let live_session = spool.join("ddd.session.json");
         std::fs::write(&live_session, b"{}").unwrap();
@@ -8768,6 +8893,10 @@ mod tests {
         assert!(
             orphan_json.exists(),
             "unpaired remnants belong to quarantine, not retention"
+        );
+        assert!(
+            marked_json.exists() && marked_sc.exists() && marked_promote.exists(),
+            "a pair with a pending promotion marker is owed a receipt and must survive retention"
         );
         assert!(live_session.exists(), ".session.json is never a retention target");
 
