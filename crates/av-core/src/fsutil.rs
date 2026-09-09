@@ -72,6 +72,49 @@ pub const fn unix_o_nofollow() -> i32 {
     }
 }
 
+/// `O_NONBLOCK` for `OpenOptions::custom_flags`. Opening a FIFO
+/// read-only WITHOUT this flag blocks until a writer appears — a
+/// pre-planted FIFO (swapped in after any pathname precheck; pathname
+/// checks cannot close that race) would hang the caller forever
+/// before the post-open handle check could refuse it. With the flag,
+/// the open returns immediately and the handle check sees a
+/// non-regular file. Regular files ignore `O_NONBLOCK` entirely, so
+/// the flag is free on the happy path. Same per-arch caution as
+/// `unix_o_nofollow` above: Linux asm-generic uses 0o4000; the
+/// PowerPC layout swaps it; BSD/macOS use 0x4.
+#[cfg(unix)]
+pub const fn unix_o_nonblock() -> i32 {
+    // Unlike O_NOFOLLOW, O_NONBLOCK is 0o4000 across Linux
+    // arches (asm-generic AND the PowerPC layout).
+    #[cfg(target_os = "linux")]
+    {
+        0x800
+    }
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
+    {
+        0x4
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    )))]
+    {
+        0x800
+    }
+}
+
 /// Return just the file name of `path` as a `&str`,
 /// suitable for `path = %basename(&path)` in tracing macros.
 ///
@@ -157,9 +200,18 @@ pub fn create_dir_all_synced(path: &Path) -> io::Result<()> {
     // Highest new ancestor first, so each synced parent already exists.
     for dir in missing.iter().rev() {
         if let Some(parent) = dir.parent() {
-            if !parent.as_os_str().is_empty() {
-                sync_directory(parent)?;
-            }
+            // A single-component relative path (`Path::new("newdir")`)
+            // has `Some("")` as its parent, not `None`; skipping the
+            // sync there left the directory entry naming `newdir`
+            // un-fsynced (fsyncing `newdir` itself does not make the
+            // entry in `.` durable). Normalize to `.` the same way
+            // `write_atomic` does for files.
+            let parent = if parent.as_os_str().is_empty() {
+                std::path::Path::new(".")
+            } else {
+                parent
+            };
+            sync_directory(parent)?;
         }
     }
     Ok(())
@@ -209,7 +261,21 @@ pub fn read_capped(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
             ),
         ));
     }
-    let mut file = std::fs::File::open(path)?;
+    // O_NONBLOCK closes the residual race the pathname precheck cannot:
+    // a FIFO swapped in between `metadata` and `open` no longer blocks
+    // the open — it returns immediately and the handle check below
+    // refuses it. Regular files are unaffected by the flag.
+    // (No O_NOFOLLOW here: `avctl` legitimately reads user-supplied
+    // paths through symlinks; the handle check operates on the resolved
+    // target, which is what the cap protects.)
+    let mut open_options = std::fs::OpenOptions::new();
+    open_options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        open_options.custom_flags(unix_o_nonblock());
+    }
+    let mut file = open_options.open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         // Error messages must not embed the full
@@ -557,6 +623,41 @@ mod tests {
             "O_NOFOLLOW must refuse symlinks (guards the confused-deputy \
              class); constant value {:#x} may be wrong for this platform",
             unix_o_nofollow()
+        );
+    }
+
+    /// `unix_o_nonblock` must (a) leave regular-file opens working and
+    /// (b) make a read-only FIFO open return immediately instead of
+    /// blocking for a writer — the arm `read_capped` relies on to stay
+    /// un-hangable when a FIFO is swapped in after its pathname
+    /// precheck. A wrong constant would either hang this test (caught
+    /// by the harness timeout) or break every regular read.
+    #[test]
+    #[cfg(unix)]
+    fn unix_o_nonblock_flag_opens_fifos_without_blocking() {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let regular = dir.path().join("regular");
+        std::fs::write(&regular, b"hi").unwrap();
+        let ok = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(unix_o_nonblock())
+            .open(&regular);
+        assert!(ok.is_ok(), "O_NONBLOCK must permit regular files: {ok:?}");
+        let fifo = dir.path().join("fifo");
+        // mkfifo must be runnable on unix CI.
+        let status = std::process::Command::new("mkfifo").arg(&fifo).status().unwrap();
+        assert!(status.success(), "mkfifo failed");
+        // No writer exists: without the flag this open blocks forever.
+        let opened = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(unix_o_nonblock())
+            .open(&fifo)
+            .unwrap();
+        let metadata = opened.metadata().unwrap();
+        assert!(
+            !metadata.is_file(),
+            "handle check must classify the FIFO as non-regular"
         );
     }
 

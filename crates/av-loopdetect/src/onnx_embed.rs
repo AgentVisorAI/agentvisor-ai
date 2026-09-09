@@ -19,7 +19,70 @@ pub struct OnnxEmbedder {
     model: RunnableOnnxModel,
     tokenizer: tokenizers::Tokenizer,
     input_count: usize,
+    /// `input_order[i]` is the SEMANTIC tensor for graph input
+    /// position `i`: 0 = input_ids, 1 = attention_mask,
+    /// 2 = token_type_ids. See [`resolve_input_order`].
+    input_order: Vec<usize>,
     dim: usize,
+}
+
+/// Map a graph input name to its semantic slot
+/// (0 = input_ids, 1 = attention_mask, 2 = token_type_ids).
+fn classify_input_name(name: &str) -> Option<usize> {
+    let lower = name.to_ascii_lowercase();
+    if lower.contains("input_id") {
+        Some(0)
+    } else if lower.contains("attention") || lower.contains("mask") {
+        Some(1)
+    } else if lower.contains("token_type") || lower.contains("segment") {
+        Some(2)
+    } else {
+        None
+    }
+}
+
+/// Resolve the semantic binding of the model's graph inputs.
+///
+/// Tensors were previously bound purely by POSITION
+/// (`input_ids, attention_mask[, token_type_ids]`): an otherwise valid
+/// BERT export whose graph declares the inputs in a different order
+/// loaded fine (only the COUNT was checked) and then silently swapped
+/// the mask and token ids at inference — same tensor types and shapes,
+/// so nothing downstream errored; every embedding was just garbage,
+/// and loop detection quietly stopped detecting. Model files are
+/// customer-supplied artifacts, so hostile-or-hasty exports are the
+/// expected input class.
+///
+/// Policy: when every input name is recognizable, bind by NAME in any
+/// order; when none are (minimal/anonymized exports), fall back to the
+/// positional convention; a PARTIALLY recognizable or duplicated set is
+/// ambiguous and refuses to load.
+fn resolve_input_order(names: &[String]) -> Result<Vec<usize>, String> {
+    let classified: Vec<Option<usize>> = names.iter().map(|n| classify_input_name(n)).collect();
+    if classified.iter().all(Option::is_none) {
+        return Ok((0..names.len()).collect());
+    }
+    let Some(order) = classified.into_iter().collect::<Option<Vec<usize>>>() else {
+        return Err(format!(
+            "ONNX sentence model input names {names:?} are only partially recognizable; \
+             refusing an ambiguous tensor binding (expected names containing \
+             input_ids / attention_mask / token_type_ids, or none of them)"
+        ));
+    };
+    let mut seen = vec![false; names.len()];
+    for &slot in &order {
+        if slot >= names.len() || seen.get(slot).copied().unwrap_or(true) {
+            return Err(format!(
+                "ONNX sentence model input names {names:?} do not form exactly one each of \
+                 input_ids / attention_mask{}",
+                if names.len() == 3 { " / token_type_ids" } else { "" }
+            ));
+        }
+        if let Some(flag) = seen.get_mut(slot) {
+            *flag = true;
+        }
+    }
+    Ok(order)
 }
 
 impl OnnxEmbedder {
@@ -33,12 +96,18 @@ impl OnnxEmbedder {
             .map_err(|error| error.to_string())?
             .into_optimized()
             .map_err(|error| error.to_string())?;
-        let input_count = model.input_outlets().map_err(|error| error.to_string())?.len();
+        let input_outlets = model.input_outlets().map_err(|error| error.to_string())?.to_vec();
+        let input_count = input_outlets.len();
         if !(2..=3).contains(&input_count) {
             return Err(format!(
                 "ONNX sentence model must have 2 or 3 inputs, found {input_count}"
             ));
         }
+        let input_names: Vec<String> = input_outlets
+            .iter()
+            .map(|outlet| model.node(outlet.node).name.clone())
+            .collect();
+        let input_order = resolve_input_order(&input_names)?;
         let model = model.into_runnable().map_err(|error| error.to_string())?;
         let tokenizer =
             tokenizers::Tokenizer::from_file(tokenizer_path).map_err(|error| error.to_string())?;
@@ -46,6 +115,7 @@ impl OnnxEmbedder {
             model,
             tokenizer,
             input_count,
+            input_order,
             dim,
         })
     }
@@ -75,22 +145,31 @@ impl OnnxEmbedder {
             .collect();
         let mask = tract_ndarray::Array2::from_shape_vec((1, len), mask_values.clone())
             .map_err(|error| error.to_string())?;
-        let inputs = if self.input_count == 3 {
-            let token_types: Vec<i64> = encoding
-                .get_type_ids()
+        let inputs = {
+            // Semantic tensors: slot 0 = input_ids, 1 = attention_mask,
+            // 2 = token_type_ids; arranged into the model's declared
+            // graph-input order (see `resolve_input_order`).
+            let mut semantic: Vec<TValue> = vec![Tensor::from(input).into(), Tensor::from(mask).into()];
+            if self.input_count == 3 {
+                let token_types: Vec<i64> = encoding
+                    .get_type_ids()
+                    .iter()
+                    .take(len)
+                    .map(|value| i64::from(*value))
+                    .collect();
+                let token_types = tract_ndarray::Array2::from_shape_vec((1, len), token_types)
+                    .map_err(|error| error.to_string())?;
+                semantic.push(Tensor::from(token_types).into());
+            }
+            self.input_order
                 .iter()
-                .take(len)
-                .map(|value| i64::from(*value))
-                .collect();
-            let token_types = tract_ndarray::Array2::from_shape_vec((1, len), token_types)
-                .map_err(|error| error.to_string())?;
-            tvec!(
-                Tensor::from(input).into(),
-                Tensor::from(mask).into(),
-                Tensor::from(token_types).into()
-            )
-        } else {
-            tvec!(Tensor::from(input).into(), Tensor::from(mask).into())
+                .map(|&slot| {
+                    semantic
+                        .get(slot)
+                        .cloned()
+                        .ok_or_else(|| format!("ONNX input slot {slot} out of range"))
+                })
+                .collect::<Result<TVec<TValue>, String>>()?
         };
         let outputs = self.model.run(inputs).map_err(|error| error.to_string())?;
         let output = outputs
@@ -245,5 +324,61 @@ mod tests {
         let output = tract_ndarray::Array3::zeros((1, 2, 3)).into_dyn();
         let error = pool_output(output.view(), &[1], 3).unwrap_err();
         assert!(error.contains("token count 1"));
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    /// Inputs were previously bound purely by position; a reordered but
+    /// otherwise valid export silently swapped mask and token ids
+    /// (identical tensor types/shapes — nothing errored, embeddings
+    /// were garbage). Recognizable names must bind semantically in any
+    /// order; anonymized exports keep the positional convention; a
+    /// partially recognizable or duplicated set refuses to load.
+    #[test]
+    fn input_order_resolves_names_in_any_order() {
+        assert_eq!(
+            resolve_input_order(&names(&["input_ids", "attention_mask", "token_type_ids"])).unwrap(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(
+            resolve_input_order(&names(&["attention_mask", "input_ids", "token_type_ids"])).unwrap(),
+            vec![1, 0, 2]
+        );
+        assert_eq!(
+            resolve_input_order(&names(&["input_ids", "attention_mask"])).unwrap(),
+            vec![0, 1]
+        );
+        // tract-optimized graphs may decorate source names; substring
+        // classification must survive that.
+        assert_eq!(
+            resolve_input_order(&names(&["input_ids.cast", "ATTENTION_MASK_0"])).unwrap(),
+            vec![0, 1]
+        );
+    }
+
+    #[test]
+    fn input_order_falls_back_to_position_for_anonymized_exports() {
+        assert_eq!(
+            resolve_input_order(&names(&["input.1", "input.3", "input.5"])).unwrap(),
+            vec![0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn input_order_refuses_ambiguous_name_sets() {
+        // Partially recognizable.
+        assert!(resolve_input_order(&names(&["input_ids", "input.3"]))
+            .unwrap_err()
+            .contains("partially recognizable"));
+        // Two masks, no ids.
+        assert!(resolve_input_order(&names(&["attention_mask", "mask_two"]))
+            .unwrap_err()
+            .contains("exactly one each"));
+        // token_type_ids in a 2-input model.
+        assert!(resolve_input_order(&names(&["input_ids", "token_type_ids"]))
+            .unwrap_err()
+            .contains("exactly one each"));
     }
 }

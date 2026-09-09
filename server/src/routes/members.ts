@@ -490,9 +490,22 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
       .object({
         email: emailSchema,
         role: roleSchema.default("member"),
+        // Workspace-context pin (optional, client-supplied). Switching
+        // workspaces replaces the browser-wide session cookie, so an
+        // invite dialog opened in tab 1 under org A silently submits
+        // under org B after tab 2 switches — granting the typed email a
+        // role in a workspace the inviter never looked at. The SPA
+        // sends the org id it was RENDERING when the dialog opened;
+        // a mismatch with the cookie's claims means the context moved
+        // underneath the form and the grant must not proceed. Absent
+        // field (older clients, scripts) keeps cookie-claims behavior.
+        orgId: z.string().min(1).max(128).optional(),
       })
       .safeParse(req.body);
     if (!body.success) return reply.code(400).send({ error: "invalid_input" });
+    if (body.data.orgId !== undefined && body.data.orgId !== claims.orgId) {
+      return reply.code(409).send({ error: "org_context_changed" });
+    }
     // R83 F1: block admin inviting an attacker-controlled email as
     // OWNER (attacker accepts, gains org-delete power).
     if (!canGrantRole(claims.membershipRole, body.data.role)) {

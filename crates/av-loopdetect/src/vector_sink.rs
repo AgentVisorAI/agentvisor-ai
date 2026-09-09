@@ -127,7 +127,8 @@ impl QdrantVectorSink {
             ));
         }
         // Absent: create.
-        self.client
+        let created = self
+            .client
             .put(url)
             .json(&serde_json::json!({
                 "vectors": {
@@ -137,9 +138,14 @@ impl QdrantVectorSink {
             }))
             .send()
             .await
-            .map_err(classify_qdrant_error)?
-            .error_for_status()
             .map_err(classify_qdrant_error)?;
+        let created_status = created.status();
+        if !created_status.is_success() {
+            return Err(format!(
+                "Qdrant returned {created_status} creating collection {:?}",
+                self.collection
+            ));
+        }
         Ok(())
     }
 }
@@ -160,7 +166,12 @@ impl VectorSink for QdrantVectorSink {
     fn nearest_similarity<'a>(&'a self, session_id: &'a str, vector: &'a [f32]) -> VectorSearchFuture<'a> {
         Box::pin(async move {
             let url = format!("{}/collections/{}/points/search", self.base_url, self.collection);
-            let response: serde_json::Value = self
+            // `error_for_status` accepts 3xx, and redirect following is
+            // deliberately disabled (see the client builder): a
+            // redirecting endpoint would be acknowledged as success
+            // without the operation ever executing. Require 2xx
+            // explicitly — here and in record/delete_scope/create below.
+            let raw = self
                 .client
                 .post(url)
                 .json(&serde_json::json!({
@@ -177,12 +188,15 @@ impl VectorSink for QdrantVectorSink {
                 }))
                 .send()
                 .await
-                .map_err(classify_qdrant_error)?
-                .error_for_status()
-                .map_err(classify_qdrant_error)?
-                .json()
-                .await
                 .map_err(classify_qdrant_error)?;
+            let status = raw.status();
+            if !status.is_success() {
+                return Err(format!(
+                    "Qdrant returned {status} searching collection {:?}",
+                    self.collection
+                ));
+            }
+            let response: serde_json::Value = raw.json().await.map_err(classify_qdrant_error)?;
             let Some(score) = response
                 .pointer("/result/0/score")
                 .and_then(serde_json::Value::as_f64)
@@ -212,7 +226,8 @@ impl VectorSink for QdrantVectorSink {
                 "{}/collections/{}/points?wait=true",
                 self.base_url, self.collection
             );
-            self.client
+            let recorded = self
+                .client
                 .put(url)
                 .json(&serde_json::json!({
                     "points": [{
@@ -226,9 +241,14 @@ impl VectorSink for QdrantVectorSink {
                 }))
                 .send()
                 .await
-                .map_err(classify_qdrant_error)?
-                .error_for_status()
                 .map_err(classify_qdrant_error)?;
+            let status = recorded.status();
+            if !status.is_success() {
+                return Err(format!(
+                    "Qdrant returned {status} recording a vector in collection {:?}",
+                    self.collection
+                ));
+            }
             Ok(())
         })
     }
@@ -239,7 +259,8 @@ impl VectorSink for QdrantVectorSink {
                 "{}/collections/{}/points/delete?wait=true",
                 self.base_url, self.collection
             );
-            self.client
+            let deleted = self
+                .client
                 .post(url)
                 .json(&serde_json::json!({
                     "filter": {
@@ -251,9 +272,14 @@ impl VectorSink for QdrantVectorSink {
                 }))
                 .send()
                 .await
-                .map_err(classify_qdrant_error)?
-                .error_for_status()
                 .map_err(classify_qdrant_error)?;
+            let status = deleted.status();
+            if !status.is_success() {
+                return Err(format!(
+                    "Qdrant returned {status} deleting a session scope from collection {:?}",
+                    self.collection
+                ));
+            }
             Ok(())
         })
     }

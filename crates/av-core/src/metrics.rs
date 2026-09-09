@@ -262,6 +262,13 @@ enum MetricKind {
     Counter,
     Gauge,
     Histogram,
+    /// Not a registrable kind: a name reserved because a histogram's
+    /// text exposition generates it (`<base>_bucket`, `<base>_sum`,
+    /// `<base>_count`). Conflicts with EVERY registration — including
+    /// another histogram — since any metric under this name would
+    /// emit series/TYPE lines colliding with the generating
+    /// histogram's rendered samples.
+    HistogramReserved,
 }
 
 impl MetricKind {
@@ -270,6 +277,7 @@ impl MetricKind {
             Self::Counter => "counter",
             Self::Gauge => "gauge",
             Self::Histogram => "histogram",
+            Self::HistogramReserved => "histogram-generated series (_bucket/_sum/_count)",
         }
     }
 }
@@ -446,17 +454,38 @@ impl Registry {
     fn reserve_base_kind(&self, key: &str, kind: MetricKind) {
         let (base, _labels) = split_key(key);
         let mut kinds = self.base_kinds.lock();
-        match kinds.get(base) {
-            Some(existing) if *existing != kind => panic!(
-                "metric base-name kind conflict: {base:?} is already registered as \
-                 `{}` at another label combination; cannot register {key:?} as `{}`. \
-                 Prometheus rejects mismatched TYPE headers across variants of the \
-                 same base name and the whole scrape becomes invalid text exposition.",
-                existing.label(),
-                kind.label(),
-            ),
-            _ => {
-                kinds.insert(base.to_owned(), kind);
+        // A histogram's exposition OWNS three generated series names
+        // beyond its base: `<base>_bucket`, `<base>_sum`,
+        // `<base>_count`. A counter registered later as, say,
+        // `latency_seconds_count` would render a second bare
+        // `latency_seconds_count` sample under its own TYPE header —
+        // duplicate series + conflicting TYPE claims in one scrape,
+        // which Prometheus rejects wholesale. Reserve the generated
+        // names alongside the base; the same loop symmetrically
+        // panics when a histogram's generated names collide with
+        // anything already registered (either order fails fast).
+        let reserved: Vec<(String, MetricKind)> = match kind {
+            MetricKind::Histogram => vec![
+                (base.to_owned(), kind),
+                (format!("{base}_bucket"), MetricKind::HistogramReserved),
+                (format!("{base}_sum"), MetricKind::HistogramReserved),
+                (format!("{base}_count"), MetricKind::HistogramReserved),
+            ],
+            _ => vec![(base.to_owned(), kind)],
+        };
+        for (name, reserve_as) in reserved {
+            match kinds.get(name.as_str()) {
+                Some(existing) if *existing != reserve_as => panic!(
+                    "metric base-name kind conflict: {name:?} is already registered as \
+                     `{}`; cannot register {key:?} as `{}`. \
+                     Prometheus rejects mismatched TYPE headers across variants of the \
+                     same base name and the whole scrape becomes invalid text exposition.",
+                    existing.label(),
+                    reserve_as.label(),
+                ),
+                _ => {
+                    kinds.insert(name, reserve_as);
+                }
             }
         }
     }
@@ -1032,6 +1061,40 @@ mod tests {
         let r = Registry::new();
         r.counter("av_metric", "help");
         r.histogram("av_metric", "help");
+    }
+
+    /// A histogram's text exposition generates `<base>_bucket`,
+    /// `<base>_sum` and `<base>_count` series. Registering a counter
+    /// under one of those names produced TWO samples named
+    /// `<base>_count` under conflicting TYPE headers — Prometheus
+    /// rejects the whole scrape as invalid exposition. Both
+    /// registration orders must fail fast.
+    #[test]
+    #[should_panic(expected = "kind conflict")]
+    fn counter_named_like_histogram_count_series_panics() {
+        let r = Registry::new();
+        r.histogram("av_lat_seconds", "help");
+        r.counter("av_lat_seconds_count", "help");
+    }
+
+    #[test]
+    #[should_panic(expected = "kind conflict")]
+    fn histogram_whose_generated_series_collide_with_counter_panics() {
+        let r = Registry::new();
+        r.counter("av_lat_seconds_sum", "help");
+        r.histogram("av_lat_seconds", "help");
+    }
+
+    /// The reservation must not break legitimate reuse: the same
+    /// histogram re-registered (other label sets) and unrelated
+    /// suffix-shaped names with no histogram sibling stay valid.
+    #[test]
+    fn histogram_reservation_permits_reregistration_and_unrelated_suffix_names() {
+        let r = Registry::new();
+        r.histogram("av_lat_seconds{route=\"a\"}", "help");
+        r.histogram("av_lat_seconds{route=\"b\"}", "help");
+        r.counter("av_unrelated_count", "help");
+        assert!(r.render().contains("av_unrelated_count"));
     }
 
     /// Cross-label type collision on the same base name: `foo{a="1"}`

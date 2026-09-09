@@ -252,7 +252,7 @@ fn stub_middle_to_target(
             continue;
         };
         let role = msg_role(message);
-        if role == "system" || role == "tool" || message.get("tool_calls").is_some() {
+        if role == "system" || role == "developer" || role == "tool" || message.get("tool_calls").is_some() {
             continue;
         }
         let Some(content) = msg_content_str(message) else {
@@ -1100,12 +1100,14 @@ mod tests {
     fn middle_stub_skips_protected_roles_and_small_messages() {
         let big = "long analysis paragraph ".repeat(600); // well past 50k total below
         let protected_system = json!({"role": "system", "content": big.clone()});
+        let protected_developer = json!({"role": "developer", "content": big.clone()});
         let protected_tool = json!({"role": "tool", "tool_call_id": "c1", "content": big.clone()});
         let protected_calls = json!({"role": "assistant", "content": big.clone(),
             "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}}]});
         let small = json!({"role": "user", "content": "tiny"});
         let mut msgs = vec![
             protected_system.clone(),
+            protected_developer.clone(),
             protected_tool.clone(),
             protected_calls.clone(),
             small.clone(),
@@ -1123,9 +1125,13 @@ mod tests {
         assert!(out.changed, "large history must engage the middle stub pass");
         let result = out.payload["messages"].as_array().unwrap();
         assert_eq!(result[0], protected_system, "system messages must survive");
-        assert_eq!(result[1], protected_tool, "tool messages must survive");
-        assert_eq!(result[2], protected_calls, "tool-call carriers must survive");
-        assert_eq!(result[3], small, "sub-32-token messages must survive");
+        assert_eq!(
+            result[1], protected_developer,
+            "developer messages (OpenAI's higher-priority system-role successor) must survive"
+        );
+        assert_eq!(result[2], protected_tool, "tool messages must survive");
+        assert_eq!(result[3], protected_calls, "tool-call carriers must survive");
+        assert_eq!(result[4], small, "sub-32-token messages must survive");
         let stubbed = result
             .iter()
             .filter(|m| msg_content_str(m).is_some_and(|c| c.contains("reason: middle history]")))

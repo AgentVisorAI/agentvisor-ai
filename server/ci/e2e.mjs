@@ -260,6 +260,13 @@ try {
   check("invite created", !!inv1);
   const inv2 = await ds.inviteMember({ email: `resend-${rand}@test.dev`, role: "member" });
   check("invite resend (upsert) ok", !!inv2);
+  // Workspace-context pin: an invite carrying the org id its dialog was
+  // opened under must be refused when the session cookie has moved to a
+  // different workspace (cross-tab switch race). Matching pin passes.
+  const pinOk = await ds.inviteMember({ email: `pin-${rand}@test.dev`, role: "member", orgId: (await ds.getSession()).org.id });
+  check("invite with matching org pin ok", !!pinOk);
+  const pinStale = await ds.inviteMember({ email: `pin2-${rand}@test.dev`, role: "member", orgId: "org_someone_elses" }).then(() => null).catch((e) => (e && (e.errorCode || e.message)) || "");
+  check("invite with stale org pin refused", /org_context_changed/.test(pinStale || ""), String(pinStale));
   const pend = (await ds.listInvites()).invites || [];
   check("resend keeps ONE pending row", pend.filter(i => i.email === `resend-${rand}@test.dev`).length === 1);
   await ds.revokeInvite(pend.find(i => i.email === `resend-${rand}@test.dev`).id);

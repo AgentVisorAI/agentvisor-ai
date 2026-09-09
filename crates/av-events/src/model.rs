@@ -345,8 +345,15 @@ impl OcsfEventBuilder {
     }
 
     /// Attach a stop reason.
+    ///
+    /// Clears any provider-native text a prior `stop_reason_native`
+    /// call attached: the pair travels together, and re-normalizing
+    /// without re-sourcing would otherwise emit a contradictory
+    /// `(stop_reason_id, native text)` combination that validation
+    /// cannot catch (native text is free-form).
     pub fn stop_reason(mut self, r: crate::StopReason) -> Self {
         self.stop_reason = Some(r);
+        self.native_stop_reason = None;
         self
     }
 
@@ -485,6 +492,25 @@ mod tests {
             instance_uid: "agent-inst-42".into(),
             ttl_remaining_s: Some(731),
         }
+    }
+
+    /// Re-normalizing via `stop_reason` after `stop_reason_native` must
+    /// drop the stale provider-native text: the pair travels together,
+    /// and validation cannot catch a contradictory `(id, native)`
+    /// combination because native text is free-form.
+    #[test]
+    fn stop_reason_rebind_clears_stale_native_text() {
+        let ev = OcsfEventBuilder::new(EventClass::StopReason, "sess-1", identity(), 7)
+            .stop_reason_native(StopReason::Stop, "stop")
+            .stop_reason(StopReason::PolicyBlocked)
+            .build()
+            .unwrap();
+        assert_eq!(ev.stop_reason_id, Some(StopReason::PolicyBlocked.id()));
+        assert_eq!(
+            ev.stop_reason.as_deref(),
+            Some(StopReason::PolicyBlocked.caption()),
+            "caption must re-derive from the rebound reason, not the stale native text"
+        );
     }
 
     #[test]

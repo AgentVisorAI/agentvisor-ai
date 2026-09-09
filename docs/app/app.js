@@ -4912,13 +4912,17 @@
       var tr = e.target.closest("tr[data-invite]");
       var invId = tr.getAttribute("data-invite");
       var inv = invites.filter(function (x) { return x.id === invId; })[0];
+      var orgAtRevoke = state.session && state.session.org ? state.session.org.id : undefined;
       state.ds.revokeInvite(invId).then(function () {
         renderSettingsMembers(root);
         // Undo instead of a confirm dialog: revoking an invite is
         // low-stakes (nothing is lost but the email link), so don't
         // interrupt — offer the way back for 6 seconds.
         if (inv) toastAction("Invite to " + inv.email + " revoked", "Undo", function () {
-          state.ds.inviteMember({ email: inv.email, role: inv.role }).then(function () {
+          // Same workspace pin as openInviteModal: the undo fires
+          // seconds later and another tab may have switched the
+          // browser-wide session cookie in between.
+          state.ds.inviteMember({ email: inv.email, role: inv.role, orgId: orgAtRevoke }).then(function () {
             toast("Invite restored");
             renderSettingsMembers(root);
           }).catch(function (err) { toast(err.message || "Could not restore the invite", true); });
@@ -4930,6 +4934,10 @@
 
   function openInviteModal(rootAfterSave) {
     if (document.body.classList.contains("locked")) return;
+    // Captured at open: the workspace this dialog is ABOUT. See the
+    // submit handler — the session cookie is browser-wide and another
+    // tab can switch it before this form submits.
+    var orgAtOpen = state.session && state.session.org ? state.session.org.id : undefined;
     var backdrop = h(
       '<div class="modal-backdrop" role="dialog" aria-modal="true"><div class="modal">' +
         '<h2>Invite a teammate</h2>' +
@@ -4959,7 +4967,12 @@
       var role = backdrop.querySelector("#inv_role").value;
       var btn = e.target.querySelector('button[type="submit"]');
       btn.disabled = true;
-      state.ds.inviteMember({ email: email, role: role }).then(function () {
+      // Pin the invite to the workspace this dialog was opened under:
+      // an org switch in another tab replaces the browser-wide session
+      // cookie, and without the pin the grant would land in whichever
+      // workspace that cookie now points at (server refuses on
+      // mismatch with org_context_changed).
+      state.ds.inviteMember({ email: email, role: role, orgId: orgAtOpen }).then(function () {
         close();
         toast("Invite sent to " + email);
         if (rootAfterSave) renderSettingsMembers(rootAfterSave);
@@ -4967,6 +4980,7 @@
         btn.disabled = false;
         var msg = err.message || "Invite failed";
         if (err.errorCode === "already_a_member") msg = "This person is already a member.";
+        if (err.errorCode === "org_context_changed") msg = "Workspace changed in another tab — close this dialog and try again.";
         toast(msg, true);
       });
     });
