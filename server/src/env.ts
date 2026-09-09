@@ -197,6 +197,19 @@ const Env = z.object({
     .string()
     .optional()
     .transform((v) => v === "true" || v === "1"),
+  // Test hygiene: disable the periodic retention sweeper (boot-jitter
+  // initial sweep + interval). The retention drill seeds ancient rows
+  // and asserts on exact sweep-now effects; the background sweeper's
+  // 0–30 s boot-jitter sweep legally purges those rows mid-drill (the
+  // org's retention window really is exceeded), producing evidence-
+  // destroying flakes — the cross-org isolation check cannot even
+  // retry, its seeded row is simply gone. sweep-now (the code under
+  // test) is unaffected. Never legitimately set in production; same
+  // opt-in discipline as ALLOW_INTERNAL_WEBHOOK_TARGETS above.
+  DISABLE_RETENTION_SWEEPER: z
+    .string()
+    .optional()
+    .transform((v) => v === "true" || v === "1"),
   ALLOWED_ORIGINS: z
     .string()
     .default("")
