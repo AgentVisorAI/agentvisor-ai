@@ -2232,6 +2232,38 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tokio::sync::oneshot;
 
+    /// Round-22 mutation finding: sanitize_for_terminal — the defense
+    /// that keeps hostile spool/bridge strings (session ids, warnings
+    /// echoed by console-sync and the crash drill) from injecting
+    /// terminal escape sequences into an operator's shell — had ZERO
+    /// pins: replacing its whole body with a constant survived the
+    /// suite, as did every boundary in its control-plane checks. Pin
+    /// the contract: C0 controls (except TAB), DEL, C1 range, and the
+    /// bidi/zero-width set are all replaced; printable text passes
+    /// through byte-identical.
+    #[test]
+    fn sanitize_for_terminal_neutralizes_every_control_class() {
+        // ESC-based CSI injection (the classic \x1b]0; title attack).
+        assert_eq!(sanitize_for_terminal("a\u{1b}[31mred"), "a\u{FFFD}[31mred");
+        // Every C0 control except TAB is replaced; TAB survives.
+        assert_eq!(sanitize_for_terminal("a\tb"), "a\tb");
+        assert_eq!(
+            sanitize_for_terminal("a\u{0}b\rc\nd"),
+            "a\u{FFFD}b\u{FFFD}c\u{FFFD}d"
+        );
+        // Boundary: 0x1f replaced, 0x20 (space) kept.
+        assert_eq!(sanitize_for_terminal("\u{1f} \u{20}"), "\u{FFFD}  ");
+        // DEL and the full C1 range boundaries (0x7f, 0x80, 0x9f, 0xa0).
+        assert_eq!(
+            sanitize_for_terminal("\u{7f}\u{80}\u{9f}\u{a0}"),
+            "\u{FFFD}\u{FFFD}\u{FFFD}\u{a0}"
+        );
+        // Bidi controls (Trojan-Source display reversal) are replaced.
+        assert_eq!(sanitize_for_terminal("x\u{202e}y"), "x\u{FFFD}y");
+        // Plain unicode text passes through untouched.
+        assert_eq!(sanitize_for_terminal("café Straße ✓"), "café Straße ✓");
+    }
+
     #[test]
     fn unicode_truncation_does_not_split_utf8_or_exceed_utf16_cap() {
         let input = "😀".repeat(4_001);
