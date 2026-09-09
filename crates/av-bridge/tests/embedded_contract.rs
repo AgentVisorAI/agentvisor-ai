@@ -175,67 +175,6 @@ fn maintenance_reports_the_exact_expiry_count() {
     );
 }
 
-/// A retention crash-gap must not resurrect an already-published
-/// event: when a record vanishes from the segment (rewrite crash
-/// between segment and sidecar) but its offset lies INSIDE the
-/// surviving records' offset range, the sidecar's UID→offset entry is
-/// deliberately RETAINED so `publish_idempotent` still short-circuits
-/// to the original ack instead of appending a duplicate audit event.
-/// Mutation-run hardening (round 9): the `offset <= hi` half of the
-/// range check had a surviving mutant — nothing exercised the
-/// gap-offset shape.
-#[test]
-fn crash_gap_inside_offset_range_keeps_idempotency() {
-    let dir = tempfile::tempdir().unwrap();
-    let acks = {
-        let broker = EmbeddedBroker::provision(dir.path(), &manifest()).unwrap();
-        (0..3)
-            .map(|i| {
-                broker
-                    .publish_idempotent(
-                        "agent.session",
-                        "inst-A",
-                        &json!({"metadata": {"uid": format!("gap-uid-{i}")}, "value": i}),
-                        &format!("gap-uid-{i}"),
-                    )
-                    .unwrap()
-            })
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(acks[1].offset, 1);
-
-    // Simulate the crash: the MIDDLE record is gone from the segment,
-    // the sidecar still remembers it.
-    let segment = dir
-        .path()
-        .join("topics")
-        .join("agent.session")
-        .join(format!("p{}.jsonl", acks[0].partition));
-    let surviving: Vec<String> = std::fs::read_to_string(&segment)
-        .unwrap()
-        .lines()
-        .enumerate()
-        .filter(|(i, _)| *i != 1)
-        .map(|(_, line)| line.to_owned())
-        .collect();
-    std::fs::write(&segment, format!("{}\n", surviving.join("\n"))).unwrap();
-
-    let reopened = EmbeddedBroker::open(dir.path()).unwrap();
-    let retry = reopened
-        .publish_idempotent(
-            "agent.session",
-            "inst-A",
-            &json!({"metadata": {"uid": "gap-uid-1"}, "value": 1}),
-            "gap-uid-1",
-        )
-        .unwrap();
-    assert_eq!(
-        retry, acks[1],
-        "a gap-offset UID inside the surviving range must keep deduplicating \
-         (a republish would mint a duplicate audit event)"
-    );
-}
-
 #[test]
 fn unknown_topic_is_an_error_not_autocreate() {
     let dir = tempfile::tempdir().unwrap();
@@ -328,6 +267,137 @@ fn crash_recovery_preserves_offsets_and_truncates_torn_tail() {
     let events = reopened.fetch("agent.session", partition, 0, 100).unwrap();
     assert_eq!(events.len(), 7);
     assert_eq!(events[6].value["i"], "after-crash");
+}
+
+/// Reopen reconciliation of the UID→offset idempotency sidecar: a
+/// retention crash between segment rewrite and sidecar rewrite leaves a
+/// sidecar entry whose record is GONE from a fully-parseable segment.
+/// Recovery must drop it — the prior [min, max]-range heuristic kept any
+/// middle-offset entry, so the next publish_idempotent returned a stale
+/// ack whose offset now fetches a DIFFERENT record (or nothing).
+/// (Supersedes the old `crash_gap_inside_offset_range_keeps_idempotency`
+/// pin: the non-crash retention path already prunes exactly these UIDs —
+/// the dedup window is the hot-retention window by design — so recovery
+/// must converge to the state the interrupted sidecar rewrite would have
+/// produced, not resurrect a mapping whose ack misdirects fetches.)
+#[test]
+fn reopen_drops_stale_sidecar_uids_when_segment_is_fully_parseable() {
+    let dir = tempfile::tempdir().unwrap();
+    let uid = |n: u64| format!("uid-{n}");
+    let event = |n: u64| json!({"metadata": {"uid": uid(n)}, "n": n});
+    let partition;
+    {
+        let broker = EmbeddedBroker::provision(dir.path(), &manifest()).unwrap();
+        partition = broker
+            .publish_idempotent("agent.session", "inst-X", &event(0), &uid(0))
+            .unwrap()
+            .partition;
+        for n in 1..4 {
+            broker
+                .publish_idempotent("agent.session", "inst-X", &event(n), &uid(n))
+                .unwrap();
+        }
+    } // "crash"
+
+    // Simulate the retention crash: the segment was rewritten without
+    // the (middle) record at offset 2, but the sidecar rewrite never
+    // ran — uid-2 → 2 survives on disk.
+    let seg = dir
+        .path()
+        .join("topics")
+        .join("agent.session")
+        .join(format!("p{partition}.jsonl"));
+    let kept: String = std::fs::read_to_string(&seg)
+        .unwrap()
+        .lines()
+        .filter(|line| !line.contains("uid-2"))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    std::fs::write(&seg, kept).unwrap();
+
+    let reopened = EmbeddedBroker::open(dir.path()).unwrap();
+    // The stale mapping must be dropped: republishing uid-2 appends a
+    // fresh record past the surviving max offset instead of acking the
+    // purged offset.
+    let ack = reopened
+        .publish_idempotent("agent.session", "inst-X", &event(2), &uid(2))
+        .unwrap();
+    assert_eq!(
+        ack.offset, 4,
+        "stale sidecar UID must not short-circuit to a purged offset"
+    );
+    let fetched = reopened.fetch("agent.session", partition, 4, 10).unwrap();
+    assert_eq!(
+        fetched.len(),
+        1,
+        "the republished record must actually be appended"
+    );
+    assert_eq!(fetched[0].value["n"], 2);
+    // Idempotency for records that DID survive is untouched.
+    let ack = reopened
+        .publish_idempotent("agent.session", "inst-X", &event(1), &uid(1))
+        .unwrap();
+    assert_eq!(ack.offset, 1, "surviving records keep deduplicating");
+}
+
+/// The conservative arm of the same reconciliation: when the segment
+/// holds an unparseable-but-complete line, its offset is unknowable, so
+/// a non-live sidecar UID inside the extended offset range is KEPT — a
+/// stale ack (caught by fetch-side digest checks) beats re-appending a
+/// duplicate of an authentic-but-corrupt record.
+#[test]
+fn reopen_keeps_sidecar_uid_for_an_unparseable_segment_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let uid = |n: u64| format!("uid-{n}");
+    let event = |n: u64| json!({"metadata": {"uid": uid(n)}, "n": n});
+    let partition;
+    {
+        let broker = EmbeddedBroker::provision(dir.path(), &manifest()).unwrap();
+        partition = broker
+            .publish_idempotent("agent.session", "inst-X", &event(0), &uid(0))
+            .unwrap()
+            .partition;
+        for n in 1..4 {
+            broker
+                .publish_idempotent("agent.session", "inst-X", &event(n), &uid(n))
+                .unwrap();
+        }
+    } // "crash"
+
+    // Corrupt (don't remove) the middle record: one complete unparseable
+    // line still occupying offset 2.
+    let seg = dir
+        .path()
+        .join("topics")
+        .join("agent.session")
+        .join(format!("p{partition}.jsonl"));
+    let rewritten: String = std::fs::read_to_string(&seg)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            if line.contains("uid-2") {
+                "{corrupt-but-complete\n".to_owned()
+            } else {
+                format!("{line}\n")
+            }
+        })
+        .collect();
+    std::fs::write(&seg, rewritten).unwrap();
+
+    let reopened = EmbeddedBroker::open(dir.path()).unwrap();
+    let ack = reopened
+        .publish_idempotent("agent.session", "inst-X", &event(2), &uid(2))
+        .unwrap();
+    assert_eq!(
+        ack.offset, 2,
+        "a UID that may belong to the unparseable line must keep deduplicating",
+    );
+    let fetched = reopened.fetch("agent.session", partition, 0, 10).unwrap();
+    assert_eq!(
+        fetched.len(),
+        3,
+        "no duplicate append: only the three parseable records remain fetchable",
+    );
 }
 
 #[test]

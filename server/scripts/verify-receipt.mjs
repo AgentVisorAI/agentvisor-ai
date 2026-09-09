@@ -219,7 +219,13 @@ function receiptSigningMessage(rawBody) {
 //      implementation-defined; JSON.parse silently keeps the LAST,
 //      so two readers can disagree about the signed content).
 function isStrictStandardB64(s) {
-  return typeof s === "string" && s.length % 4 === 0 && /^[A-Za-z0-9+/]*={0,2}$/.test(s);
+  if (typeof s !== "string" || s.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(s)) return false;
+  // Canonical-encoding parity: non-zero trailing bits (and odd padding
+  // shapes) decode identically under Buffer.from(s, "base64") but Rust's
+  // STANDARD engine refuses them. Round-tripping decode→encode accepts
+  // exactly the canonical encodings. Keep in sync with
+  // docs/verify/verify.js.
+  return Buffer.from(s, "base64").toString("base64") === s;
 }
 function firstDuplicateKey(text) {
   // Minimal JSON walker: tracks object key sets per depth. Assumes
@@ -231,14 +237,24 @@ function firstDuplicateKey(text) {
   function readString() {
     // at opening quote
     i++;
-    let out = "";
+    const start = i;
     while (i < n) {
-      const c = text[i];
-      if (c === "\\") { out += text[i] + (text[i + 1] ?? ""); i += 2; continue; }
-      if (c === '"') { i++; return out; }
-      out += c; i++;
+      if (text[i] === "\\") { i += 2; continue; }
+      if (text[i] === '"') {
+        const raw = text.slice(start, i);
+        i++;
+        // Decode JSON string escapes so duplicate detection happens in
+        // the same domain as serde's decoded-key comparison:
+        // "\u0073ession_id" and "session_id" are the SAME key to the
+        // Rust verifier and must collide here too — comparing raw
+        // escape text let an escaped duplicate slip past this gate
+        // while JSON.parse silently kept the last value. Keep in sync
+        // with docs/verify/verify.js.
+        try { return JSON.parse('"' + raw + '"'); } catch { return raw; }
+      }
+      i++;
     }
-    return out;
+    return text.slice(start);
   }
   while (i < n) {
     skipWs();

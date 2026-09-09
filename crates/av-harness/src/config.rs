@@ -1135,7 +1135,15 @@ impl HarnessConfig {
                 .rsplit_once(':')
                 .map(|(h, _)| h.trim_start_matches('[').trim_end_matches(']'))
                 .unwrap_or("");
-            let is_wildcard = matches!(host, "0.0.0.0" | "::" | "*" | "");
+            // Parse-and-classify instead of literal string matching: the
+            // unspecified address has many spellings (`::0`,
+            // `0:0:0:0:0:0:0:0`, `::ffff:0.0.0.0`, …) and a literal list
+            // silently waves the non-canonical ones through — the exact
+            // all-interfaces exposure this guard exists to refuse.
+            let is_wildcard = matches!(host, "*" | "")
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_unspecified());
             if is_wildcard {
                 errors.push(format!(
                     "listen {:?} binds every interface while require_identity = false: any \
@@ -3372,6 +3380,22 @@ spec:
         )
         .unwrap_err();
         assert!(err.contains("every interface"), "IPv6 wildcard: {err}");
+
+        // Non-canonical spellings of the unspecified address are the
+        // same all-interfaces bind and must be refused too — the prior
+        // literal string match (`"0.0.0.0" | "::"`) waved these through.
+        for listen in ["[::0]:8484", "[0:0:0:0:0:0:0:0]:8484", "[0000::]:8484"] {
+            let err = HarnessConfig::from_toml(&format!(
+                r#"upstream_url = "https://api.openai.com"
+                   listen = "{listen}"
+                   require_identity = false"#,
+            ))
+            .unwrap_err();
+            assert!(
+                err.contains("every interface"),
+                "non-canonical wildcard {listen}: {err}"
+            );
+        }
 
         // Loopback remains legal.
         HarnessConfig::from_toml(

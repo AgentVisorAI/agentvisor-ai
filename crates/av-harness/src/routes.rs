@@ -267,7 +267,7 @@ async fn trace_request(request: Request<Body>, next: Next) -> Response {
             .and_then(|v| av_core::SessionId::parse(v).ok())
             .map(|id| id.to_string())
             .unwrap_or_else(|| " rejected".to_owned()),
-        Ok(None) => "unbound".to_owned(),
+        Ok(None) => " unbound".to_owned(),
         Err(_) => " duplicate-header".to_owned(),
     };
     let span = tracing::info_span!(
