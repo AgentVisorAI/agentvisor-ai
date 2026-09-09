@@ -1114,6 +1114,14 @@ async fn mcp_call(State(state): State<AppState>, headers: HeaderMap, body: Bytes
 
 async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Response {
     let (execution, unaudited_outcome) = if state.config.tool_upstream_url.is_some() {
+        // Same cheap pre-parse identity gate as the intercept path
+        // (pipeline::refuse_unauthenticated_tool_call): required
+        // identity + no Authorization header can never be admitted —
+        // refuse before `from_request` runs its parse/canonicalize/
+        // hash work on anonymous bytes.
+        if let Err(error) = state.refuse_unauthenticated_tool_call(&headers) {
+            return pipeline_error(error);
+        }
         match ToolExecution::from_request(&state.config.atif_spool_dir, &headers, &body, state.journal_key) {
             Ok(mut execution) => {
                 let required_scope = crate::pipeline::tool_scope(&execution.tool);

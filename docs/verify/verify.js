@@ -40,6 +40,47 @@
       // decode→encode accepts exactly the canonical encodings.
       try { return btoa(atob(s)) === s; } catch { return false; }
     }
+    // Rust-parity precision gate: receipt integers are u64s capped at
+    // JCS_SAFE_MAX = 2^53 (av-core error.rs; jcs.rs refuses anything
+    // above). JSON.parse rounds bigger integer tokens to the nearest
+    // double BEFORE the raw-receipt path re-canonicalizes the body, so
+    // a tampered `…992` → `…993` silently rounds BACK to the signed
+    // value and verified green here while `avctl receipt-verify`
+    // refuses the file. Scan the raw text: any integer token above
+    // 2^53 in magnitude is a refusal. Keep in sync with
+    // server/scripts/verify-receipt.mjs.
+    function firstUnsafeInteger(text) {
+      const LIMIT = 9007199254740992n; // 2^53 == Rust JCS_SAFE_MAX
+      let i = 0;
+      const n = text.length;
+      while (i < n) {
+        const c = text[i];
+        if (c === '"') {
+          i++;
+          while (i < n) {
+            if (text[i] === "\\") { i += 2; continue; }
+            if (text[i] === '"') { i++; break; }
+            i++;
+          }
+          continue;
+        }
+        if (c === "-" || (c >= "0" && c <= "9")) {
+          let j = i;
+          if (text[j] === "-") j++;
+          let digits = "";
+          while (j < n && text[j] >= "0" && text[j] <= "9") { digits += text[j]; j++; }
+          const isFloat = text[j] === "." || text[j] === "e" || text[j] === "E";
+          if (!isFloat && digits.length > 0 && BigInt(digits) > LIMIT) {
+            return (text[i] === "-" ? "-" : "") + digits;
+          }
+          while (j < n && /[0-9eE+.-]/.test(text[j])) j++;
+          i = j;
+          continue;
+        }
+        i++;
+      }
+      return null;
+    }
     function firstDuplicateKey(text) {
       // Minimal walker over ALREADY-JSON.parse-able text: tracks key
       // sets per object depth. Keep in sync with
@@ -159,10 +200,14 @@
         out.set(canonical, RECEIPT_DOMAIN_TAG_V2.length + 8);
         return out;
       }
-      // Unknown version — return an obviously-wrong message so
-      // verify returns false. Better to fail-closed than to guess
-      // a future framing.
-      return new Uint8Array(0);
+      // Unknown version: hard refusal BEFORE any cryptographic check.
+      // The previous "return empty message" sentinel was not
+      // fail-closed — the empty message is valid Ed25519 signing
+      // input, so any key that ever signed zero bytes in another
+      // context would make every version-3+ body "verify". Rust
+      // refuses unsupported versions outright; mirror it. Thrown here,
+      // rendered as the red error card by handleText's catch.
+      throw new Error("receipt_version " + receiptVersion + " has no defined signature framing (supported: 1, 2) — the Rust verifier refuses this file; refusing here too.");
     }
 
     // R78 HIGH #1 (landed R79 into the extracted verify.js): trust
@@ -241,7 +286,17 @@
       );
     }
     function rawReceiptToBundle(parsed) {
-      const body = {};
+      // Null-prototype target: on a plain `{}`, assigning the key
+      // "__proto__" invokes the prototype setter instead of creating
+      // an own property — the member silently VANISHES from the
+      // canonicalization (so the original signature still verifies
+      // over a body that visibly carries an extra field) and the
+      // assigned object pollutes the reconstruction's prototype. Rust
+      // refuses unknown top-level fields outright; with a null
+      // prototype the member survives into the canonical bytes and the
+      // signature check refuses it here too. Keep in sync with
+      // server/scripts/verify-receipt.mjs.
+      const body = Object.create(null);
       for (const k of Object.keys(parsed)) {
         if (k === "signature_b64") continue;
         body[k] = parsed[k];
@@ -520,6 +575,11 @@
         const dup = firstDuplicateKey(text);
         if (dup !== null) {
           render({ kind: "err", message: 'Duplicate JSON key "' + dup + '" — the Rust verifier refuses this file; refusing here too.' });
+          return;
+        }
+        const unsafeInt = firstUnsafeInteger(text);
+        if (unsafeInt !== null) {
+          render({ kind: "err", message: "Integer " + unsafeInt + " exceeds 2\u00B253 (JCS-safe bound) — JSON.parse would silently round it; the Rust verifier refuses this file; refusing here too." });
           return;
         }
         if (!isStrictStandardB64(bundle.public_key_b64)) {

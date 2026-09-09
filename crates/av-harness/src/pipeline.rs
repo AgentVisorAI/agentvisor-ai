@@ -2708,6 +2708,34 @@ impl AppState {
             .map(|(verdict, _session)| verdict)
     }
 
+    /// Cheap pre-parse identity gate for the tool paths. When identity
+    /// is REQUIRED, a request with no Authorization header can never be
+    /// admitted — refuse before `parse_tool_call` /
+    /// `ToolExecution::from_request` run their duplicate-key scan, JSON
+    /// parse, canonicalization, and hashing. The chat path resolves
+    /// identity before any body processing; the tool paths parsed FIRST
+    /// (the required scope depends on the parsed tool name), handing an
+    /// unauthenticated flood the expensive pre-auth work — bounded by
+    /// the MCP admission cap, but blocking-pool cycles anonymous
+    /// garbage shouldn't get. A present-but-garbage bearer still costs
+    /// one signature verification before the parse (the full
+    /// scope-aware `resolve_identity` still runs afterwards) — the same
+    /// cost order as the chat path.
+    pub(crate) fn refuse_unauthenticated_tool_call(&self, headers: &HeaderMap) -> Result<(), PipelineError> {
+        if !self.config.require_identity {
+            return Ok(());
+        }
+        if single_header(headers, "authorization")?.is_none() {
+            // Mirrors resolve_identity's (None, _) require_identity arm,
+            // including the identity-rejection audit event.
+            let session_id = session_id(headers)?;
+            let error = PipelineError::Unauthorized("missing bearer token".to_owned());
+            self.enqueue_transient_failure(&session_id, StopReason::IdentityRejected, error.to_string())?;
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// Core of [`Self::intercept_tool`] that also returns the bound session.
     ///
     /// Callers that must await audit durability need the same session the
@@ -2721,6 +2749,7 @@ impl AppState {
     ) -> Result<(ToolVerdict, Arc<Session>), PipelineError> {
         let session_id = session_id(headers)?;
         let workflow = workflow(headers, &self.config.default_workflow)?;
+        self.refuse_unauthenticated_tool_call(headers)?;
         let parsed_call = av_sandbox::parse_tool_call(raw).ok();
         let required_scope = parsed_call
             .as_ref()
@@ -2755,6 +2784,28 @@ impl AppState {
             ));
         }
         session.touch();
+        // The semantic-loop breaker gates CHAT admission (both the
+        // prepare arm above and the streaming re-check), but tool
+        // execution ignored it entirely: a runaway agent whose chat is
+        // already refused/aborted could keep firing otherwise-permitted
+        // MCP tool calls on the same session until idle close — the
+        // "stop the runaway agent" decision only stopped half the
+        // agent. Gate the hard-stop actions here. `Inject` deliberately
+        // passes: its remedy is a corrective CHAT message (the next
+        // chat turn injects and resets the breaker); blocking tools
+        // under Inject would strand tool-driven agents the operator
+        // chose to steer rather than stop.
+        if session.loop_state.state() == BreakerState::Open {
+            match session.loop_state.action() {
+                BreakerAction::Reject | BreakerAction::Abort => {
+                    session.latch_enforcement(StopReason::LoopDetected);
+                    return Err(PipelineError::blocked(
+                        "semantic loop circuit breaker is open".to_owned(),
+                    ));
+                }
+                _ => {}
+            }
+        }
         let worker_permit = self
             .worker
             .try_reserve(&session_id)
@@ -4448,6 +4499,80 @@ mod tests {
         signed.insert(SESSION_HEADER, HeaderValue::from_static("signed-write"));
         signed.insert(WORKFLOW_HEADER, HeaderValue::from_static("signed"));
         assert!(state.intercept_tool(&signed, &raw).unwrap().is_allowed());
+    }
+
+    /// The semantic-loop breaker's hard-stop actions (Reject/Abort) must
+    /// gate TOOL admission exactly like they gate chat: pre-fix, a
+    /// breaker-open session — whose chat requests were already refused —
+    /// kept executing otherwise-permitted MCP tool calls on the same
+    /// session until idle close, so the "stop the runaway agent"
+    /// decision only stopped half the agent.
+    #[tokio::test]
+    async fn open_breaker_hard_stop_refuses_tool_calls() {
+        let config = HarnessConfig::for_tests("http://127.0.0.1:9", "/tmp", "/tmp");
+        let state = state(config);
+        let identity = av_events::AgentIdentity {
+            version: "dev".into(),
+            charter: "anonymous".into(),
+            instance_uid: "anonymous".into(),
+            ttl_remaining_s: None,
+        };
+        let session = state.sessions.get_or_open(
+            "breaker-tools",
+            crate::session::Workflow::Unsigned,
+            &identity,
+            &state.config.breaker,
+        );
+        // Trip the breaker directly: identical embeddings above the
+        // min-token floor are zero-novelty steps; the default window
+        // trips after three.
+        for _ in 0..4 {
+            session.loop_state.observe_embedding(vec![1.0, 2.0, 3.0], 2_000);
+        }
+        assert_eq!(
+            session.loop_state.state(),
+            BreakerState::Open,
+            "precondition: breaker must be open",
+        );
+
+        let raw = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "db_read", "arguments": {}}
+        }))
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(SESSION_HEADER, HeaderValue::from_static("breaker-tools"));
+        let refusal = state.intercept_tool(&headers, &raw);
+        assert!(
+            matches!(&refusal, Err(PipelineError::Blocked { context, .. }) if context.contains("circuit breaker")),
+            "an open hard-stop breaker must refuse tool execution, got {refusal:?}",
+        );
+        assert!(
+            session.enforcement_tripped(),
+            "the tool-path refusal latches enforcement like the chat path",
+        );
+    }
+
+    /// Required-identity tool calls with NO Authorization header are
+    /// refused by the cheap pre-parse gate — an unauthenticated flood
+    /// must not reach the MCP parse/canonicalize/hash work, and the
+    /// refusal shape matches resolve_identity's missing-bearer arm.
+    #[tokio::test]
+    async fn required_identity_tool_call_without_bearer_is_refused_before_parse() {
+        let mut config = HarnessConfig::for_tests("http://127.0.0.1:9", "/tmp", "/tmp");
+        config.require_identity = true;
+        let state = state(config);
+        let mut headers = HeaderMap::new();
+        headers.insert(SESSION_HEADER, HeaderValue::from_static("anon-tools"));
+        // Deliberately unparseable body: the gate fires on the header
+        // alone, so the parse must never get a say in the verdict.
+        let refusal = state.intercept_tool(&headers, b"{this is not json");
+        assert!(
+            matches!(&refusal, Err(PipelineError::Unauthorized(reason)) if reason.contains("missing bearer token")),
+            "missing bearer under require_identity must refuse pre-parse, got {refusal:?}",
+        );
     }
 
     /// `intercept_tool_durable` used to re-derive the session id from headers

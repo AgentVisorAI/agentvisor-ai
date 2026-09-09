@@ -132,13 +132,28 @@ if (looksLikeRawReceipt(bundle)) {
     console.error(`duplicate JSON key "${dup}" — the Rust verifier refuses this file; refusing here too`);
     process.exit(1);
   }
+  const unsafeInt = firstUnsafeInteger(rawText);
+  if (unsafeInt !== null) {
+    console.error(`integer ${unsafeInt} exceeds 2^53 (JCS-safe bound) — JSON.parse would silently round it; the Rust verifier refuses this file; refusing here too`);
+    process.exit(1);
+  }
   if (!isStrictStandardB64(bundle.public_key_b64)) {
     console.error("public_key_b64 is not strict standard base64 — the Rust verifier refuses this file; refusing here too");
     process.exit(1);
   }
-  const body = {};
+  const body = Object.create(null);
   for (const k of Object.keys(bundle)) {
     if (k === "signature_b64") continue;
+    // Null-prototype target: on a plain `{}`, assigning the key
+    // "__proto__" invokes the prototype setter instead of creating an
+    // own property — the member silently VANISHES from the
+    // canonicalization (so the original signature still verifies over
+    // a body that visibly carries an extra field) and the assigned
+    // object pollutes the reconstruction's prototype. Rust refuses
+    // unknown top-level fields outright; with a null prototype the
+    // member survives into the canonical bytes and the signature
+    // check refuses it here too. Keep in sync with
+    // docs/verify/verify.js rawReceiptToBundle.
     body[k] = bundle[k];
   }
   bundle = {
@@ -205,8 +220,16 @@ function receiptSigningMessage(rawBody) {
     lenBuf.writeBigUInt64BE(BigInt(canonical.length), 0);
     return Buffer.concat([RECEIPT_DOMAIN_TAG_V2, lenBuf, canonical]);
   }
-  // Unknown version — return empty to fail-closed.
-  return Buffer.alloc(0);
+  // Unknown version: hard refusal BEFORE any cryptographic check. The
+  // previous "return empty buffer" sentinel was not fail-closed — the
+  // empty message is perfectly valid Ed25519 signing input, so any
+  // key that ever signed zero bytes in another context would make
+  // every version-3+ body "verify". Rust refuses unsupported versions
+  // outright (receipt.rs signing_message); mirror it.
+  console.error(
+    `receipt_version ${receiptVersion} has no defined signature framing (supported: 1, 2) — the Rust verifier refuses this file; refusing here too`,
+  );
+  process.exit(1);
 }
 // Rust-parity strictness (round-12 differential: one file must never
 // verify green here while `avctl receipt-verify` / the daemon refuse
@@ -226,6 +249,49 @@ function isStrictStandardB64(s) {
   // exactly the canonical encodings. Keep in sync with
   // docs/verify/verify.js.
   return Buffer.from(s, "base64").toString("base64") === s;
+}
+// Rust-parity precision gate: receipt integers are u64s capped at
+// JCS_SAFE_MAX = 2^53 (av-core error.rs; jcs.rs refuses anything
+// above). JSON.parse rounds bigger integer tokens to the nearest
+// double BEFORE this script re-canonicalizes the raw-receipt body, so
+// a tampered `…992` → `…993` silently rounds BACK to the signed value
+// and verified green here while `avctl receipt-verify` refuses the
+// file — the same one-file-two-verdicts equivocation the duplicate-key
+// and base64 gates close. Scan the raw text: any integer token above
+// 2^53 in magnitude is a refusal. Keep in sync with
+// docs/verify/verify.js.
+function firstUnsafeInteger(text) {
+  const LIMIT = 9007199254740992n; // 2^53 == Rust JCS_SAFE_MAX
+  let i = 0;
+  const n = text.length;
+  while (i < n) {
+    const c = text[i];
+    if (c === '"') {
+      i++;
+      while (i < n) {
+        if (text[i] === "\\") { i += 2; continue; }
+        if (text[i] === '"') { i++; break; }
+        i++;
+      }
+      continue;
+    }
+    if (c === "-" || (c >= "0" && c <= "9")) {
+      let j = i;
+      if (text[j] === "-") j++;
+      let digits = "";
+      while (j < n && text[j] >= "0" && text[j] <= "9") { digits += text[j]; j++; }
+      const isFloat = text[j] === "." || text[j] === "e" || text[j] === "E";
+      if (!isFloat && digits.length > 0 && BigInt(digits) > LIMIT) {
+        return (text[i] === "-" ? "-" : "") + digits;
+      }
+      // Skip any float tail so its digits aren't re-scanned.
+      while (j < n && /[0-9eE+.-]/.test(text[j])) j++;
+      i = j;
+      continue;
+    }
+    i++;
+  }
+  return null;
 }
 function firstDuplicateKey(text) {
   // Minimal JSON walker: tracks object key sets per depth. Assumes
@@ -329,22 +395,54 @@ const ok = sigOk && keyIdOk && pubkeyOk;
 const demoKey = ok && DEMO_RECEIPT_KEYS.has(pubKeyHex.toLowerCase());
 const trustedKey = ok && !demoKey && TRUSTED_RECEIPT_KEYS.has(pubKeyHex.toLowerCase());
 
-// Metadata rows: console-export bundles carry a session envelope +
-// camelCase receipt fields; raw daemon receipt bodies use the Rust
-// wire shape (session_id, ai_agent.charter.name,
-// subject.event_count/step_count, receipt_id). Accept both — same
-// dual-shape display docs/verify/verify.js uses.
+// Metadata rows. R8-claim-audit parity with docs/verify/verify.js:
+// display facts from the SIGNED body first — the bundle envelope's
+// `session` / `eventCount` / `receiptId` duplicates are convenience
+// copies an attacker can edit freely WITHOUT breaking the signature,
+// so printing them above the "authentic" verdict let a tampered
+// bundle show forged session ids, agents, and counts. Envelope values
+// are last-resort fallbacks only, and any drift between an envelope
+// copy and its signed counterpart is called out explicitly.
+// Console-export bodies use camelCase (sessionExternalId/agent/
+// eventCount/receiptId); raw daemon receipt bodies use the Rust wire
+// shape (session_id, ai_agent.charter.name, subject.event_count/
+// step_count, receipt_id). Accept both.
 let signedBody = {};
 try { signedBody = JSON.parse(r.rawBody || "{}"); } catch { signedBody = {}; }
 const rawSubject = signedBody.subject || {};
-console.log("Session:       ", bundle.session?.externalId || bundle.session?.id || signedBody.session_id || "—");
-console.log("Agent:         ", bundle.session?.agent || signedBody.ai_agent?.charter?.name || "—");
-console.log("Events sealed: ", r.eventCount ?? rawSubject.event_count ?? rawSubject.step_count ?? "—");
-console.log("Receipt ID:    ", r.receiptId || signedBody.receipt_id || "—");
+const envSession = bundle.session || {};
+// Values that only exist in the unsigned envelope are labeled as such
+// inline — an auditor must never mistake attacker-editable convenience
+// copies for signed facts.
+const unsignedTag = (v) => `${v} (unsigned envelope value — NOT covered by the signature)`;
+const sessionRow =
+  signedBody.sessionExternalId || signedBody.sessionId || signedBody.session_id ||
+  (envSession.externalId ? unsignedTag(envSession.externalId) : envSession.id ? unsignedTag(envSession.id) : "—");
+const agentRow =
+  signedBody.agent || signedBody.ai_agent?.charter?.name ||
+  (envSession.agent ? unsignedTag(envSession.agent) : "—");
+const eventsRow =
+  signedBody.eventCount ?? rawSubject.event_count ?? rawSubject.step_count ??
+  (r.eventCount != null ? unsignedTag(r.eventCount) : "—");
+const receiptIdRow =
+  signedBody.receiptId || signedBody.receipt_id ||
+  (r.receiptId ? unsignedTag(r.receiptId) : "—");
+console.log("Session:       ", sessionRow);
+console.log("Agent:         ", agentRow);
+console.log("Events sealed: ", eventsRow);
+console.log("Receipt ID:    ", receiptIdRow);
 console.log("Public key:    ", pubKeyHex);
 console.log("Trusted key:   ", trustedKey ? "yes" : "NO (not on the trust anchor list)");
 console.log("Message bytes: ", msg.length);
 console.log("Signature:     ", sig.length + " bytes (Ed25519)");
+const drift = [];
+if (envSession.externalId && signedBody.sessionExternalId && envSession.externalId !== signedBody.sessionExternalId) drift.push("session id");
+if (envSession.agent && signedBody.agent && envSession.agent !== signedBody.agent) drift.push("agent");
+if (r.eventCount != null && signedBody.eventCount != null && r.eventCount !== signedBody.eventCount) drift.push("event count");
+if (r.receiptId && signedBody.receiptId && r.receiptId !== signedBody.receiptId) drift.push("receipt id");
+if (drift.length > 0) {
+  console.log(`⚠️  Unsigned envelope copies differ from the signed body: ${drift.join(", ")} — trust the signed values above.`);
+}
 console.log("");
 
 if (!ok) {
