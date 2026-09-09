@@ -2031,6 +2031,51 @@ mod tests {
         );
     }
 
+    /// Round-27: the freeform-cap magnitudes (notes 8 KiB,
+    /// reasoning_content 256 KiB) had surviving `*` mutants in their
+    /// const expressions — pin the exact byte boundaries.
+    #[test]
+    fn freeform_caps_bite_at_exact_byte_boundaries() {
+        let doc = |extras: serde_json::Value| {
+            let mut step = serde_json::json!({"step_id": 1, "source": "agent", "message": "hi"});
+            if let (Some(o), Some(e)) = (step.as_object_mut(), extras.as_object()) {
+                for (k, v) in e {
+                    o.insert(k.clone(), v.clone());
+                }
+            }
+            serde_json::json!({
+                "schema_version": "ATIF-v1.7",
+                "session_id": "s",
+                "agent": {"name": "a", "version": "1"},
+                "steps": [step],
+            })
+        };
+        let has_issue = |v: &Value, needle: &str| {
+            validate_value(v, Mode::Strict)
+                .iter()
+                .any(|i| i.path.contains(needle))
+        };
+        let rc = |n: usize| serde_json::json!({"reasoning_content": "r".repeat(n)});
+        assert!(
+            !has_issue(&doc(rc(MAX_REASONING_LEN)), "reasoning_content"),
+            "exactly 256 KiB must pass"
+        );
+        assert!(
+            has_issue(&doc(rc(MAX_REASONING_LEN + 1)), "reasoning_content"),
+            "256 KiB + 1 must be refused"
+        );
+        // notes is trajectory-root.
+        let mut root = doc(serde_json::json!({}));
+        root.as_object_mut()
+            .unwrap()
+            .insert("notes".into(), Value::from("n".repeat(MAX_NOTES_LEN)));
+        assert!(!has_issue(&root, "notes"), "exactly 8 KiB notes must pass");
+        root.as_object_mut()
+            .unwrap()
+            .insert("notes".into(), Value::from("n".repeat(MAX_NOTES_LEN + 1)));
+        assert!(has_issue(&root, "notes"), "8 KiB + 1 notes must be refused");
+    }
+
     #[test]
     fn version_parse() {
         assert_eq!(parse_version("ATIF-v1.7"), Some((1, 7)));
