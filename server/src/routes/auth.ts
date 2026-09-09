@@ -912,22 +912,54 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     if (taken) {
       return reply.code(409).send({ error: "email_in_use" });
     }
-    await db.user.update({
-      where: { id: user.id },
-      data: {
-        email: newEmail,
-        pendingEmail: null,
-        pendingEmailTokenHash: null,
-        pendingEmailAt: null,
-        // The confirm token was mailed to the NEW address — mailbox
-        // control of the (now current) email is proven.
-        emailVerifiedAt: new Date(),
-        // Fence every session: the login identifier just rotated and
-        // the confirm may have happened on an untrusted device. The
-        // user signs back in with the new address.
-        sessionRevokedAt: new Date(),
-      },
-    });
+    // Conditional consume, same rationale as /reset-confirm: the read
+    // ran an argon2 verify ago, and an unconditional write would let a
+    // raced cancellation / password reset (both clear the pending
+    // fields) still rotate the login address afterwards.
+    let rotated = 0;
+    try {
+      const updated = await db.user.updateMany({
+        where: {
+          id: user.id,
+          pendingEmailTokenHash: user.pendingEmailTokenHash,
+          pendingEmailAt: user.pendingEmailAt,
+        },
+        data: {
+          email: newEmail,
+          pendingEmail: null,
+          pendingEmailTokenHash: null,
+          pendingEmailAt: null,
+          // The confirm token was mailed to the NEW address — mailbox
+          // control of the (now current) email is proven.
+          emailVerifiedAt: new Date(),
+          // Fence every session: the login identifier just rotated and
+          // the confirm may have happened on an untrusted device. The
+          // user signs back in with the new address.
+          sessionRevokedAt: new Date(),
+          // Void any OUTSTANDING password reset: its link was mailed to
+          // the OLD address. The email change exists precisely for the
+          // "my old mailbox is compromised" recovery, and reset-confirm
+          // looks the account up by its CURRENT email — so a captured
+          // old-mailbox reset link otherwise kept working for its full
+          // 24 h TTL after the user moved away from that mailbox,
+          // handing the attacker the password back.
+          resetTokenHash: null,
+          resetTokenAt: null,
+        },
+      });
+      rotated = updated.count;
+    } catch (err) {
+      // The unique index on email is the authoritative taken-check; a
+      // signup racing between the read above and this write surfaces
+      // as P2002 — same 409 as the pre-check, never a 500.
+      if (typeof err === "object" && err !== null && (err as { code?: string }).code === "P2002") {
+        return reply.code(409).send({ error: "email_in_use" });
+      }
+      throw err;
+    }
+    if (rotated === 0) {
+      return reply.code(401).send({ error: "invalid_token" });
+    }
     const firstMembership = await db.membership.findFirst({
       where: { userId: user.id },
       orderBy: { createdAt: "asc" },
@@ -1845,9 +1877,23 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     // Auto-revoke the user's active-created API keys inside the
     // same transaction so a crash between the two writes can't
     // leave the passwordHash rotated but the tokens still live.
-    await db.$transaction([
-      db.user.update({
-        where: { id: user.id },
+    //
+    // The consume is CONDITIONAL on the exact verified token state:
+    // the read above ran ~200 ms of argon2 ago (token verify + new-
+    // password hash), and an unconditional `where: { id }` write let
+    // (a) two concurrent confirms of the SAME token both commit and
+    // (b) a confirm racing a password change / second reset-request —
+    // which clears or rotates resetTokenHash — still overwrite the
+    // fresh credential with the attacker-supplied one. Zero matched
+    // rows = the verified token is no longer the live one = the same
+    // uniform 401 as a bad token.
+    const consumed = await db.$transaction(async (tx) => {
+      const updated = await tx.user.updateMany({
+        where: {
+          id: user.id,
+          resetTokenHash: user.resetTokenHash,
+          resetTokenAt: user.resetTokenAt,
+        },
         data: {
           passwordHash,
           resetTokenHash: null,
@@ -1868,12 +1914,17 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
           // signed up by password before verification existed).
           emailVerifiedAt: new Date(),
         },
-      }),
-      db.apiKey.updateMany({
+      });
+      if (updated.count === 0) return false;
+      await tx.apiKey.updateMany({
         where: { createdById: user.id, revokedAt: null },
         data: { revokedAt: new Date() },
-      }),
-    ]);
+      });
+      return true;
+    });
+    if (!consumed) {
+      return reply.code(401).send({ error: "invalid_token" });
+    }
     // R135 F1: password reset is the strongest break-glass primitive
     // in the auth pipeline (R123 F3 auto-revokes every av_srv_
     // token org-wide + R90 F1 fences all cookies). Prior shape

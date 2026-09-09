@@ -85,14 +85,24 @@ impl WasmPolicy {
         let mut has_memory = false;
         let mut alloc_ok = false;
         let mut evaluate_ok = false;
+        // Check TYPES, not just arity: the runtime calls
+        // `get_typed_func::<(i32, i32), i32>` (and `<i32, i32>` for
+        // alloc), so a module exporting the right arity with i64/f32
+        // params passed this load-time gate and then failed EVERY
+        // evaluation — the startup-success/runtime-denial split this
+        // validation exists to prevent.
+        let all_i32 = |f: &wasmtime::FuncType| {
+            f.params().all(|p| matches!(p, wasmtime::ValType::I32))
+                && f.results().all(|r| matches!(r, wasmtime::ValType::I32))
+        };
         for export in module.exports() {
             match (export.name(), export.ty()) {
                 ("memory", wasmtime::ExternType::Memory(_)) => has_memory = true,
                 ("alloc", wasmtime::ExternType::Func(f)) => {
-                    alloc_ok = f.params().len() == 1 && f.results().len() == 1;
+                    alloc_ok = f.params().len() == 1 && f.results().len() == 1 && all_i32(&f);
                 }
                 ("evaluate", wasmtime::ExternType::Func(f)) => {
-                    evaluate_ok = f.params().len() == 2 && f.results().len() == 1;
+                    evaluate_ok = f.params().len() == 2 && f.results().len() == 1 && all_i32(&f);
                 }
                 _ => {}
             }
@@ -390,6 +400,29 @@ mod tests {
         let err = WasmPolicy::from_bytes("evaluate-arity", evaluate_wrong_arity.as_bytes())
             .err()
             .expect("load must fail on a 1-param evaluate");
+        assert!(err.contains("evaluate"), "error should name evaluate: {err}");
+
+        // Right ARITY, wrong TYPES: `get_typed_func::<(i32, i32), i32>`
+        // refuses i64 params at instantiation, so an arity-only load
+        // gate accepted a module that then failed every evaluation —
+        // the same startup-success/runtime-denial split, one lint
+        // deeper. Pin the type halves too.
+        let alloc_wrong_types = r#"(module
+            (memory (export "memory") 1)
+            (func (export "alloc") (param i64) (result i64) (i64.const 2048))
+            (func (export "evaluate") (param i32 i32) (result i32) (i32.const 0)))"#;
+        let err = WasmPolicy::from_bytes("alloc-types", alloc_wrong_types.as_bytes())
+            .err()
+            .expect("load must fail on an i64 alloc signature");
+        assert!(err.contains("alloc"), "error should name alloc: {err}");
+
+        let evaluate_wrong_types = r#"(module
+            (memory (export "memory") 1)
+            (func (export "alloc") (param i32) (result i32) (i32.const 2048))
+            (func (export "evaluate") (param i64 i32) (result i32) (i32.const 0)))"#;
+        let err = WasmPolicy::from_bytes("evaluate-types", evaluate_wrong_types.as_bytes())
+            .err()
+            .expect("load must fail on an i64 evaluate param");
         assert!(err.contains("evaluate"), "error should name evaluate: {err}");
 
         // No exported memory.

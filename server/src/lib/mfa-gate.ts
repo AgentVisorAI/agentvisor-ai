@@ -35,12 +35,14 @@ export const MFA_GATE_COOKIE = "av_mfa_gate";
 /** Matches the ceremony-challenge TTL: 5 minutes to touch the key. */
 export const MFA_GATE_TTL_S = 300;
 
-function gateMac(userId: string, iat: number): Buffer {
+function gateMac(userId: string, iat: number, nonce: Buffer): Buffer {
   const h = createHmac("sha256", env.JWT_SECRET);
   h.update("webauthn:mfa-gate:");
   h.update(userId);
   h.update(":");
   h.update(String(iat));
+  h.update(":");
+  h.update(nonce);
   return h.digest();
 }
 
@@ -52,8 +54,20 @@ function gateMac(userId: string, iat: number): Buffer {
  */
 export function setMfaGateCookie(reply: FastifyReply, verifiedUserId: string | null): void {
   const iat = Math.floor(Date.now() / 1000);
-  const mac = verifiedUserId === null ? randomBytes(32) : gateMac(verifiedUserId, iat);
-  reply.setCookie(MFA_GATE_COOKIE, JSON.stringify({ mac: mac.toString("base64url"), iat }), {
+  // Fresh per-cookie nonce, MAC'd for real gates. Without it the real
+  // MAC was gateMac(userId, iat) — DETERMINISTIC within a second — so
+  // two same-second logins with the same candidate password produced
+  // identical cookie MACs iff the password was correct (decoys are
+  // independently random): a password-validity oracle readable from
+  // the attacker's own cookies, defeating the very masking this decoy
+  // scheme implements. With the nonce in the MAC input, real and decoy
+  // cookies are both unique per issuance.
+  const nonce = randomBytes(16);
+  const mac = verifiedUserId === null ? randomBytes(32) : gateMac(verifiedUserId, iat, nonce);
+  reply.setCookie(
+    MFA_GATE_COOKIE,
+    JSON.stringify({ mac: mac.toString("base64url"), iat, n: nonce.toString("base64url") }),
+    {
     ...SESSION_COOKIE_OPTS,
     signed: true,
     maxAge: MFA_GATE_TTL_S,
@@ -69,22 +83,26 @@ export function mfaGateAuthorizes(req: FastifyRequest, userId: string): boolean 
   if (!raw) return false;
   const unsigned = req.unsignCookie(raw);
   if (!unsigned.valid || unsigned.value === null) return false;
-  let bag: { mac?: unknown; iat?: unknown };
+  let bag: { mac?: unknown; iat?: unknown; n?: unknown };
   try {
-    bag = JSON.parse(unsigned.value) as { mac?: unknown; iat?: unknown };
+    bag = JSON.parse(unsigned.value) as { mac?: unknown; iat?: unknown; n?: unknown };
   } catch {
     return false;
   }
-  if (typeof bag.mac !== "string" || typeof bag.iat !== "number") return false;
+  if (typeof bag.mac !== "string" || typeof bag.iat !== "number" || typeof bag.n !== "string") {
+    return false;
+  }
   const age = Math.floor(Date.now() / 1000) - bag.iat;
   if (age < 0 || age > MFA_GATE_TTL_S) return false;
   let presented: Buffer;
+  let nonce: Buffer;
   try {
     presented = Buffer.from(bag.mac, "base64url");
+    nonce = Buffer.from(bag.n, "base64url");
   } catch {
     return false;
   }
-  const expected = gateMac(userId, bag.iat);
+  const expected = gateMac(userId, bag.iat, nonce);
   return presented.length === expected.length && timingSafeEqual(presented, expected);
 }
 

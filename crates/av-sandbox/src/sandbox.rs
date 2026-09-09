@@ -376,8 +376,16 @@ fn extract_payout_micros(arguments: &Value, field: &str) -> Result<u64, String> 
     if usd > 1.0e12 {
         return Err(format!("{field} of {usd} exceeds sanity bounds"));
     }
+    // Ceil, not round: a positive sub-micro amount (e.g. 0.0000004 USD)
+    // rounded to ZERO micros, and a zero spend skips payout enforcement
+    // entirely (`ActionBudget` only gates payout > 0) — including the
+    // fail-closed "payout with NO cap configured is refused" rule. A
+    // hostile tool argument could drip unaccounted positive payouts
+    // forever. Any positive amount now costs at least one micro-USD,
+    // so the cap (or its absence) always gets a say; exact zero stays
+    // zero.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    Ok((usd * av_core::units::USD_MICROS_PER_DOLLAR as f64).round() as u64)
+    Ok((usd * av_core::units::USD_MICROS_PER_DOLLAR as f64).ceil() as u64)
 }
 
 #[cfg(test)]
@@ -766,5 +774,16 @@ mod payout_boundary_tests {
         );
         let negative = extract(json!(-0.25));
         assert!(matches!(negative, Err(ref m) if m.contains("non-negative")));
+        // Sub-micro positive amounts must CEIL to one micro, never round
+        // to zero: a zero result skips payout enforcement entirely —
+        // including the fail-closed no-cap refusal — so a hostile tool
+        // argument of 0.0000004 USD per call could drip unaccounted
+        // positive payouts forever.
+        assert_eq!(
+            extract(json!(0.0000004)).unwrap(),
+            1,
+            "positive sub-micro payouts must cost at least one micro-USD"
+        );
+        assert_eq!(extract(json!(0.0000019)).unwrap(), 2, "ceil, not round");
     }
 }

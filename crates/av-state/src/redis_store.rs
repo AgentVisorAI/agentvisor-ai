@@ -19,6 +19,10 @@ use redis::Commands;
 /// window (or persist budgets elsewhere) — see the `StateStore` trait
 /// docs on counter lifetime.
 const BUDGET_COUNTER_TTL_SECS: u64 = 86_400;
+/// One-shot refund replay markers (see `REFUND_LUA`) only need to
+/// outlive the cluster driver's transparent retry window (seconds);
+/// 5 minutes is generous without accumulating a day of marker keys.
+const REFUND_MARKER_TTL_SECS: u64 = 300;
 
 /// Atomic check-and-spend using subtraction so `current + amount` never rounds.
 static TRY_SPEND_LUA: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
@@ -113,9 +117,24 @@ return result
 /// non-underflow path matches the same discipline. Extracted to a
 /// static (R69) so `every_counter_script_applies_the_shared_ttl`
 /// enrolls it in the TTL-drift regression test (R67 review L3).
+///
+/// KEYS[2] is a one-shot idempotency marker (same hash tag as the
+/// counter — a suffix on KEYS[1] — so cluster mode keeps the script
+/// single-slot). The cluster driver transparently RETRIES commands on
+/// connection loss (redis-rs `DEFAULT_RETRIES`), and a refund replayed
+/// after its first execution committed-but-lost-the-reply would credit
+/// the budget twice — refunding tokens that were only debited once,
+/// i.e. spendable budget minted out of a network flap. `SET NX` on the
+/// marker makes the replay a no-op. Spend-side scripts deliberately
+/// have no marker: their replay double-DEBITS, which fails
+/// conservative (the documented EVAL-uncertainty posture), never
+/// budget-inflating.
 static REFUND_LUA: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     format!(
         r"
+if redis.call('SET', KEYS[2], '1', 'NX', 'EX', {REFUND_MARKER_TTL_SECS}) == false then
+    return -1
+end
 if redis.call('EXISTS', KEYS[1]) == 0 then
     return 0
 end
@@ -134,13 +153,25 @@ return new
 /// exactly (EXISTS gate + DECRBY + clamp-at-zero via SET with
 /// fresh TTL / EXPIRE refresh on non-underflow). Extracted to a
 /// static (R69) so the same TTL-drift test enrolls it.
+///
+/// The trailing key (`KEYS[#KEYS]`) is the replay marker — see
+/// `REFUND_LUA`. The decrement passes `ARGV[i]` to DECRBY as the raw
+/// integer STRING: the previous `tonumber(ARGV[i])` converted through
+/// a Lua double, so an `i64::MAX`-clamped amount rounded to 2^63,
+/// DECRBY rejected it mid-loop, and earlier keys in the same batch
+/// stayed decremented while later ones were skipped — a partial
+/// commit the in-memory backend (which clamps every entry) never
+/// produces. Redis parses the string as an exact i64.
 static REFUND_MANY_LUA: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     format!(
         r"
-for i, key in ipairs(KEYS) do
+if redis.call('SET', KEYS[#KEYS], '1', 'NX', 'EX', {REFUND_MARKER_TTL_SECS}) == false then
+    return -1
+end
+for i = 1, #KEYS - 1 do
+    local key = KEYS[i]
     if redis.call('EXISTS', key) == 1 then
-        local amount = tonumber(ARGV[i])
-        local new = redis.call('DECRBY', key, amount)
+        local new = redis.call('DECRBY', key, ARGV[i])
         if new < 0 then
             redis.call('SET', key, 0, 'EX', {BUDGET_COUNTER_TTL_SECS})
         else
@@ -453,6 +484,10 @@ impl StateStore for RedisStore {
         // Redis DECRBY takes i64. Cap at i64::MAX so a caller passing
         // u64::MAX cannot silently wrap into a negative value.
         let amount = i64::try_from(amount).unwrap_or(i64::MAX);
+        // Fresh replay marker per logical refund: the same-slot suffix
+        // keeps cluster mode single-slot; a driver-level retry reuses
+        // the SAME marker and no-ops (see REFUND_LUA).
+        let marker = format!("{key}:r:{}", av_core::new_event_uid());
         // Refund is best-effort by the trait contract, but
         // its silent-swallow used to be COMPLETELY invisible — no log,
         // no metric — so an operator seeing budget depletion during a
@@ -465,6 +500,7 @@ impl StateStore for RedisStore {
             RedisBackend::Single(pool) => match pool.get() {
                 Ok(mut connection) => redis::Script::new(&REFUND_LUA)
                     .key(key)
+                    .key(&marker)
                     .arg(amount)
                     .invoke(&mut *connection),
                 Err(error) => Err(redis::RedisError::from((
@@ -476,6 +512,7 @@ impl StateStore for RedisStore {
             RedisBackend::Cluster(pool) => match pool.get() {
                 Ok(mut connection) => redis::Script::new(&REFUND_LUA)
                     .key(key)
+                    .key(&marker)
                     .arg(amount)
                     .invoke(&mut *connection),
                 Err(error) => Err(redis::RedisError::from((
@@ -509,9 +546,14 @@ impl StateStore for RedisStore {
     /// Best-effort like `refund` — Redis errors log-warn but never
     /// propagate.
     fn refund_many(&self, refunds: &[crate::Refund]) {
-        if refunds.is_empty() {
+        let Some(first) = refunds.first() else {
             return;
-        }
+        };
+        // Replay marker key (see REFUND_LUA): derived from the first
+        // refund key so it shares the batch's hash tag (all keys carry
+        // the same `{...}` tag per the invariant above) — single-slot
+        // in cluster mode.
+        let marker = format!("{}:r:{}", first.key, av_core::new_event_uid());
         let outcome: Result<i64, redis::RedisError> = match &self.backend {
             RedisBackend::Single(pool) => match pool.get() {
                 Ok(mut connection) => {
@@ -523,6 +565,7 @@ impl StateStore for RedisStore {
                         // cannot silently wrap into a negative value.
                         invocation.arg(i64::try_from(r.amount).unwrap_or(i64::MAX));
                     }
+                    invocation.key(&marker);
                     invocation.invoke(&mut *connection)
                 }
                 Err(error) => Err(redis::RedisError::from((
@@ -539,6 +582,7 @@ impl StateStore for RedisStore {
                         invocation.key(&r.key);
                         invocation.arg(i64::try_from(r.amount).unwrap_or(i64::MAX));
                     }
+                    invocation.key(&marker);
                     invocation.invoke(&mut *connection)
                 }
                 Err(error) => Err(redis::RedisError::from((
@@ -849,5 +893,30 @@ mod tests {
                 "{name} has an unexpanded BUDGET_COUNTER_TTL_SECS placeholder"
             );
         }
+        // Refund replay/precision pins (pass-7 findings):
+        // 1. Both refund scripts open with the SET-NX replay marker —
+        //    the cluster driver transparently retries scripts on
+        //    connection loss, and an unmarked refund replay CREDITS the
+        //    budget twice (spendable budget minted from a network flap).
+        // 2. REFUND_MANY passes ARGV[i] to DECRBY as the raw integer
+        //    string — `tonumber` converted through a Lua double, so an
+        //    i64::MAX amount rounded to 2^63, DECRBY rejected mid-loop,
+        //    and the batch PARTIALLY committed (in-memory clamps every
+        //    entry; the backends must agree).
+        for (name, script) in [
+            ("REFUND_LUA", REFUND_LUA.as_str()),
+            ("REFUND_MANY_LUA", REFUND_MANY_LUA.as_str()),
+        ] {
+            assert!(
+                script.contains("'NX', 'EX'"),
+                "{name} must guard against driver-level replay with a SET-NX marker: {script}"
+            );
+        }
+        assert!(
+            !REFUND_MANY_LUA.contains("tonumber(ARGV"),
+            "REFUND_MANY_LUA must pass ARGV to DECRBY as an exact integer string, \
+             not through a Lua double: {}",
+            REFUND_MANY_LUA.as_str()
+        );
     }
 }
