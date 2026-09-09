@@ -4822,11 +4822,7 @@ pub fn spawn_reconciler(
                             metrics
                                 .counter(
                                     "av_idle_close_timeouts_total",
-                                    "Idle-close reached the per-session deadline and \
-                                     returned to the next tick — indicates a session with \
-                                     an active lease that never drops (stuck stream, hung \
-                                     worker) or a bridge publish stalled behind an \
-                                     unresponsive broker.",
+                                    crate::pipeline::IDLE_CLOSE_TIMEOUTS_HELP,
                                 )
                                 .inc();
                         }

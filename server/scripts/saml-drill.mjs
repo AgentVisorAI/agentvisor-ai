@@ -18,8 +18,30 @@ import { promises as fs } from "node:fs";
 
 const API = process.env.API_BASE || "http://127.0.0.1:4340";
 const SPA_ORIGIN = "http://127.0.0.1:8988";
+// Optional rerun hygiene: when set (battery/local reruns against a
+// persistent DB), sweep this drill's fixed-email rows at the end.
+// Without the sweep, `alice@saml-drill.example` from a previous run
+// belongs to that run's org, and the current run's ACS JIT-provision
+// correctly refuses the cross-org account collision — a false FAIL
+// on rerun. CI's fresh DB never hits this; sweeping keeps local
+// battery runs deterministic. Same pattern as oidc-drill's cleanup.
+const PG_CONTAINER = process.env.PG_CONTAINER;
+
+function sweepDrillRows() {
+  if (!PG_CONTAINER) return;
+  execSync(
+    `docker exec -e PGPASSWORD=av ${PG_CONTAINER} psql -U av -d avdb -c "` +
+      `DELETE FROM orgs WHERE id IN (SELECT m.\\"orgId\\" FROM memberships m ` +
+      `JOIN users u ON u.id = m.\\"userId\\" WHERE u.email LIKE '%@saml-drill.example'); ` +
+      `DELETE FROM users WHERE email LIKE '%@saml-drill.example';"`,
+    { stdio: "pipe" },
+  );
+}
 
 async function main() {
+  // Self-heal from any earlier run (including one that failed before
+  // its own end-of-run sweep could fire).
+  sweepDrillRows();
   // 1. Sign up the org owner so we can create a SAML config through the console API.
   const email = `owner-${Date.now()}@saml-drill.example`;
   const signup = await fetch(`${API}/api/v1/auth/signup`, {
@@ -225,6 +247,11 @@ async function main() {
   const replaySlugOk = /saml_assertion_(replay_detected|signature_or_conditions_failed)/.test(replayLocation);
   if (replay.status !== 302 || !replaySlugOk) {
     throw new Error(`replay guard did not fire: status=${replay.status} location=${replayLocation}`);
+  }
+
+  if (PG_CONTAINER) {
+    sweepDrillRows();
+    console.log("[cleanup] swept saml-drill users + orgs via psql");
   }
 
   console.log("\n✅  SAML full-flow drill: PASSED");

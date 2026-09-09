@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use av_bridge::{BridgeManifest, EmbeddedBroker, EventBus};
 use av_harness::config::{BridgeBackend, EmbedderBackend, StateBackend, VectorBackend};
+use av_harness::http_serve;
 use av_harness::reconciler::spawn_reconciler;
 use av_harness::{build_router, AppState, HarnessConfig};
 use av_identity::{IdentityValidator, KeyMaterial};
@@ -10,7 +11,6 @@ use av_loopdetect::{Embedder, HashEmbedder, NoopVectorSink, VectorSink};
 use av_receipts::{Ed25519Signer, Signer};
 use av_sandbox::{PolicyEngine, Sandbox, SandboxConfig, WasmPolicy};
 use av_state::{InMemoryStore, StateStore};
-use axum::serve::ListenerExt as _;
 use futures::future::FutureExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -337,51 +337,51 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
     );
     let listener = tokio::net::TcpListener::bind(&config.listen)
         .await
-        .with_context(|| format!("bind {}", config.listen))?
-        // Set TCP_NODELAY on every accepted socket. Nagle + delayed-
-        // ACK together produce ~40 ms of avoidable per-frame stall
-        // in the SSE relay: each streamed frame is 50-200 bytes
-        // (one token or a small delta), so the second small frame
-        // sits in the sender's kernel queue until the first is
-        // ACK'd. Compounded across a 500-token stream that's tens
-        // of seconds of inter-token latency the operator would
-        // otherwise trace to "OpenAI feels slower behind the
-        // proxy". The outbound-side reqwest client already sets
-        // `.tcp_keepalive(30 s)` on the upstream direction
-        // (`pipeline.rs`); this closes the reverse-facing hole.
-        //
-        // `tap_io` is axum 0.8's idiomatic hook for per-connection
-        // socket-option tuning without swapping listener types.
-        // Failure to set the option (embedded system without full
-        // socket-option support, half-open flood socket teardown
-        // between accept and setsockopt, ECONNRESET race) logs and
-        // falls through — a suboptimal-latency connection is still
-        // a working one.
-        //
-        // Wrap the warn in a `std::sync::Once`: a SYN-flood or
-        // Slowloris-class probe against an unauthenticated endpoint
-        // could otherwise fire this warn at accept-rate (~20 k/s on
-        // a moderately-sized Linux node), saturating the log
-        // pipeline and amplifying the very DoS the SSE latency
-        // regression is a distant second to. Every occurrence is
-        // still counted via `av_tcp_nodelay_failures_total` so
-        // operators keep visibility of persistent failures without
-        // the log storm. Same dampener discipline as R33's
-        // identity_rejection_window sliding cap.
-        .tap_io(move |tcp_stream| {
-            if let Err(error) = tcp_stream.set_nodelay(true) {
-                static WARNED: std::sync::Once = std::sync::Once::new();
-                WARNED.call_once(|| {
-                    tracing::warn!(
-                        %error,
-                        "failed to set TCP_NODELAY on incoming connection; SSE inter-token \
-                         latency may regress by ~40 ms per frame. Subsequent failures logged \
-                         only via av_tcp_nodelay_failures_total to avoid a per-accept log storm."
-                    );
-                });
-                tcp_nodelay_failures.inc();
-            }
-        });
+        .with_context(|| format!("bind {}", config.listen))?;
+    // Set TCP_NODELAY on every accepted socket. Nagle + delayed-
+    // ACK together produce ~40 ms of avoidable per-frame stall
+    // in the SSE relay: each streamed frame is 50-200 bytes
+    // (one token or a small delta), so the second small frame
+    // sits in the sender's kernel queue until the first is
+    // ACK'd. Compounded across a 500-token stream that's tens
+    // of seconds of inter-token latency the operator would
+    // otherwise trace to "OpenAI feels slower behind the
+    // proxy". The outbound-side reqwest client already sets
+    // `.tcp_keepalive(30 s)` on the upstream direction
+    // (`pipeline.rs`); this closes the reverse-facing hole.
+    //
+    // The hook runs in `http_serve`'s accept loop (the reaping
+    // replacement for `axum::serve`, whose `tap_io` this used
+    // to be). Failure to set the option (embedded system without
+    // full socket-option support, half-open flood socket teardown
+    // between accept and setsockopt, ECONNRESET race) logs and
+    // falls through — a suboptimal-latency connection is still
+    // a working one.
+    //
+    // Wrap the warn in a `std::sync::Once`: a SYN-flood or
+    // Slowloris-class probe against an unauthenticated endpoint
+    // could otherwise fire this warn at accept-rate (~20 k/s on
+    // a moderately-sized Linux node), saturating the log
+    // pipeline and amplifying the very DoS the SSE latency
+    // regression is a distant second to. Every occurrence is
+    // still counted via `av_tcp_nodelay_failures_total` so
+    // operators keep visibility of persistent failures without
+    // the log storm. Same dampener discipline as R33's
+    // identity_rejection_window sliding cap.
+    let on_accept = move |tcp_stream: &tokio::net::TcpStream| {
+        if let Err(error) = tcp_stream.set_nodelay(true) {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::warn!(
+                    %error,
+                    "failed to set TCP_NODELAY on incoming connection; SSE inter-token \
+                     latency may regress by ~40 ms per frame. Subsequent failures logged \
+                     only via av_tcp_nodelay_failures_total to avoid a per-accept log storm."
+                );
+            });
+            tcp_nodelay_failures.inc();
+        }
+    };
     if let Some(segment) = config.duplicated_chat_path_segment() {
         tracing::warn!(
             upstream_url = %av_core::url_redact::redact_userinfo(&config.upstream_url),
@@ -452,12 +452,25 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
     );
     let draining_flag = Arc::clone(&state.draining);
     let ready_drain_window = std::time::Duration::from_secs(config.shutdown_ready_drain_s);
-    let server = std::future::IntoFuture::into_future(
-        axum::serve(listener, build_router(state.clone())).with_graceful_shutdown(async move {
+    // Reap counter for stalled request bodies (slowloris body phase).
+    // Non-zero under normal operation means some client (or middlebox)
+    // is opening requests it never finishes — worth a look, not a page.
+    let stalled_reaps = metrics.counter(
+        "av_http_stalled_body_reaps_total",
+        "Request bodies aborted because the client sent no frame within the silence bound",
+    );
+    let server = Box::pin(http_serve::serve_with_client_silence_reaping(
+        listener,
+        build_router(state.clone()),
+        on_accept,
+        stalled_reaps,
+        http_serve::HEADER_READ_TIMEOUT,
+        http_serve::BODY_FRAME_GAP_TIMEOUT,
+        async move {
             shutdown_signal().await;
             // Flip the draining flag FIRST so `/readyz` reports 503 on
-            // every connection accepted from here on. NOTE: axum stops
-            // accepting the moment this future completes, so without
+            // every connection accepted from here on. NOTE: the accept
+            // loop stops the moment this future completes, so without
             // the pre-drain window below a fresh readiness probe sees
             // connection-refused (also a probe failure, but an LB that
             // distinguishes "degraded" from "gone" gets no 503, and
@@ -476,13 +489,15 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
                 tokio::time::sleep(ready_drain_window).await;
             }
             let _ = shutdown_started_tx.send(());
-        }),
-    );
-    // `Box::pin` (not `tokio::pin!`): the stack pin macro binds the
-    // future to `run()`'s scope, so it cannot be dropped before the
-    // later shutdown phases — the explicit `drop(server)` after the
-    // select is what actually closes the accepting TcpListener.
-    let mut server = Box::pin(server);
+        },
+    ));
+    // `Box::pin` above (not `tokio::pin!`): the stack pin macro binds
+    // the future to `run()`'s scope, so it could not be dropped before
+    // the later shutdown phases — the explicit `drop(server)` after the
+    // select is what actually closes the accepting TcpListener (the
+    // reaping serve loop moves the listener into the future, so dropping
+    // the future drops the listener with it, exactly as before).
+    let mut server = server;
     let result = tokio::select! {
         result = &mut server => result.context("serve AgentVisor AI"),
         _ = shutdown_started_rx => {
@@ -639,13 +654,7 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
         const PER_SESSION_CLOSE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
         let session_close_timeouts = shutdown_finalizer.metrics().counter(
             "av_shutdown_session_close_timeouts_total",
-            "Per-session close hit the shutdown-time per-session deadline (3 s) and \
-             was deferred to restart-time spool recovery. A sustained rate > 0 on \
-             every rollout indicates a class of sessions that regularly hang their \
-             close (leaked leases, dropped worker permits, unresponsive bridge \
-             publish) — the coincident session id in the shutdown warn log is the \
-             correlation key. Distinct from `av_http_shutdown_drain_timeouts_total` \
-             which fires on the OUTER phase timeout.",
+            av_harness::pipeline::SESSION_CLOSE_TIMEOUTS_HELP,
         );
         for session in open_sessions {
             let session_id = session.id.clone();
@@ -718,8 +727,7 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
             mcp_metrics
                 .counter(
                     "av_shutdown_mcp_drain_timeouts_total",
-                    "Shutdown MCP-inflight drain hit its 5 s deadline before every detached \
-                     mcp_call_inner spawn completed",
+                    av_harness::pipeline::MCP_DRAIN_TIMEOUTS_HELP,
                 )
                 .inc();
             tracing::warn!(

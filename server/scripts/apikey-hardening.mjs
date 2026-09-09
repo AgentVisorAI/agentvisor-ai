@@ -150,6 +150,17 @@ let carolState = {};
 // candidate).
 {
   const bobHint = bobKey.key.hint.slice("av_srv_".length, "av_srv_".length + 8);
+  // Idempotency: a previous run of this drill (same DB, e.g. local
+  // battery reruns) leaves the fixed-id collider row behind, and the
+  // INSERT below would then die on the primary key — a false FAIL
+  // unrelated to what the scenario proves. Delete-then-insert makes
+  // the scenario rerunnable; the trailing delete leaves no trace.
+  const colliderDelete =
+    "DELETE FROM api_keys WHERE id = 'colliderkey000000000000000000';";
+  execSync(
+    `docker exec -e PGPASSWORD=av ${PG_CONTAINER} psql -U av -d avdb -c "${colliderDelete}"`,
+    { stdio: "ignore" },
+  );
   const sql = [
     "INSERT INTO api_keys (id, \"orgId\", name, \"tokenHash\", \"tokenHint\", role)",
     `SELECT 'colliderkey000000000000000000', "orgId", 'collider', '$argon2id$v=19$m=65536,t=3,p=4$YWFhYWFhYWE$YWFhYWFhYWFhYWFhYWFh', '${bobHint}', 'admin'`,
@@ -164,6 +175,10 @@ let carolState = {};
   });
   if (r.status !== 200) fail(`hint collision broke real bearer -> ${r.status}`);
   console.log("✅ hint collision: real key still authenticates past the impostor");
+  execSync(
+    `docker exec -e PGPASSWORD=av ${PG_CONTAINER} psql -U av -d avdb -c "${colliderDelete}"`,
+    { stdio: "ignore" },
+  );
 }
 
 console.log("\nAll 7 API-key hardening scenarios passed.");

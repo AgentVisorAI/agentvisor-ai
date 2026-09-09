@@ -45,7 +45,7 @@ av-harness = { path = "crates/av-harness", version = "0.1.0" }
 tokio = { version = "1.47", features = ["full"] }
 axum = { version = "0.8", features = ["macros"] }
 hyper = { version = "1.7", features = ["full"] }
-hyper-util = { version = "0.1", features = ["server", "http2", "tokio", "service"] }
+hyper-util = { version = "0.1", features = ["server", "server-auto", "server-graceful", "http2", "tokio", "service"] }
 tower = { version = "0.5", features = ["util", "limit", "timeout"] }
 futures = "0.3"
 serde = { version = "1.0", features = ["derive"] }

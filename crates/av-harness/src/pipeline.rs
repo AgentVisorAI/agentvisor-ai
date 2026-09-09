@@ -56,6 +56,42 @@ pub(crate) const MIDDLEWARE_US_HEADER: &str = "x-av-middleware-us";
 /// TCP connect timeout for every outbound HTTPS client the harness builds.
 pub const HTTP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// Shared HELP for `av_shutdown_session_close_timeouts_total`, registered
+/// at boot (pre-registration in [`PreparedPipeline`]'s metric block) and
+/// looked up again on the shutdown path (`main.rs` finalize loop). The
+/// registry is first-wins on HELP and warns on drift — a single const is
+/// the only arrangement that cannot drift.
+pub const SESSION_CLOSE_TIMEOUTS_HELP: &str =
+    "Per-session close hit the shutdown-time per-session deadline (3 s) and \
+     was deferred to restart-time spool recovery. A sustained rate > 0 on \
+     every rollout indicates a class of sessions that regularly hang their \
+     close (leaked leases, dropped worker permits, unresponsive bridge \
+     publish) — the coincident session id in the shutdown warn log is the \
+     correlation key. Distinct from `av_http_shutdown_drain_timeouts_total` \
+     which fires on the OUTER phase timeout.";
+
+/// Shared HELP for `av_shutdown_mcp_drain_timeouts_total` (boot
+/// pre-registration and shutdown-path lookup in `main.rs`). Same
+/// first-wins/no-drift rationale as [`SESSION_CLOSE_TIMEOUTS_HELP`].
+pub const MCP_DRAIN_TIMEOUTS_HELP: &str =
+    "Shutdown MCP-inflight drain hit its 5 s deadline before every detached \
+     mcp_call_inner spawn completed. Downstream effects: some detached \
+     tool bodies were interrupted at close and their sessions may be \
+     quarantined at restart-time recovery. Any occurrence during a \
+     rollout indicates a class of tool calls that regularly outlive HTTP \
+     drain (long-running upstream tool, hung sandbox); check the \
+     coincident tracing warn line.";
+
+/// Shared HELP for `av_idle_close_timeouts_total` (boot pre-registration
+/// and reconciler idle-sweep lookup). Same first-wins/no-drift rationale
+/// as [`SESSION_CLOSE_TIMEOUTS_HELP`].
+pub const IDLE_CLOSE_TIMEOUTS_HELP: &str =
+    "Idle-close reached the per-session deadline (90 s) and returned to \
+     the next tick — indicates a session with an active lease that never \
+     drops (stuck stream, hung worker) or a bridge publish stalled behind \
+     an unresponsive broker. A steady rate > 0 requires operator \
+     investigation of the coincident session id.";
+
 /// Fallback identity scope when the tool name cannot be parsed from the request.
 pub(crate) const TOOL_INVOKE_SCOPE: &str = "tool:invoke";
 
@@ -1623,14 +1659,7 @@ impl AppState {
         // idle-close sweep, so a lazy `rate() > 0` alert wouldn't
         // see the FIRST fire — exactly the incident the alert
         // exists to catch. See OPERATIONS.md.
-        metrics.counter(
-            "av_idle_close_timeouts_total",
-            "Idle-close reached the per-session deadline (90 s) and returned \
-             to the next tick — indicates a session with an active lease \
-             that never drops (stuck stream, hung worker, unresponsive \
-             bridge). A steady rate > 0 requires operator investigation \
-             of the coincident session id.",
-        );
+        metrics.counter("av_idle_close_timeouts_total", IDLE_CLOSE_TIMEOUTS_HELP);
         // Shutdown-time per-session close deadline counter. Fires
         // when the shutdown-path close_session (main.rs
         // finalize_sessions loop) hits its 3 s per-session deadline
@@ -1642,11 +1671,7 @@ impl AppState {
         // shutdown that surfaces the class.
         metrics.counter(
             "av_shutdown_session_close_timeouts_total",
-            "Per-session close hit the shutdown-time per-session deadline (3 s) \
-             and was deferred to restart-time spool recovery. A sustained rate > 0 \
-             on every rollout indicates a class of sessions that regularly hang \
-             their close; the coincident session id in the shutdown warn log is the \
-             correlation key. Distinct from av_http_shutdown_drain_timeouts_total.",
+            SESSION_CLOSE_TIMEOUTS_HELP,
         );
         // Shutdown-time MCP-inflight drain-deadline counter. Fires when
         // the shutdown barrier waiting for detached mcp_call_inner
@@ -1657,16 +1682,7 @@ impl AppState {
         // `av_shutdown_session_close_timeouts_total` on an otherwise-
         // recoverable session. Pre-registration matches the rest of
         // the block — any occurrence must be visible to `rate() > 0`.
-        metrics.counter(
-            "av_shutdown_mcp_drain_timeouts_total",
-            "Shutdown MCP-inflight drain hit its 5 s deadline before every detached \
-             mcp_call_inner spawn completed. Downstream effects: some detached \
-             tool bodies were interrupted at close and their sessions may be \
-             quarantined at restart-time recovery. Any occurrence during a \
-             rollout indicates a class of tool calls that regularly outlive HTTP \
-             drain (long-running upstream tool, hung sandbox); check the \
-             coincident tracing warn line.",
-        );
+        metrics.counter("av_shutdown_mcp_drain_timeouts_total", MCP_DRAIN_TIMEOUTS_HELP);
         // Per-tick recovery-scan cap counter. Every recovery pass that
         // walks `read_dir` yields after `MAX_RECOVERY_ENTRIES_PER_TICK`
         // entries so a poisoned spool (millions of stale files) does
