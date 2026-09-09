@@ -820,6 +820,7 @@ vector_backend = "memory"
         "av_atif_retention_panics_total",
         "av_atif_retention_errors_total",
         "av_tcp_nodelay_failures_total",
+        "av_http_accept_failures_total",
         "av_stream_abort_panics_total",
         "av_ephemeral_close_panics_total",
         "av_admission_refund_panics_total",

@@ -459,11 +459,20 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
         "av_http_stalled_body_reaps_total",
         "Request bodies aborted because the client sent no frame within the silence bound",
     );
+    // Accept-loop failures (EMFILE/ENFILE under fd pressure,
+    // ECONNABORTED races). The loop's per-process warn is Once-guarded
+    // (see http_serve.rs), so this counter is the primary signal for a
+    // sustained accept-failure incident.
+    let accept_failures = metrics.counter(
+        "av_http_accept_failures_total",
+        "TCP accept() failures on the front-door listener (EMFILE/ENFILE fd pressure, aborted handshakes); the accept loop continues after each",
+    );
     let server = Box::pin(http_serve::serve_with_client_silence_reaping(
         listener,
         build_router(state.clone()),
         on_accept,
         stalled_reaps,
+        accept_failures,
         http_serve::HEADER_READ_TIMEOUT,
         http_serve::BODY_FRAME_GAP_TIMEOUT,
         async move {

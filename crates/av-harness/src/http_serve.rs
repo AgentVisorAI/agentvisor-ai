@@ -68,11 +68,13 @@ const H2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(30);
 /// bounds are parameters so tests can exercise reaping in milliseconds;
 /// production callers pass [`HEADER_READ_TIMEOUT`] /
 /// [`BODY_FRAME_GAP_TIMEOUT`].
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_with_client_silence_reaping(
     listener: tokio::net::TcpListener,
     router: Router,
     on_accept: impl Fn(&tokio::net::TcpStream) + Send,
     stalled_reaps: Arc<av_core::metrics::Counter>,
+    accept_failures: Arc<av_core::metrics::Counter>,
     header_read_timeout: Duration,
     body_frame_gap: Duration,
     shutdown: impl Future<Output = ()> + Send + 'static,
@@ -87,7 +89,22 @@ pub async fn serve_with_client_silence_reaping(
                     // Transient accept errors (EMFILE under fd pressure,
                     // ECONNABORTED) must not kill the accept loop — that
                     // would turn resource pressure into a full outage.
-                    tracing::warn!(%error, "accept failed; continuing");
+                    // Warn ONCE per process: under sustained EMFILE the
+                    // failing accept never drains the kernel queue, so
+                    // this arm loops at ~20 Hz for the whole incident —
+                    // an unthrottled warn floods the log pipeline during
+                    // the exact resource emergency it reports (same
+                    // dampener discipline as the TCP_NODELAY warn in
+                    // main.rs). The counter is the primary signal.
+                    static WARNED: std::sync::Once = std::sync::Once::new();
+                    WARNED.call_once(|| {
+                        tracing::warn!(
+                            %error,
+                            "accept failed; continuing. Subsequent failures counted only \
+                             via av_http_accept_failures_total to avoid a log storm"
+                        );
+                    });
+                    accept_failures.inc();
                     tokio::time::sleep(Duration::from_millis(50)).await;
                     continue;
                 }
@@ -242,6 +259,7 @@ mod tests {
                 test_router(),
                 |_| {},
                 reaps_for_server,
+                Arc::new(av_core::metrics::Counter::default()),
                 TEST_HEADER_TIMEOUT,
                 TEST_BODY_GAP,
                 std::future::pending(),
@@ -383,6 +401,7 @@ mod tests {
             listener,
             test_router(),
             |_| {},
+            Arc::new(av_core::metrics::Counter::default()),
             Arc::new(av_core::metrics::Counter::default()),
             TEST_HEADER_TIMEOUT,
             TEST_BODY_GAP,

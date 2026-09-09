@@ -41,6 +41,20 @@ import { formatForAdapter, pickAdapter } from "./webhook-adapters.js";
 const MAX_ATTEMPT = 6;
 const BACKOFF_SECONDS = [30, 120, 600, 1800, 7200];
 const DELIVERY_TIMEOUT_MS = 5000;
+// Claim lease for in-flight rows. A delivery sits in status='pending'
+// only while a deliverOne is actively executing — bounded by
+// DELIVERY_TIMEOUT_MS (5 s) plus small overhead — so a 'pending' row
+// whose lease expired belongs to a process that died (SIGTERM during a
+// rolling deploy, crash, dropped microtask) between claiming the row
+// and writing its terminal status. Without the lease those rows were
+// orphaned FOREVER: the sweeper only re-scans status='retrying', so a
+// claimed-but-never-delivered row was silent permanent delivery loss —
+// contradicting the "self-healing without a queue broker" contract in
+// the module docstring. 5 min = 60× the in-flight bound; generous
+// enough that a legitimately-executing delivery can never be
+// double-claimed, tight enough that a lost delivery retries within
+// minutes. Keep the SQL interval in the sweeper's claim query in sync.
+const PENDING_LEASE_MS = 5 * 60 * 1000;
 
 /**
  * SSRF guard — refuse to send outbound requests to internal / metadata
@@ -461,7 +475,16 @@ async function deliverOne(
     deliveryId = existingDeliveryId;
     await db.webhookDelivery.update({
       where: { id: existingDeliveryId },
-      data: { attempt, status: "pending", nextRetryAt: null },
+      // nextRetryAt doubles as the claim lease while status='pending'
+      // (see PENDING_LEASE_MS): if this process dies mid-POST, the
+      // sweeper reclaims the row after the lease instead of orphaning
+      // it. Terminal updates (delivered / failed / scheduleRetry)
+      // overwrite it.
+      data: {
+        attempt,
+        status: "pending",
+        nextRetryAt: new Date(Date.now() + PENDING_LEASE_MS),
+      },
     });
   } else {
     const row = await db.webhookDelivery.create({
@@ -471,6 +494,10 @@ async function deliverOne(
         payload: body,
         attempt,
         status: "pending",
+        // First-attempt rows carry the same claim lease: a crash
+        // between this create and the terminal update is reclaimed by
+        // the sweeper rather than stuck 'pending' forever.
+        nextRetryAt: new Date(Date.now() + PENDING_LEASE_MS),
       },
       select: { id: true },
     });
@@ -679,6 +706,14 @@ async function deliverOne(
           responseCode,
           responseBody: truncated,
           deliveredAt: new Date(),
+          // Clear the retry bookkeeping: the deliveries drawer sorts
+          // its badge from errorMessage (#307 fixed the four failure
+          // paths but missed this 2xx path), so a success-after-retry
+          // otherwise kept rendering the PREVIOUS attempt's error on a
+          // row that actually delivered. nextRetryAt held the claim
+          // lease — also stale once delivered.
+          errorMessage: null,
+          nextRetryAt: null,
         },
       });
       return;
@@ -745,6 +780,9 @@ async function scheduleRetry(
         errorMessage,
         responseBody: responseBody ?? undefined,
         responseCode: responseCode ?? undefined,
+        // Clear the claim lease — a failed row with a future
+        // nextRetryAt would mislead the drawer.
+        nextRetryAt: null,
       },
     });
     logger?.warn({ deliveryId }, "webhook_delivery_gave_up");
@@ -796,7 +834,11 @@ export function startWebhookSweeper(logger?: FastifyBaseLogger): void {
         attempt: number;
       }>>`
         UPDATE "webhook_deliveries"
-        SET status = 'pending'
+        SET status = 'pending',
+            -- Renew the claim lease (mirrors PENDING_LEASE_MS): if THIS
+            -- process dies before deliverOne writes a terminal status,
+            -- a later tick reclaims the row via the lease arm below.
+            "nextRetryAt" = (now() AT TIME ZONE 'UTC') + interval '5 minutes'
         WHERE id IN (
           SELECT id FROM "webhook_deliveries"
           -- Round-104 TZ fix: nextRetryAt is a naive-UTC timestamp
@@ -804,7 +846,22 @@ export function startWebhookSweeper(logger?: FastifyBaseLogger): void {
           -- comparison casts it through the SESSION TimeZone. With a
           -- non-UTC database (TZ=America/New_York) retries stalled ~4-5
           -- hours. Normalize now() to naive UTC explicitly.
-          WHERE status = 'retrying' AND "nextRetryAt" <= (now() AT TIME ZONE 'UTC')
+          WHERE ((status = 'retrying' AND "nextRetryAt" <= (now() AT TIME ZONE 'UTC'))
+             -- Expired claim lease: a row stays 'pending' only while a
+             -- deliverOne is executing (bounded by DELIVERY_TIMEOUT_MS,
+             -- 5 s). A lease in the past means the claiming process died
+             -- mid-flight (deploy SIGTERM, crash, dropped microtask);
+             -- without this arm the row was orphaned FOREVER — the
+             -- sweeper only re-scanned 'retrying' — i.e. silent
+             -- permanent delivery loss on any restart.
+             OR (status = 'pending' AND "nextRetryAt" IS NOT NULL
+                 AND "nextRetryAt" <= (now() AT TIME ZONE 'UTC'))
+             -- Pre-lease orphans (rows claimed by code that nulled
+             -- nextRetryAt while pending, then died). 15 min of age is
+             -- far past any legitimate in-flight window, so reclaiming
+             -- cannot double-deliver a live attempt.
+             OR (status = 'pending' AND "nextRetryAt" IS NULL
+                 AND "createdAt" <= (now() AT TIME ZONE 'UTC') - interval '15 minutes'))
           ORDER BY "nextRetryAt" ASC
           LIMIT 20
           FOR UPDATE SKIP LOCKED
@@ -841,8 +898,25 @@ export function startWebhookSweeper(logger?: FastifyBaseLogger): void {
           if (!endpoint.isActive) {
             await db.webhookDelivery.update({
               where: { id: d.id },
-              data: { status: "failed", errorMessage: "endpoint_disabled" },
+              data: { status: "failed", errorMessage: "endpoint_disabled", nextRetryAt: null },
             });
+            continue;
+          }
+          // Reclaimed-lease rows re-enter with their persisted attempt
+          // counter; a row whose process crashed on every one of its
+          // MAX_ATTEMPT deliveries must fail here rather than loop at
+          // lease cadence forever (scheduleRetry's give-up only runs
+          // when an attempt FAILS in-process, never on a crash).
+          if (d.attempt >= MAX_ATTEMPT) {
+            await db.webhookDelivery.update({
+              where: { id: d.id },
+              data: {
+                status: "failed",
+                errorMessage: "max_attempts_exceeded",
+                nextRetryAt: null,
+              },
+            });
+            logger?.warn({ deliveryId: d.id }, "webhook_delivery_gave_up");
             continue;
           }
           // deliverOne with existingDeliveryId reuses this row rather than

@@ -1286,27 +1286,96 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
       // signed receipt.body's totals — compliance defect. Same
       // class as R94 F1 (events tx) and R93 F4 / R118 F2 /
       // R119 F2 (post-seal defacement).
-      await db.$transaction(async (tx) => {
-        await tx.receipt.create({
-          data: {
-            sessionId: session.id,
-            receiptId: r.receiptId,
-            body: r.body,
-            sigB64: r.sigB64,
-            keyIdHint: r.keyIdHex.slice(0, 8),
-            eventCount: r.eventCount,
-            issuedAt: r.issuedAt,
+      try {
+        await db.$transaction(async (tx) => {
+          await tx.receipt.create({
+            data: {
+              sessionId: session.id,
+              receiptId: r.receiptId,
+              body: r.body,
+              sigB64: r.sigB64,
+              keyIdHint: r.keyIdHex.slice(0, 8),
+              eventCount: r.eventCount,
+              issuedAt: r.issuedAt,
+            },
+          });
+          await tx.session.update({
+            where: { id: session.id },
+            data: {
+              status: "sealed",
+              stopReasonId: r.stopReasonId,
+              stopReason: r.stopReason,
+            },
+          });
+        });
+      } catch (err) {
+        if (
+          typeof err !== "object" ||
+          err === null ||
+          (err as { code?: string }).code !== "P2002"
+        ) {
+          throw err;
+        }
+        // Concurrent seal of the same session: the existingReceipt
+        // read above ran before either racer committed, so both took
+        // this fresh-seal branch and the loser's receipt.create hit
+        // the sessionId unique index. An at-least-once daemon retry
+        // in flight beside the original is the benign shape; treat
+        // it exactly like the sequential re-post path — byte-exact
+        // ⇒ idempotent 200, anything else ⇒ the 409 refusal — never
+        // an unhandled P2002 → 500 (the winner already sealed the
+        // session correctly; the loser's tx rolled back cleanly).
+        const raced = await db.receipt.findUnique({
+          where: { sessionId: session.id },
+          select: {
+            receiptId: true,
+            body: true,
+            sigB64: true,
+            keyIdHint: true,
+            eventCount: true,
+            issuedAt: true,
           },
         });
-        await tx.session.update({
-          where: { id: session.id },
-          data: {
-            status: "sealed",
-            stopReasonId: r.stopReasonId,
-            stopReason: r.stopReason,
-          },
-        });
-      });
+        if (!raced) throw err;
+        const identical =
+          raced.receiptId === r.receiptId &&
+          raced.body === r.body &&
+          raced.sigB64 === r.sigB64 &&
+          raced.keyIdHint === r.keyIdHex.slice(0, 8) &&
+          raced.eventCount === r.eventCount &&
+          raced.issuedAt.getTime() === r.issuedAt.getTime();
+        if (!identical) {
+          req.log.warn(
+            {
+              deploymentId: daemon.deploymentId,
+              sessionId: session.id,
+              existingReceiptId: raced.receiptId,
+              proposedReceiptId: r.receiptId,
+            },
+            "ingest_receipt_overwrite_refused",
+          );
+          writeAudit(
+            {
+              orgId: daemon.orgId,
+              event: "deployment.receipt_overwrite_refused",
+              actorId: `daemon:${daemon.deploymentId}`,
+              actorEmail: `daemon@${daemon.deploymentId}`,
+              target: session.id,
+              metadata: {
+                deploymentId: daemon.deploymentId,
+                sessionId: session.id,
+                currentReceiptId: raced.receiptId,
+                proposedReceiptId: r.receiptId,
+                sameReceiptIdDifferentPayload: raced.receiptId === r.receiptId,
+                racedConcurrentSeal: true,
+              },
+              req,
+            },
+            req.log,
+          );
+          return reply.code(409).send({ error: "receipt_already_sealed" });
+        }
+      }
     }
     bus.publish({
       type: "receipt.finalized",
