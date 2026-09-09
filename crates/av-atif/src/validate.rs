@@ -1951,6 +1951,86 @@ mod tests {
         }
     }
 
+    /// Round-26 pass 3: the tool_definitions caps enforce the declared
+    /// strict-valid ⇒ schema-valid invariant (schema maxItems: 512,
+    /// items maxProperties: 128 — see golden.rs), but both boundaries
+    /// had surviving `>` mutants. Pin exactly-at (clean) and one-past
+    /// (refused) for each.
+    #[test]
+    fn tool_definition_caps_bite_exactly_at_schema_bounds() {
+        let doc_with_defs = |defs: serde_json::Value| {
+            serde_json::json!({
+                "schema_version": "ATIF-v1.7",
+                "session_id": "s",
+                "agent": {"name": "a", "version": "1", "tool_definitions": defs},
+                "steps": [{"step_id": 1, "source": "user", "message": "hi"}],
+            })
+        };
+        let has_issue = |v: &Value, needle: &str| {
+            validate_value(v, Mode::Strict)
+                .iter()
+                .any(|i| i.message.contains(needle))
+        };
+        let def = serde_json::json!({"name": "t"});
+        let at_max: Vec<_> = (0..512).map(|_| def.clone()).collect();
+        assert!(
+            !has_issue(&doc_with_defs(serde_json::json!(at_max)), "512 definitions"),
+            "exactly 512 definitions must be schema-clean"
+        );
+        let past_max: Vec<_> = (0..513).map(|_| def.clone()).collect();
+        assert!(
+            has_issue(&doc_with_defs(serde_json::json!(past_max)), "512 definitions"),
+            "513 definitions must be refused (schema maxItems)"
+        );
+
+        let fat = |props: usize| -> serde_json::Value {
+            let mut m = serde_json::Map::new();
+            for i in 0..props {
+                m.insert(format!("p{i}"), Value::from(1));
+            }
+            Value::Object(m)
+        };
+        assert!(
+            !has_issue(&doc_with_defs(serde_json::json!([fat(128)])), "128 properties"),
+            "exactly 128 properties must be schema-clean"
+        );
+        assert!(
+            has_issue(&doc_with_defs(serde_json::json!([fat(129)])), "128 properties"),
+            "129 properties must be refused (schema maxProperties)"
+        );
+    }
+
+    /// Round-26: the truncation helper's `>` was mutable to `>=` —
+    /// exactly MAX issues must pass through UNMARKED; MAX+1 must
+    /// truncate and append the synthetic notice.
+    #[test]
+    fn issue_truncation_marker_appears_only_past_the_cap() {
+        let mk = |n: usize| -> Vec<ValidationIssue> {
+            (0..n)
+                .map(|i| ValidationIssue {
+                    path: format!("p{i}"),
+                    message: "m".into(),
+                })
+                .collect()
+        };
+        let at = truncate_issues_with_marker(mk(MAX_VALIDATION_ISSUES));
+        assert_eq!(
+            at.len(),
+            MAX_VALIDATION_ISSUES,
+            "exactly-at-cap must be untouched"
+        );
+        assert!(
+            !at.last().unwrap().message.contains("issue cap"),
+            "no synthetic marker at exactly the cap"
+        );
+        let past = truncate_issues_with_marker(mk(MAX_VALIDATION_ISSUES + 1));
+        assert_eq!(past.len(), MAX_VALIDATION_ISSUES + 1, "cap + marker");
+        assert!(
+            past.last().unwrap().message.contains("issue cap"),
+            "one past the cap must carry the truncation notice"
+        );
+    }
+
     #[test]
     fn version_parse() {
         assert_eq!(parse_version("ATIF-v1.7"), Some((1, 7)));

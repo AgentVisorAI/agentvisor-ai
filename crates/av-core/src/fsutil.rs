@@ -789,3 +789,23 @@ mod read_capped_tests {
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 }
+
+#[cfg(test)]
+mod empty_path_tests {
+    #![allow(clippy::unwrap_used)]
+
+    /// Round-26: pins the empty-path no-op contract of the
+    /// missing-ancestor walk (`dir.as_os_str().is_empty() || …`).
+    /// NB: the `||`→`&&` mutant here is behaviorally EQUIVALENT — a
+    /// pushed "" ancestor is absorbed downstream (create_dir_all("")
+    /// is Ok with zero components, and the `!parent.is_empty()` sync
+    /// guard skips it); the two arms interlock defensively. This test
+    /// pins the documented contract, not that mutant.
+    #[test]
+    fn create_dir_all_synced_treats_empty_path_as_noop() {
+        assert!(
+            super::create_dir_all_synced(std::path::Path::new("")).is_ok(),
+            "empty path must be a no-op Ok, not an mkdir(\"\") error"
+        );
+    }
+}
