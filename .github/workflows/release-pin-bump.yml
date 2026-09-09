@@ -27,7 +27,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      # Round-29 F2 discipline: pin by commit SHA. This job holds
+      # contents:write and pushes directly to main — an unpinned
+      # checkout tag here was the single worst place to leave the
+      # tag-rewrite window open.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
       - name: Bump docs/install.sh pin

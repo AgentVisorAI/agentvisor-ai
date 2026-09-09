@@ -50,6 +50,21 @@ services:
         value: agentvisor-console
       - key: APP_BASE_URL
         value: https://agentvisorai.me
+      - key: API_PUBLIC_URL
+        # The API's own public origin (this service's Koyeb domain or a
+        # custom one). SAML SP endpoints (entityId / ACS / metadata /
+        # login) and the OAuth redirect_uri are built from this —
+        # without it they fall back to APP_BASE_URL, the static Pages
+        # host above, which 404s every IdP round-trip. Mirrors
+        # render.yaml; replace with this deployment's real API origin.
+        value: https://api.agentvisorai.me
+      # Koyeb fronts services with its global edge + router — verify
+      # the hop depth for this deployment and set it explicitly: a
+      # wrong TRUSTED_PROXY_HOP_COUNT (default 1) silently breaks
+      # per-IP rate limits, IP allowlists, and audit IPs (see
+      # server/DEPLOY.md; render.yaml pins "3" for its own topology).
+      # - key: TRUSTED_PROXY_HOP_COUNT
+      #   value: "2"
       - key: EMAIL_FROM
         value: AgentVisor AI <no-reply@agentvisorai.me>
       - key: MICROSOFT_TENANT

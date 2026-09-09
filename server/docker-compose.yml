@@ -49,7 +49,14 @@ services:
       PORT: "8080"
       HOST: "0.0.0.0"
       ALLOWED_ORIGINS: "http://localhost:8787,http://127.0.0.1:8787"
-      NODE_ENV: production
+      # Deliberately NOT NODE_ENV=production: env.ts's production
+      # refinements are fatal without an https:// APP_BASE_URL and a
+      # configured mailer (RESEND_API_KEY/SMTP_URL) — with them, this
+      # local stack crash-looped on boot. Production posture (strict
+      # cookie flags, HTTPS-force, mailer required) comes from the real
+      # deployment manifests (render.yaml / koyeb.yaml / fly.toml),
+      # which set NODE_ENV=production alongside the values it demands.
+      NODE_ENV: development
     ports:
       - "127.0.0.1:8985:8080"
     read_only: true
