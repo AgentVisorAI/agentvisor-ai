@@ -100,21 +100,33 @@ let plaintext, keyId, hint;
 
 // 4. GET /keys via cookie
 {
-  const r = await jsonReq("GET", "/api/v1/keys");
-  if (r.status !== 200) {
-    console.log("❌ list keys failed:", r.status, await r.text());
+  // The lastUsedAt bump is a fire-and-forget UPDATE by design
+  // (session-middleware `void db.apiKey.update(...)` — auth latency
+  // must not pay for the write). Immediately-after reads therefore
+  // race it on a loaded runner; poll briefly instead of asserting a
+  // single snapshot. Still hard-fails if the bump never lands.
+  let keys;
+  const deadline = Date.now() + 5000;
+  for (;;) {
+    const r = await jsonReq("GET", "/api/v1/keys");
+    if (r.status !== 200) {
+      console.log("❌ list keys failed:", r.status, await r.text());
+      process.exit(1);
+    }
+    const j = await r.json();
+    if (j.keys.length !== 1) {
+      console.log("❌ expected 1 key, got:", j.keys.length);
+      process.exit(1);
+    }
+    keys = j.keys;
+    if (keys[0].lastUsedAt || Date.now() > deadline) break;
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  if (!keys[0].lastUsedAt) {
+    console.log("❌ lastUsedAt not bumped within 5 s:", keys[0]);
     process.exit(1);
   }
-  const j = await r.json();
-  if (j.keys.length !== 1) {
-    console.log("❌ expected 1 key, got:", j.keys.length);
-    process.exit(1);
-  }
-  if (!j.keys[0].lastUsedAt) {
-    console.log("❌ lastUsedAt not bumped:", j.keys[0]);
-    process.exit(1);
-  }
-  console.log(`✅ list shows lastUsedAt=${j.keys[0].lastUsedAt}`);
+  console.log(`✅ list shows lastUsedAt=${keys[0].lastUsedAt}`);
 }
 
 // 5. DELETE key

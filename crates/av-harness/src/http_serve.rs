@@ -20,7 +20,7 @@
 //!   reaps pre-request idle keep-alive connections (hyper arms it
 //!   between requests on an idle HTTP/1 connection).
 //! * **Body phase**: a per-*frame* gap timeout on the request body
-//!   (30 s between chunks), applied via [`SilenceBoundedBody`]. A slow
+//!   (30 s between chunks), applied via `SilenceBoundedBody`. A slow
 //!   uploader making real progress never trips it; a stalled one is
 //!   aborted with a hyper error that resets the stream.
 //! * **HTTP/2**: keep-alive pings (20 s interval / 30 s grace) reap

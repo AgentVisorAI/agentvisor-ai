@@ -57,7 +57,7 @@ pub(crate) const MIDDLEWARE_US_HEADER: &str = "x-av-middleware-us";
 pub const HTTP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Shared HELP for `av_shutdown_session_close_timeouts_total`, registered
-/// at boot (pre-registration in [`PreparedPipeline`]'s metric block) and
+/// at boot (pre-registration in the pipeline's metric block) and
 /// looked up again on the shutdown path (`main.rs` finalize loop). The
 /// registry is first-wins on HELP and warns on drift — a single const is
 /// the only arrangement that cannot drift.
