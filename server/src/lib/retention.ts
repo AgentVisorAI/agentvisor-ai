@@ -169,6 +169,15 @@ export async function sweepRetentionAll(
  * sweeping simultaneously), then every RETENTION_INTERVAL_MS.
  */
 export function startRetentionSweeper(logger?: FastifyBaseLogger): void {
+  if (env.DISABLE_RETENTION_SWEEPER) {
+    // Test-hygiene gate (see env.ts). Warn loudly so a production
+    // deploy that somehow carries the flag is visible in the boot log
+    // — data-retention compliance depends on this loop running.
+    logger?.warn(
+      "retention sweeper DISABLED via DISABLE_RETENTION_SWEEPER — test-only setting; sweep-now remains available",
+    );
+    return;
+  }
   // R208 F2: guard on BOTH the interval timer AND the pending
   // jitter setTimeout. Prior guard `if (sweeperTimer) return`
   // let a duplicate `start` during the boot-jitter window

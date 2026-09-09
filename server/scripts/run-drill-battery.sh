@@ -58,7 +58,7 @@ ALL_DRILLS=(
   "invite-drill|60445"
   "invite-hardening|60446"
   "ip-allowlist-drill|60750"
-  "retention-drill|60749"
+  "retention-drill|60749|DISABLE_RETENTION_SWEEPER=true"
   "saml-drill|60440"
   "saml-hardening|60441"
   "webauthn-drill|60443"
