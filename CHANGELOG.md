@@ -32,6 +32,19 @@ exercised against release binaries in CI on every push
 - Exchanged tokens now bind each revocation ancestor to its issuer. Reissue
   exchanged tokens created by older builds: tokens without issuer ancestry
   are refused because their revocation identity is ambiguous.
+- Intent tokens (`x-av-intent-token`) now carry the human principal in
+  `sub` and the calling agent in `act.sub` (RFC 8693 shape), plus the ids of
+  the missions that applied in `missions`. Backends that read `sub` as the
+  agent must read `act.sub` instead.
+- `[[backends]]` entries now speak the MCP Streamable HTTP transport by
+  default (`transport = "mcp"`: an `initialize` handshake per audited
+  session, session and protocol-version headers, SSE replies). Set
+  `transport = "json_rpc"` for a backend that only accepts one plain
+  JSON-RPC POST per call. `tool_upstream_url` keeps the plain transport
+  unless `tool_upstream_transport = "mcp"`.
+- A backend may no longer be named like `audience`; boot refuses the
+  combination, because tokens signed for that backend would also be valid
+  inbound identities.
 
 ### Security
 
@@ -197,6 +210,48 @@ exercised against release binaries in CI on every push
   including error paths.
 
 ### Added
+
+- **MCP protocol on `/mcp`.** The gateway is a Streamable HTTP MCP server
+  (protocol versions 2024-11-05 to 2025-11-25): `initialize` with version
+  negotiation and a principal-bound, HMAC-signed `MCP-Session-Id` that also
+  names the audited session; `ping`; notifications (202); `tools/list`
+  aggregated from every backend and filtered to the tools the caller may
+  call; `GET` (405) and `DELETE` (closes the audited session); `Origin`
+  (`mcp_allowed_origins`) and `MCP-Protocol-Version` checks.
+  `/mcp/{backend}` exposes one backend's tools behind the same host.
+- **MCP client for backends.** Per-audited-session backend sessions,
+  `Accept`/session/version headers, incremental SSE decoding, answers to
+  backend `ping` requests, resumption with `Last-Event-ID`, and one retry
+  after a session-expiry 404.
+- **Identity.** RFC 8693 `actor_token` on `/v1/token` (scopes requested ∩
+  subject ∩ actor, two-level `act`, revoking the actor revokes the result);
+  `identity_human_subject_pattern` requires every identity to be
+  attributable to a human.
+- **Authorization.** Per-agent missions (`[[missions]]` selected by agent,
+  charter, or human subject; every applicable mission must allow the call);
+  an optional external AuthZEN 1.0 policy decision point (`[authzen]`),
+  consulted per call after the local checks and in batch for `tools/list`,
+  failing closed with 503 and denying with the new `PDP_DENIED` code.
+- **Credentials.** `auth = "forward_token"` forwards the caller's own token
+  to that one backend.
+- **Backend isolation.** `require_private_backends` gives tool traffic its
+  own client whose resolver refuses non-private addresses on every
+  connection; `deploy/kubernetes/network-policies.yaml` and
+  `deploy/cloudfoundry/mcp-backend.manifest.yml` restrict backends to the
+  gateway.
+- **Full-content tenant telemetry.** With `otel_tenant_endpoint`, every
+  audited step is exported as an OpenTelemetry GenAI span (`chat {model}`,
+  `execute_tool {tool}`, …) with its redacted content, through a tracer
+  provider that exports only to the tenant (`otel_tenant_content`).
+- **Zero-code-change platform integration.** The RFC 7523 jwt-bearer grant
+  on `/v1/token` issues agent tokens to Cloud Foundry app instances that
+  prove their instance identity (`[workload_identity]`,
+  `[[workload_identities]]`, each naming the human the agent acts for);
+  `avctl sidecar` attaches that identity to an unmodified application's
+  requests; the buildpack sets the OpenAI SDK variables, writes an MCP
+  client configuration, and starts the sidecar (`launch.yml`), and
+  `scripts/package-buildpack.py` packages it with the static `avctl`
+  binaries (also published by the release workflow).
 
 - **Per-agent identity, authorization, and credential isolation for tool
   calls.**

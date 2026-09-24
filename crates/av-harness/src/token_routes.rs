@@ -225,7 +225,10 @@ fn revoke_verified(state: &AppState, token: &str) -> Result<Option<(AgentIdentit
             Arc::clone(&state.exchanged_revocations),
             "exchanged",
         ),
-        Err(_) if has_gateway_signature(state, token) => return Ok(None),
+        // Gateway-signed agent tokens issued to workloads are inbound
+        // identities; every other gateway-signed token that failed the
+        // exchange profile is refused here.
+        Err(_) if has_gateway_signature(state, token) && !is_workload_token(state, token) => return Ok(None),
         Err(_) => match validator.validate_for_revocation(token) {
             Ok(identity) => (identity.claims, Arc::clone(store), "nhi"),
             // Preserve the RFC 7009 no-op response for forged gateway tokens.
@@ -291,6 +294,27 @@ fn has_gateway_signature(state: &AppState, token: &str) -> bool {
         jsonwebtoken::Algorithm::EdDSA,
     )
     .unwrap_or(false)
+}
+
+/// True for an agent token this gateway issued to a workload: workload
+/// identity is on, the gateway signature verifies, and the issuer is the
+/// workload issuer. Such a token is then validated like any inbound token.
+fn is_workload_token(state: &AppState, token: &str) -> bool {
+    use base64::Engine as _;
+    if state.workload.is_none() || !has_gateway_signature(state, token) {
+        return false;
+    }
+    token
+        .split('.')
+        .nth(1)
+        .and_then(|claims| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(claims)
+                .ok()
+        })
+        .and_then(|claims| serde_json::from_slice::<Value>(&claims).ok())
+        .and_then(|claims| claims.get("iss").and_then(Value::as_str).map(str::to_owned))
+        .is_some_and(|iss| iss == crate::workload::issuer(&state.config))
 }
 
 #[derive(Deserialize)]

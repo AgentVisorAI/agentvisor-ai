@@ -6,21 +6,63 @@ case "$4" in ''|*[!0-9]*) printf 'error: DEPS_IDX must be an integer\n' >&2; exi
 buildpack_dir=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 # shellcheck source=buildpack/lib/binding.sh
 . "$buildpack_dir/lib/binding.sh"
+# shellcheck source=buildpack/lib/outputs.sh
+. "$buildpack_dir/lib/outputs.sh"
 binding=$(read_binding)
 [ "$binding" != null ] || { printf 'error: no agentvisor binding found\n' >&2; exit 1; }
-profile_dir=$3/$4/profile.d
-mkdir -p "$profile_dir"
+deps=$3/$4
+# Paths as the running container sees them (DEPS_DIR is /home/vcap/deps).
+runtime_deps="/home/vcap/deps/$4"
+mkdir -p "$deps/profile.d" "$deps/agentvisor"
+
+# The loopback sidecar attaches the instance identity to every request.
+sidecar=false
+if [ "$(printf '%s' "$binding" | jq -r 'if .sidecar == null then true else .sidecar end')" = true ]; then
+    binary=$(sidecar_binary)
+    if [ -n "$binary" ]; then
+        mkdir -p "$deps/bin"
+        cp "$binary" "$deps/bin/avctl"
+        chmod 755 "$deps/bin/avctl"
+        sidecar=true
+    else
+        printf 'agentvisor: this buildpack package has no sidecar binary for %s; the application must present its own identity token\n' "$(uname -m)"
+    fi
+fi
+base=$(client_base "$binding" "$sidecar")
+mcp_config "$binding" "$base" > "$deps/agentvisor/mcp.json"
+chmod 644 "$deps/agentvisor/mcp.json"
+
 # Single quotes and literal newlines cannot escape the generated assignments.
 escape_sq() { printf '%s' "$1" | sed "s/'/'\\\\''/g"; }
 {
-    printf '#!/bin/sh\n# AgentVisor connection metadata; the application must consume these variables.\n'
-    for pair in AV_GATEWAY_URL:gateway_url AV_AUDIENCE:audience AV_IDENTITY_JWKS_URL:identity_jwks_url; do
-        name=${pair%%:*}
-        key=${pair#*:}
-        value=$(printf '%s' "$binding" | jq -r --arg key "$key" '.[$key] // empty')
-        # Export an empty optional value to avoid retaining a previous binding.
-        printf "export %s='%s'\n" "$name" "$(escape_sq "$value")"
+    printf '#!/bin/sh\n# AgentVisor client configuration, generated at staging from the service binding.\n'
+    client_environment "$binding" "$base" "$runtime_deps/agentvisor/mcp.json" | while IFS= read -r line; do
+        printf "export %s='%s'\n" "${line%%=*}" "$(escape_sq "${line#*=}")"
     done
-} > "$profile_dir/agentvisor.sh"
-chmod 644 "$profile_dir/agentvisor.sh"
-printf 'agentvisor: wrote %s\n' "$profile_dir/agentvisor.sh"
+    if [ "$sidecar" = true ]; then
+        # SDKs refuse to start without a key; the sidecar replaces it. The
+        # expansion is written literally so it runs when the app starts.
+        # shellcheck disable=SC2016
+        printf 'export OPENAI_API_KEY="${OPENAI_API_KEY:-agentvisor-sidecar}"\n'
+    fi
+} > "$deps/profile.d/agentvisor.sh"
+chmod 644 "$deps/profile.d/agentvisor.sh"
+printf 'agentvisor: wrote %s\n' "$deps/profile.d/agentvisor.sh"
+
+if [ "$sidecar" = true ]; then
+    sidecar_config "$binding" cf-instance > "$deps/agentvisor/sidecar.json"
+    chmod 644 "$deps/agentvisor/sidecar.json"
+    # Cloud Foundry starts buildpack-provided sidecars from launch.yml.
+    cat > "$deps/launch.yml" <<YAML
+---
+processes:
+- type: "agentvisor-sidecar"
+  command: "$runtime_deps/bin/avctl sidecar --config $runtime_deps/agentvisor/sidecar.json"
+  limits:
+    memory: 64
+  platforms:
+    cloudfoundry:
+      sidecar_for: ["web"]
+YAML
+    printf 'agentvisor: sidecar declared in %s\n' "$deps/launch.yml"
+fi

@@ -3,6 +3,7 @@
 mod console_sync;
 mod operator_revocation;
 mod setup;
+mod sidecar;
 
 use anyhow::{Context, Result};
 use av_bridge::{BridgeManifest, EmbeddedBroker};
@@ -59,6 +60,28 @@ enum Command {
         /// Harness base URL.
         #[arg(long, default_value = "http://127.0.0.1:8484")]
         url: String,
+    },
+    /// Run the loopback identity sidecar beside an application: it attaches
+    /// an AgentVisor identity token to every request and forwards it to the
+    /// gateway, so the application's SDKs need no code change.
+    Sidecar {
+        /// Settings file written by the buildpack (gateway, audience, listen,
+        /// credential). Flags given explicitly override its values.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Gateway base URL [default: $AV_GATEWAY_URL].
+        #[arg(long)]
+        gateway: Option<String>,
+        /// Gateway audience [default: $AV_AUDIENCE, then agentvisor-ai].
+        #[arg(long)]
+        audience: Option<String>,
+        /// Loopback address to listen on [default: 127.0.0.1:8485].
+        #[arg(long)]
+        listen: Option<std::net::SocketAddr>,
+        /// Identity source: `cf-instance` or `token-file:<path>`
+        /// [default: cf-instance].
+        #[arg(long)]
+        credential: Option<String>,
     },
     /// Generate and persist an Ed25519 signing seed.
     Keygen {
@@ -259,6 +282,44 @@ enum ValidationMode {
     Compat,
 }
 
+/// Resolve sidecar settings (flags, then the settings file, then the
+/// environment, then defaults) and run it.
+async fn run_sidecar(
+    config: Option<PathBuf>,
+    gateway: Option<String>,
+    audience: Option<String>,
+    listen: Option<std::net::SocketAddr>,
+    credential: Option<String>,
+) -> Result<()> {
+    let file = config.as_deref().map(sidecar::SidecarFile::load).transpose()?;
+    let env = |name: &str| std::env::var(name).ok().filter(|value| !value.trim().is_empty());
+    let gateway = gateway
+        .or_else(|| file.as_ref().map(|file| file.gateway.clone()))
+        .or_else(|| env("AV_GATEWAY_URL"))
+        .context("the gateway URL is required (--gateway, --config, or AV_GATEWAY_URL)")?;
+    let audience = audience
+        .or_else(|| file.as_ref().map(|file| file.audience.clone()))
+        .or_else(|| env("AV_AUDIENCE"))
+        .unwrap_or_else(|| "agentvisor-ai".to_owned());
+    let listen = match (listen, file.as_ref()) {
+        (Some(listen), _) => listen,
+        (None, Some(file)) => file
+            .listen
+            .parse()
+            .with_context(|| format!("invalid listen address {:?}", file.listen))?,
+        (None, None) => std::net::SocketAddr::from(([127, 0, 0, 1], 8485)),
+    };
+    let credential = credential
+        .or_else(|| file.as_ref().map(|file| file.credential.clone()))
+        .unwrap_or_else(|| "cf-instance".to_owned());
+    let options = sidecar::SidecarOptions {
+        gateway,
+        audience,
+        credential: sidecar::Credential::parse(&credential)?,
+    };
+    sidecar::run(listen, options).await
+}
+
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     // Returning `Result<()>` relied on the default
@@ -297,6 +358,13 @@ async fn run(cli: Cli) -> Result<()> {
         ),
         Command::Doctor { offline } => setup::doctor(offline).await,
         Command::Health { url } => setup::health(&url).await,
+        Command::Sidecar {
+            config,
+            gateway,
+            audience,
+            listen,
+            credential,
+        } => run_sidecar(config, gateway, audience, listen, credential).await,
         Command::Keygen { output } => keygen(&output),
         Command::Pubkey { seed } => pubkey(&seed),
         Command::ReceiptLocate { session_id, spool } => receipt_locate(&session_id, &spool),

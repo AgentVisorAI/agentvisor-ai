@@ -9,6 +9,10 @@ criterion/
 /config/*.seed
 *.key
 *.pem
+# Test-only Cloud Foundry instance-identity chain (regenerate with the
+# generate.sh beside it). These keys protect nothing.
+!crates/av-identity/tests/fixtures/cf-instance-identity/*.key
+!crates/av-identity/tests/fixtures/cf-instance-identity/*.pem
 
 # Rust workspace scratch that lives inside target/ but bleeds via IDE tools
 target/tmp/

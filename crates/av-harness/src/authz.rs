@@ -47,6 +47,12 @@ impl TokenSigner {
         &self.kid
     }
 
+    /// The raw Ed25519 public key, base64url without padding (a JWK `x`).
+    pub fn public_key_b64url(&self) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(self.public_key)
+    }
+
     /// Public verification key for JWTs minted by this signer.
     pub fn decoding_key(&self) -> jsonwebtoken::DecodingKey {
         jsonwebtoken::DecodingKey::from_ed_der(&self.public_key)
@@ -100,32 +106,36 @@ pub enum AuthzDecision {
     },
 }
 
-/// AuthZEN-style evaluation request (per IETF AuthZEN WG draft).
-#[derive(Debug, Serialize, Deserialize)]
+/// AuthZEN Access Evaluation request
+/// ([Authorization API 1.0](https://openid.net/specs/authorization-api-1_0.html)).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthzEvalRequest {
-    /// The agent or principal being evaluated.
+    /// The principal being evaluated.
     pub subject: AuthzSubject,
     /// The action being requested.
     pub action: AuthzAction,
     /// The resource being acted upon.
     pub resource: AuthzResource,
+    /// Environment of the request (session, missions, time).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<serde_json::Value>,
 }
 
 /// Subject of an authorization evaluation.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthzSubject {
-    /// Subject identifier (e.g. `agent:billing`).
+    /// Subject identifier (the human principal, e.g. `user:alice@corp.com`).
     pub id: String,
-    /// Subject type (e.g. `agent`, `user`).
+    /// Subject type (e.g. `user`, `agent`).
     #[serde(rename = "type")]
     pub subject_type: String,
-    /// Additional subject properties.
+    /// Additional subject properties (the acting agent, scopes, issuer).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub properties: Option<serde_json::Value>,
 }
 
 /// Action being evaluated.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthzAction {
     /// Action name (the resolved business intent).
     pub name: String,
@@ -135,31 +145,26 @@ pub struct AuthzAction {
 }
 
 /// Resource being acted upon.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthzResource {
     /// Resource identifier (typically the tool name).
     pub id: String,
     /// Resource type (e.g. `tool`).
     #[serde(rename = "type")]
     pub resource_type: String,
+    /// Additional resource properties (the backend serving the tool).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub properties: Option<serde_json::Value>,
 }
 
 /// AuthZEN evaluation response.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthzEvalResponse {
     /// `true` if the action is permitted.
     pub decision: bool,
-    /// Additional context for the decision.
+    /// Additional context for the decision. Its shape is PDP-specific.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context: Option<AuthzContext>,
-}
-
-/// Additional context in an AuthZEN response.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct AuthzContext {
-    /// Human-readable reason for the decision.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
+    pub context: Option<serde_json::Value>,
 }
 
 /// JWT `typ` of intent tokens. A distinct explicit type (RFC 8725 §3.11)
@@ -167,26 +172,63 @@ pub struct AuthzContext {
 /// are signed by the same exchange key and carry the backend as `aud`.
 pub const INTENT_TOKEN_TYP: &str = "av-intent+jwt";
 
+/// The acting agent inside an intent token (RFC 8693 `act` shape).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntentActor {
+    /// The calling agent's `instance_uid`.
+    pub sub: String,
+}
+
 /// Claims inside a signed intent token.
 #[derive(Debug, Serialize, Deserialize)]
 #[allow(missing_docs)]
 pub struct IntentClaims {
     pub iss: String,
     pub aud: String,
+    /// The human principal the call is attributable to (the caller token's
+    /// `sub`), or the caller's instance id when no identity was validated.
     pub sub: String,
+    /// The calling agent, when an identity was validated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub act: Option<IntentActor>,
     pub tool: String,
     pub intent: String,
+    /// Ids of the missions that constrained this call.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missions: Vec<String>,
     pub iat: u64,
     pub exp: u64,
     pub jti: String,
 }
 
+/// What the policy decision point knows about the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CallerFacts<'a> {
+    /// The calling agent's `instance_uid` (`anonymous` without identity).
+    pub instance_uid: &'a str,
+    /// The calling agent's charter.
+    pub charter: &'a str,
+    /// The human principal (`sub`), when an identity was validated.
+    pub subject: Option<&'a str>,
+}
+
+impl CallerFacts<'static> {
+    /// Facts for a request without a validated identity.
+    pub const ANONYMOUS: Self = Self {
+        instance_uid: "anonymous",
+        charter: "anonymous",
+        subject: None,
+    };
+}
+
 /// The local policy decision point. Evaluates tool calls against the
-/// intent map and the active mission.
+/// intent map, the global mission, and every per-agent mission that
+/// selects the caller.
 pub struct PolicyDecisionPoint {
     intent_map: BTreeMap<String, String>,
     require_mapping: bool,
     mission: Option<MissionConfig>,
+    missions: Vec<MissionConfig>,
     intent_token_ttl_s: u64,
     issuer: String,
     signer: Option<Arc<TokenSigner>>,
@@ -199,15 +241,36 @@ impl PolicyDecisionPoint {
             intent_map: config.intent_map.clone(),
             require_mapping: config.require_intent_mapping,
             mission: config.mission.clone(),
+            missions: config.missions.clone(),
             intent_token_ttl_s: config.intent_token_ttl_s,
             issuer: config.audience.clone(),
             signer,
         }
     }
 
-    /// Decide whether `tool` may run at `now_s`. Signs nothing, so the
-    /// pipeline can run it before the budget is charged.
+    /// Every mission that constrains `caller`: the global mission, then
+    /// each `[[missions]]` entry whose selectors match.
+    pub fn applicable_missions<'s>(&'s self, caller: &CallerFacts<'_>) -> Vec<&'s MissionConfig> {
+        self.mission
+            .iter()
+            .chain(
+                self.missions
+                    .iter()
+                    .filter(|mission| mission.selects(caller.instance_uid, caller.charter, caller.subject)),
+            )
+            .collect()
+    }
+
+    /// Decide whether `tool` may run at `now_s` for a caller without a
+    /// validated identity. Signs nothing.
     pub fn decide(&self, tool: &str, now_s: u64) -> AuthzDecision {
+        self.decide_for(tool, now_s, &CallerFacts::ANONYMOUS)
+    }
+
+    /// Decide whether `tool` may run at `now_s` for `caller`. Signs
+    /// nothing, so the pipeline can run it before the budget is charged.
+    /// Missions only narrow: every applicable mission must allow the call.
+    pub fn decide_for(&self, tool: &str, now_s: u64, caller: &CallerFacts<'_>) -> AuthzDecision {
         // Step 1: resolve intent from tool name.
         let intent = match self.intent_map.get(tool) {
             Some(intent) => intent.clone(),
@@ -222,8 +285,8 @@ impl PolicyDecisionPoint {
             }
         };
 
-        // Step 2: check mission constraints.
-        if let Some(mission) = &self.mission {
+        // Step 2: check every applicable mission.
+        for mission in self.applicable_missions(caller) {
             if now_s >= mission.expires_at {
                 return AuthzDecision::Deny {
                     code: DenialCode::MissionExpired,
@@ -254,31 +317,35 @@ impl PolicyDecisionPoint {
     }
 
     /// Sign a short-lived intent token for a permitted call, bound to the
-    /// backend that receives it. `None` when no signer is configured.
+    /// backend that receives it. `sub` is the human principal and `act.sub`
+    /// the calling agent; the token never outlives an applicable mission.
+    /// `None` when no signer is configured.
     pub fn mint_intent_token(
         &self,
         tool: &str,
         intent: &str,
-        subject: &str,
+        caller: &CallerFacts<'_>,
         audience: &str,
         now_s: u64,
     ) -> Option<String> {
         let signer = self.signer.as_ref()?;
+        let missions = self.applicable_missions(caller);
+        let exp = missions
+            .iter()
+            .map(|mission| mission.expires_at)
+            .fold(now_s.saturating_add(self.intent_token_ttl_s), u64::min);
         let claims = IntentClaims {
             iss: self.issuer.clone(),
             aud: audience.to_owned(),
-            sub: subject.to_owned(),
+            sub: caller.subject.unwrap_or(caller.instance_uid).to_owned(),
+            act: caller.subject.map(|_| IntentActor {
+                sub: caller.instance_uid.to_owned(),
+            }),
             tool: tool.to_owned(),
             intent: intent.to_owned(),
+            missions: missions.iter().map(|mission| mission.id.clone()).collect(),
             iat: now_s,
-            exp: self
-                .mission
-                .as_ref()
-                .map_or(now_s.saturating_add(self.intent_token_ttl_s), |mission| {
-                    now_s
-                        .saturating_add(self.intent_token_ttl_s)
-                        .min(mission.expires_at)
-                }),
+            exp,
             jti: av_core::ids::new_event_uid(),
         };
         match signer.sign_with_typ(&claims, INTENT_TOKEN_TYP) {
@@ -316,10 +383,123 @@ mod tests {
                 .collect(),
             require_mapping: require,
             mission,
+            missions: Vec::new(),
             intent_token_ttl_s: 60,
             issuer: "agentvisor-ai".into(),
             signer: None,
         }
+    }
+
+    fn facts() -> CallerFacts<'static> {
+        CallerFacts {
+            instance_uid: "inst-1",
+            charter: "support",
+            subject: Some("user:alice@corp.com"),
+        }
+    }
+
+    fn agent_mission(id: &str, intents: &[&str], expires_at: u64) -> MissionConfig {
+        MissionConfig {
+            id: id.into(),
+            allowed_intents: intents.iter().map(|intent| (*intent).to_owned()).collect(),
+            expires_at,
+            agents: vec!["inst-1".into()],
+            charters: Vec::new(),
+            subjects: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn per_agent_missions_narrow_only_the_agents_they_select() {
+        let mut p = pdp(
+            &[("db_write", "data.mutate"), ("search", "data.read")],
+            false,
+            None,
+        );
+        p.missions = vec![agent_mission("read-only", &["data.read"], 5000)];
+        let selected = facts();
+        let other = CallerFacts {
+            instance_uid: "inst-2",
+            ..facts()
+        };
+        assert!(matches!(
+            p.decide_for("db_write", 1000, &selected),
+            AuthzDecision::Deny {
+                code: DenialCode::MissionDenied,
+                ..
+            }
+        ));
+        assert!(matches!(
+            p.decide_for("search", 1000, &selected),
+            AuthzDecision::Permit { .. }
+        ));
+        assert!(
+            matches!(
+                p.decide_for("db_write", 1000, &other),
+                AuthzDecision::Permit { .. }
+            ),
+            "an unselected agent is not narrowed by another agent's mission"
+        );
+        assert!(
+            matches!(p.decide("db_write", 1000), AuthzDecision::Permit { .. }),
+            "an anonymous caller matches no per-agent mission"
+        );
+    }
+
+    #[test]
+    fn global_and_per_agent_missions_must_both_allow() {
+        let global = MissionConfig {
+            id: "global".into(),
+            allowed_intents: vec!["data.read".into(), "data.mutate".into()],
+            expires_at: 5000,
+            agents: Vec::new(),
+            charters: Vec::new(),
+            subjects: Vec::new(),
+        };
+        let mut p = pdp(
+            &[("db_write", "data.mutate"), ("search", "data.read")],
+            false,
+            Some(global),
+        );
+        p.missions = vec![agent_mission("expiring", &["data.read"], 1500)];
+        assert!(matches!(
+            p.decide_for("search", 1000, &facts()),
+            AuthzDecision::Permit { .. }
+        ));
+        assert!(matches!(
+            p.decide_for("search", 1500, &facts()),
+            AuthzDecision::Deny {
+                code: DenialCode::MissionExpired,
+                ..
+            }
+        ));
+        let signer = Arc::new(TokenSigner::from_seed(&[93; 32]));
+        p.signer = Some(Arc::clone(&signer));
+        let token = p
+            .mint_intent_token("search", "data.read", &facts(), "db", 1000)
+            .unwrap();
+        let claims = verify_intent_token(&signer, &token).claims;
+        assert_eq!(claims.missions, vec!["global".to_owned(), "expiring".to_owned()]);
+        assert_eq!(
+            claims.exp, 1060,
+            "min(now + ttl, every applicable mission expiry)"
+        );
+    }
+
+    #[test]
+    fn mission_selectors_require_every_set_selector() {
+        let mission = MissionConfig {
+            id: "m".into(),
+            allowed_intents: vec!["x".into()],
+            expires_at: 1,
+            agents: Vec::new(),
+            charters: vec!["support".into()],
+            subjects: vec!["user:alice@corp.com".into()],
+        };
+        assert!(mission.selects("any", "support", Some("user:alice@corp.com")));
+        assert!(!mission.selects("any", "support", Some("user:bob@corp.com")));
+        assert!(!mission.selects("any", "billing", Some("user:alice@corp.com")));
+        assert!(!mission.selects("any", "support", None));
     }
 
     fn verify_intent_token(signer: &TokenSigner, jwt: &str) -> jsonwebtoken::TokenData<IntentClaims> {
@@ -364,6 +544,9 @@ mod tests {
             id: "m-1".into(),
             allowed_intents: vec!["data.mutate".into()],
             expires_at: 500,
+            agents: Vec::new(),
+            charters: Vec::new(),
+            subjects: Vec::new(),
         };
         let p = pdp(&[("db_write", "data.mutate")], false, Some(mission));
         match p.decide("db_write", 1000) {
@@ -386,6 +569,9 @@ mod tests {
             id: "m-2".into(),
             allowed_intents: vec!["data.read".into()],
             expires_at: 2000,
+            agents: Vec::new(),
+            charters: Vec::new(),
+            subjects: Vec::new(),
         };
         let p = pdp(&[("db_write", "data.mutate")], false, Some(mission));
         match p.decide("db_write", 1000) {
@@ -400,6 +586,9 @@ mod tests {
             id: "m-3".into(),
             allowed_intents: vec!["data.mutate".into()],
             expires_at: 2000,
+            agents: Vec::new(),
+            charters: Vec::new(),
+            subjects: Vec::new(),
         };
         let p = pdp(&[("db_write", "data.mutate")], false, Some(mission));
         match p.decide("db_write", 1000) {
@@ -414,12 +603,15 @@ mod tests {
             id: "m-ttl".into(),
             allowed_intents: vec!["data.mutate".into()],
             expires_at: 1001,
+            agents: Vec::new(),
+            charters: Vec::new(),
+            subjects: Vec::new(),
         };
         let mut policy = pdp(&[("db_write", "data.mutate")], false, Some(mission));
         let signer = Arc::new(TokenSigner::from_seed(&[94; 32]));
         policy.signer = Some(Arc::clone(&signer));
         let token = policy
-            .mint_intent_token("db_write", "data.mutate", "caller", "db", 1000)
+            .mint_intent_token("db_write", "data.mutate", &CallerFacts::ANONYMOUS, "db", 1000)
             .unwrap();
         let claims = verify_intent_token(&signer, &token).claims;
         assert_eq!(claims.iat, 1000);
@@ -430,7 +622,7 @@ mod tests {
     fn intent_token_none_without_signer() {
         let p = pdp(&[("search", "data.read")], false, None);
         assert!(
-            p.mint_intent_token("search", "data.read", "inst-1", "backend-a", 1000)
+            p.mint_intent_token("search", "data.read", &facts(), "backend-a", 1000)
                 .is_none(),
             "no signer → no intent token"
         );
@@ -442,7 +634,7 @@ mod tests {
         let mut p = pdp(&[("search", "data.read")], false, None);
         p.signer = Some(Arc::clone(&signer));
         let jwt = p
-            .mint_intent_token("search", "data.read", "inst-1", "backend-a", 1000)
+            .mint_intent_token("search", "data.read", &facts(), "backend-a", 1000)
             .expect("signer present → must produce JWT");
         let header = jsonwebtoken::decode_header(&jwt).unwrap();
         assert_eq!(header.alg, jsonwebtoken::Algorithm::EdDSA);
@@ -451,7 +643,12 @@ mod tests {
         let decoded = verify_intent_token(&signer, &jwt);
         assert_eq!(decoded.claims.iss, "agentvisor-ai");
         assert_eq!(decoded.claims.aud, "backend-a");
-        assert_eq!(decoded.claims.sub, "inst-1");
+        assert_eq!(decoded.claims.sub, "user:alice@corp.com", "sub is the human");
+        assert_eq!(
+            decoded.claims.act,
+            Some(IntentActor { sub: "inst-1".into() }),
+            "act.sub is the calling agent"
+        );
         assert_eq!(decoded.claims.tool, "search");
         assert_eq!(decoded.claims.intent, "data.read");
         assert_eq!(decoded.claims.iat, 1000);
@@ -465,10 +662,10 @@ mod tests {
         p.signer = Some(Arc::new(TokenSigner::from_seed(&[98u8; 32])));
         let signer = p.signer.clone().unwrap();
         let a = p
-            .mint_intent_token("search", "data.read", "inst-1", "backend-a", 1000)
+            .mint_intent_token("search", "data.read", &facts(), "backend-a", 1000)
             .unwrap();
         let b = p
-            .mint_intent_token("search", "data.read", "inst-1", "backend-a", 1000)
+            .mint_intent_token("search", "data.read", &facts(), "backend-a", 1000)
             .unwrap();
         assert_ne!(
             verify_intent_token(&signer, &a).claims.jti,
@@ -507,7 +704,9 @@ mod tests {
             resource: AuthzResource {
                 id: "db_write".into(),
                 resource_type: "tool".into(),
+                properties: None,
             },
+            context: None,
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["subject"]["id"], "agent:billing");

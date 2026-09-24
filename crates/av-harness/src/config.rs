@@ -216,6 +216,12 @@ pub struct HarnessConfig {
     /// `parent_token` chain links and `act` claim nesting. Defaults to 4.
     #[serde(default = "default_max_delegation_depth")]
     pub max_delegation_depth: usize,
+    /// Regular expression every validated token's `sub` must match, so
+    /// each agent identity is attributable to a human principal (for
+    /// example `^user:`). Tokens whose subject does not match are refused
+    /// with 401. Unset (the default) accepts any subject.
+    #[serde(default)]
+    pub identity_human_subject_pattern: Option<String>,
 
     /// Enforce operation scopes on validated identities.
     ///
@@ -434,6 +440,31 @@ pub struct HarnessConfig {
     #[serde(default)]
     pub backends: Vec<BackendConfig>,
 
+    /// Refuse to connect to any tool backend (including `tool_upstream_url`)
+    /// whose address is not private: loopback, RFC 1918, shared (RFC 6598),
+    /// link-local, or IPv6 unique-local. Host names are resolved and checked
+    /// on every connection; IP literals are checked at boot. The LLM
+    /// upstream and the AuthZEN PDP are not affected.
+    #[serde(default)]
+    pub require_private_backends: bool,
+
+    /// Wire protocol for the implicit backend built from
+    /// `tool_upstream_url`. Defaults to `json_rpc` (one plain JSON-RPC POST
+    /// per call, the historical behavior); set `mcp` when that upstream is
+    /// an MCP Streamable HTTP server. `[[backends]]` entries choose their
+    /// own `transport` and default to `mcp`.
+    #[serde(default = "default_tool_upstream_transport")]
+    pub tool_upstream_transport: BackendTransport,
+
+    /// Browser origins allowed to call the MCP endpoints. The MCP
+    /// Streamable HTTP transport requires servers to refuse requests whose
+    /// `Origin` header is present and not allowed (DNS-rebinding defense).
+    /// Agents run server-side and send no `Origin`, so the default (empty)
+    /// refuses every request that carries one. Entries are exact origins,
+    /// for example `https://console.example.com`.
+    #[serde(default)]
+    pub mcp_allowed_origins: Vec<String>,
+
     // ── Pillar 2: intent mapping / AuthZEN ───────────────────────────
     /// Tool-name → business-intent mapping. An unmapped tool is refused
     /// with `UNMAPPED_TOOL` when `require_intent_mapping` is true.
@@ -452,10 +483,34 @@ pub struct HarnessConfig {
     #[serde(default)]
     pub mission: Option<MissionConfig>,
 
+    /// Per-agent missions (TOML `[[missions]]`). Each entry names the
+    /// agents, charters, or human principals it applies to. A call must
+    /// satisfy the global `[mission]` and every mission that selects its
+    /// caller, so missions only ever narrow the static policy.
+    #[serde(default)]
+    pub missions: Vec<MissionConfig>,
+
     /// Intent token TTL in seconds. Defaults to 60 (the AuthZEN
     /// recommendation for short-lived per-call tokens).
     #[serde(default = "default_intent_token_ttl")]
     pub intent_token_ttl_s: u64,
+
+    /// Platform workload identity (TOML `[workload_identity]`): accept RFC
+    /// 7523 assertions signed with a Cloud Foundry instance identity at
+    /// `/v1/token` and issue agent tokens to the registered workloads.
+    #[serde(default)]
+    pub workload_identity: Option<WorkloadIdentityConfig>,
+
+    /// Workloads that may obtain agent tokens (TOML `[[workload_identities]]`).
+    /// Each names the human principal its agents act for.
+    #[serde(default)]
+    pub workload_identities: Vec<WorkloadMapping>,
+
+    /// External AuthZEN policy decision point consulted on every tool call
+    /// after the local intent and mission checks permit it (TOML
+    /// `[authzen]`). Both must permit. Unreachable PDP → 503.
+    #[serde(default)]
+    pub authzen: Option<AuthzenConfig>,
 
     // ── Pillar 3: token exchange ─────────────────────────────────────
     /// Enable the RFC 8693 token exchange endpoint at
@@ -498,6 +553,14 @@ pub struct HarnessConfig {
     /// Owner-only permissions enforced on Unix.
     #[serde(default)]
     pub otel_tenant_auth_file: Option<String>,
+
+    /// What the tenant OTEL endpoint receives beyond request metadata.
+    /// `redacted` (the default) also exports every audited step as an
+    /// OpenTelemetry GenAI span with its content (prompts, outputs, tool
+    /// arguments and results), after redaction; `off` exports metadata
+    /// spans only. Content never goes to the operational collector.
+    #[serde(default)]
+    pub otel_tenant_content: TenantContent,
 
     /// Sensitive-data redaction patterns (regex). Applied to event
     /// payloads and ATIF step fields before journal write.
@@ -549,6 +612,45 @@ pub struct BackendConfig {
     /// as the default for unmapped tools.
     #[serde(default)]
     pub tools: Vec<String>,
+    /// Wire protocol spoken to this backend. `mcp` (the default) is the
+    /// MCP Streamable HTTP transport: an `initialize` handshake per agent
+    /// session, `MCP-Session-Id` and `MCP-Protocol-Version` headers, and
+    /// SSE responses. `json_rpc` sends one plain JSON-RPC POST per call.
+    #[serde(default)]
+    pub transport: BackendTransport,
+}
+
+/// Wire protocol spoken to a tool backend.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendTransport {
+    /// MCP Streamable HTTP (protocol versions 2024-11-05 through 2025-11-25).
+    #[default]
+    Mcp,
+    /// One plain JSON-RPC 2.0 POST per call, no MCP session handshake.
+    JsonRpc,
+}
+
+fn default_tool_upstream_transport() -> BackendTransport {
+    BackendTransport::JsonRpc
+}
+
+/// An allowed browser origin is `scheme://host[:port]` with no path,
+/// query, fragment, or credentials (RFC 6454 serialization).
+pub(crate) fn validate_origin(origin: &str) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(origin).map_err(|_| "not a valid origin".to_owned())?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none_or(str::is_empty) {
+        return Err("must be an http:// or https:// origin with a host".to_owned());
+    }
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || origin.trim_end_matches('/') != parsed.origin().ascii_serialization()
+    {
+        return Err("must be exactly scheme://host[:port], without path, query, or credentials".to_owned());
+    }
+    Ok(())
 }
 
 /// Authentication mode for a backend.
@@ -566,6 +668,12 @@ pub enum BackendAuth {
     /// the harness's token exchange service. The exchanged token
     /// carries `aud` set to this backend's name.
     Exchange,
+    /// Forward the caller's own validated bearer token to this backend,
+    /// and to no other. Requires `require_identity = true`. The backend
+    /// receives a token whose audience is the gateway, so it could replay
+    /// that token against the gateway; use it only for backends you trust
+    /// as much as the gateway, and prefer `exchange` otherwise.
+    ForwardToken,
 }
 
 /// Mission configuration: narrows the static policy for a time window.
@@ -580,6 +688,129 @@ pub struct MissionConfig {
     /// Mission expiry as epoch seconds. After this time, all tool calls
     /// are refused with `MISSION_EXPIRED`.
     pub expires_at: u64,
+    /// `[[missions]]` only: agents (token `instance_uid`) this mission
+    /// applies to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agents: Vec<String>,
+    /// `[[missions]]` only: agent charters this mission applies to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub charters: Vec<String>,
+    /// `[[missions]]` only: human principals (token `sub`) this mission
+    /// applies to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subjects: Vec<String>,
+}
+
+impl MissionConfig {
+    /// True when at least one selector is set (a per-agent mission).
+    pub fn has_selectors(&self) -> bool {
+        !self.agents.is_empty() || !self.charters.is_empty() || !self.subjects.is_empty()
+    }
+
+    /// True when this per-agent mission applies to the caller: every set
+    /// selector must match. A mission without selectors selects nobody
+    /// here (the global `[mission]` applies to everyone by itself).
+    pub fn selects(&self, instance_uid: &str, charter: &str, subject: Option<&str>) -> bool {
+        self.has_selectors()
+            && (self.agents.is_empty() || self.agents.iter().any(|agent| agent == instance_uid))
+            && (self.charters.is_empty() || self.charters.iter().any(|name| name == charter))
+            && (self.subjects.is_empty() || subject.is_some_and(|sub| self.subjects.iter().any(|s| s == sub)))
+    }
+}
+
+/// `[workload_identity]` settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkloadIdentityConfig {
+    /// PEM bundle of the platform's instance-identity root CA certificates.
+    pub ca_file: String,
+    /// Lifetime of issued agent tokens in seconds (60 to 900, default 300).
+    #[serde(default = "default_workload_token_ttl")]
+    pub token_ttl_s: u64,
+}
+
+fn default_workload_token_ttl() -> u64 {
+    300
+}
+
+/// One `[[workload_identities]]` entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkloadMapping {
+    /// Unique name (metrics and logs).
+    pub name: String,
+    /// Cloud Foundry app GUID the instance must belong to.
+    #[serde(default)]
+    pub cf_app_guid: Option<String>,
+    /// Cloud Foundry space GUID the instance must belong to.
+    #[serde(default)]
+    pub cf_space_guid: Option<String>,
+    /// Cloud Foundry organization GUID the instance must belong to.
+    #[serde(default)]
+    pub cf_org_guid: Option<String>,
+    /// The human principal the workload's agents act for (token `sub`).
+    pub sub: String,
+    /// Agent charter recorded in the token and every audit event.
+    pub charter: String,
+    /// Agent version recorded in the token.
+    #[serde(default = "default_workload_version")]
+    pub version: String,
+    /// Scopes granted to the workload's agents.
+    pub scopes: Vec<String>,
+}
+
+fn default_workload_version() -> String {
+    "1".to_owned()
+}
+
+impl WorkloadMapping {
+    /// True when every set selector matches the proven identity.
+    pub fn selects(&self, identity: &av_identity::CfInstanceIdentity) -> bool {
+        let matches =
+            |expected: &Option<String>, actual: &str| expected.as_deref().is_none_or(|value| value == actual);
+        (self.cf_app_guid.is_some() || self.cf_space_guid.is_some() || self.cf_org_guid.is_some())
+            && matches(&self.cf_app_guid, &identity.app_guid)
+            && matches(&self.cf_space_guid, &identity.space_guid)
+            && matches(&self.cf_org_guid, &identity.org_guid)
+    }
+}
+
+/// Content exported to the tenant OTEL endpoint.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TenantContent {
+    /// Full step content as GenAI spans, redacted before export.
+    #[default]
+    Redacted,
+    /// Request metadata spans only.
+    Off,
+}
+
+/// External AuthZEN policy decision point
+/// ([Authorization API 1.0](https://openid.net/specs/authorization-api-1_0.html)).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthzenConfig {
+    /// Access Evaluation endpoint, e.g.
+    /// `https://pdp.example.com/access/v1/evaluation`.
+    pub evaluation_endpoint: String,
+    /// Optional Access Evaluations (batch) endpoint, e.g.
+    /// `https://pdp.example.com/access/v1/evaluations`, used to filter
+    /// `tools/list` in one request. Without it, `tools/list` sends one
+    /// evaluation per tool.
+    #[serde(default)]
+    pub evaluations_endpoint: Option<String>,
+    /// File holding a bearer token for the PDP (owner-only permissions).
+    #[serde(default)]
+    pub auth_file: Option<String>,
+    /// Per-request timeout in milliseconds (1 to 10 000, default 1 000).
+    /// A timeout or error refuses the call with 503 (fail closed).
+    #[serde(default = "default_authzen_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+fn default_authzen_timeout_ms() -> u64 {
+    1_000
 }
 
 fn default_max_delegation_depth() -> usize {
@@ -2028,6 +2259,141 @@ impl HarnessConfig {
                 "intent_token_ttl_s exceeds the 900 s ceiling; intent tokens must be short-lived".into(),
             );
         }
+        let mut mission_ids = std::collections::HashSet::new();
+        for mission in self.mission.iter().chain(&self.missions) {
+            if !mission_ids.insert(mission.id.as_str()) {
+                errors.push(format!("mission id {:?} is used more than once", mission.id));
+            }
+        }
+        if self.mission.as_ref().is_some_and(MissionConfig::has_selectors) {
+            errors.push(
+                "[mission] applies to every caller and takes no agents/charters/subjects; \
+                 put per-agent missions in [[missions]]"
+                    .into(),
+            );
+        }
+        for mission in &self.missions {
+            if !mission.has_selectors() {
+                errors.push(format!(
+                    "[[missions]] entry {:?} has no agents, charters, or subjects; use [mission] \
+                     for a mission that applies to every caller",
+                    mission.id
+                ));
+            }
+            if mission.allowed_intents.is_empty() {
+                errors.push(format!(
+                    "mission {:?} has no allowed_intents; every call would be denied",
+                    mission.id
+                ));
+            }
+        }
+        if let Some(workload) = &self.workload_identity {
+            if workload.ca_file.trim().is_empty() {
+                errors.push("workload_identity.ca_file must not be empty".into());
+            }
+            if !(60..=900).contains(&workload.token_ttl_s) {
+                errors.push("workload_identity.token_ttl_s must be between 60 and 900".into());
+            }
+            if self.token_exchange_seed_file.is_none() {
+                errors.push(
+                    "[workload_identity] requires token_exchange_seed_file: the gateway signs agent \
+                     tokens with that key"
+                        .into(),
+                );
+            }
+            if self.workload_identities.is_empty() {
+                errors
+                    .push("[workload_identity] is set but no [[workload_identities]] are registered".into());
+            }
+        } else if !self.workload_identities.is_empty() {
+            errors.push("[[workload_identities]] requires [workload_identity]".into());
+        }
+        // The same rule the identity validator applies at request time.
+        let human = self
+            .identity_human_subject_pattern
+            .as_deref()
+            .and_then(|pattern| {
+                let mut validator = av_identity::IdentityValidator::new(&self.audience);
+                validator
+                    .set_human_subject_pattern(pattern)
+                    .ok()
+                    .map(|()| validator)
+            });
+        let mut workload_names = std::collections::HashSet::new();
+        for workload in &self.workload_identities {
+            if !workload_names.insert(workload.name.as_str()) {
+                errors.push(format!(
+                    "workload name {:?} is used more than once",
+                    workload.name
+                ));
+            }
+            if workload.name.is_empty()
+                || !workload
+                    .name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+            {
+                errors.push(format!(
+                    "workload name {:?} must be ASCII letters, digits, '-', '_', or '.'",
+                    workload.name
+                ));
+            }
+            if workload.cf_app_guid.is_none()
+                && workload.cf_space_guid.is_none()
+                && workload.cf_org_guid.is_none()
+            {
+                errors.push(format!(
+                    "workload {:?} needs cf_app_guid, cf_space_guid, or cf_org_guid",
+                    workload.name
+                ));
+            }
+            if workload.sub.trim().is_empty() {
+                errors.push(format!(
+                    "workload {:?} needs `sub`: the human principal its agents act for",
+                    workload.name
+                ));
+            } else if human
+                .as_ref()
+                .is_some_and(|validator| !validator.subject_is_human(&workload.sub))
+            {
+                errors.push(format!(
+                    "workload {:?} sub {:?} does not match identity_human_subject_pattern",
+                    workload.name, workload.sub
+                ));
+            }
+            if workload.charter.trim().is_empty() || workload.scopes.is_empty() {
+                errors.push(format!(
+                    "workload {:?} needs a charter and at least one scope",
+                    workload.name
+                ));
+            }
+        }
+        if let Some(authzen) = &self.authzen {
+            for (field, endpoint) in
+                std::iter::once(("authzen.evaluation_endpoint", Some(&authzen.evaluation_endpoint))).chain(
+                    std::iter::once((
+                        "authzen.evaluations_endpoint",
+                        authzen.evaluations_endpoint.as_ref(),
+                    )),
+                )
+            {
+                if let Some(endpoint) = endpoint {
+                    if let Err(error) = crate::backend::validate_http_endpoint(endpoint, field) {
+                        errors.push(error);
+                    }
+                }
+            }
+            if !(1..=10_000).contains(&authzen.timeout_ms) {
+                errors.push("authzen.timeout_ms must be between 1 and 10000".into());
+            }
+            if authzen
+                .auth_file
+                .as_deref()
+                .is_some_and(|path| path.trim().is_empty())
+            {
+                errors.push("authzen.auth_file must not be empty".into());
+            }
+        }
         if let Some(ref mission) = self.mission {
             let now_s = av_core::time::now_ms() / 1000;
             if mission.expires_at <= now_s {
@@ -2116,7 +2482,54 @@ impl HarnessConfig {
                     .into(),
             );
         }
+        if self
+            .backends
+            .iter()
+            .any(|b| matches!(b.auth, BackendAuth::ForwardToken))
+            && !self.require_identity
+        {
+            errors.push(
+                "a backend uses auth = \"forward_token\" but require_identity is false; \
+                 only a validated caller token may be forwarded to a backend"
+                    .into(),
+            );
+        }
+        if let Some(pattern) = &self.identity_human_subject_pattern {
+            if let Err(error) =
+                av_identity::IdentityValidator::new(&self.audience).set_human_subject_pattern(pattern)
+            {
+                errors.push(format!("identity_human_subject_pattern: {error}"));
+            }
+        }
+        for origin in &self.mcp_allowed_origins {
+            if let Err(error) = validate_origin(origin) {
+                errors.push(format!("mcp_allowed_origins entry {origin:?}: {error}"));
+            }
+        }
         errors.extend(crate::backend::validate_configs(&self.backends));
+        if self.require_private_backends {
+            for (field, url) in self
+                .backends
+                .iter()
+                .map(|backend| (format!("backend {:?} url", backend.name), backend.url.as_str()))
+                .chain(
+                    self.tool_upstream_url
+                        .iter()
+                        .map(|url| ("tool_upstream_url".to_owned(), url.as_str())),
+                )
+            {
+                if let Err(error) = crate::backend::validate_private_endpoint(url, &field) {
+                    errors.push(error);
+                }
+            }
+        }
+        if self.backends.iter().any(|backend| backend.name == self.audience) {
+            errors.push(format!(
+                "a backend is named {:?}, the same as `audience`; tokens this gateway signs for that \
+                 backend would also be valid inbound identities, so choose another name",
+                self.audience
+            ));
+        }
         if !self.redaction_patterns.is_empty() || !self.redaction_paths.is_empty() {
             if let Err(error) = av_redact::RedactionEngine::new(av_redact::RedactionConfig {
                 regex_patterns: self.redaction_patterns.clone(),
@@ -2270,6 +2683,7 @@ mod tests {
                 url: url.into(),
                 auth: BackendAuth::None,
                 tools: tools.into_iter().map(str::to_owned).collect(),
+                transport: Default::default(),
             }];
             assert!(config.validate().unwrap_err().contains(expected));
         }
@@ -2328,6 +2742,7 @@ mod tests {
             url: "http://db".into(),
             auth: BackendAuth::None,
             tools: vec![],
+            transport: Default::default(),
         }];
         config.operator_tokens = vec![OperatorTokenConfig {
             name: "operator".into(),
@@ -2382,6 +2797,7 @@ mod tests {
                 url: format!("http://{name}"),
                 auth: BackendAuth::None,
                 tools: vec![name.into()],
+                transport: Default::default(),
             })
             .collect();
         config.operator_tokens = vec![OperatorTokenConfig {

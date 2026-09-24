@@ -1,5 +1,5 @@
 #!/bin/sh
-# CNB API 0.9: create a launch-only environment layer.
+# CNB API 0.9: create a launch-only layer with the client configuration.
 set -eu
 layers_dir=${CNB_LAYERS_DIR:-${1:-}}
 [ -n "$layers_dir" ] || { printf 'error: CNB_LAYERS_DIR is required\n' >&2; exit 1; }
@@ -8,16 +8,53 @@ export CNB_PLATFORM_DIR
 buildpack_dir=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 # shellcheck source=buildpack/lib/binding.sh
 . "$buildpack_dir/lib/binding.sh"
+# shellcheck source=buildpack/lib/outputs.sh
+. "$buildpack_dir/lib/outputs.sh"
 binding=$(read_binding)
 [ "$binding" != null ] || { printf 'error: no agentvisor binding found\n' >&2; exit 1; }
 layer=$layers_dir/agentvisor
 mkdir -p "$layer/env.launch"
-for pair in AV_GATEWAY_URL:gateway_url AV_AUDIENCE:audience AV_IDENTITY_JWKS_URL:identity_jwks_url; do
-    name=${pair%%:*}
-    key=${pair#*:}
-    # jq -j deliberately omits a trailing newline from environment values.
-    printf '%s' "$binding" | jq -j --arg key "$key" '.[$key] // ""' > "$layer/env.launch/$name.override"
+
+# In a Kubernetes pod the sidecar is a second container running this
+# image's `agentvisor-sidecar` process; containers share 127.0.0.1. The
+# image always offers that process when a sidecar binary is packaged, but
+# SDK traffic goes to loopback only when the binding says `sidecar: true`,
+# because nothing starts the second container automatically.
+# Not `//`: jq treats false like null there.
+choice=$(printf '%s' "$binding" | jq -r 'if .sidecar == null then "unset" else .sidecar end')
+sidecar=false
+packaged=false
+if [ "$choice" != false ]; then
+    binary=$(sidecar_binary)
+    if [ -n "$binary" ]; then
+        mkdir -p "$layer/bin"
+        cp "$binary" "$layer/bin/avctl"
+        chmod 755 "$layer/bin/avctl"
+        packaged=true
+        [ "$choice" = true ] && sidecar=true
+    elif [ "$choice" = true ]; then
+        printf 'agentvisor: this buildpack package has no sidecar binary for %s; the application must present its own identity token\n' "$(uname -m)"
+    fi
+fi
+base=$(client_base "$binding" "$sidecar")
+mcp_config "$binding" "$base" > "$layer/mcp.json"
+client_environment "$binding" "$base" "$layer/mcp.json" | while IFS= read -r line; do
+    # printf without a newline: environment values carry no trailing newline.
+    printf '%s' "${line#*=}" > "$layer/env.launch/${line%%=*}.override"
 done
+if [ "$sidecar" = true ]; then
+    # `.default` applies only when the variable is unset.
+    printf 'agentvisor-sidecar' > "$layer/env.launch/OPENAI_API_KEY.default"
+fi
+if [ "$packaged" = true ]; then
+    sidecar_config "$binding" token-file:/var/run/secrets/agentvisor/token > "$layer/sidecar.json"
+    jq -rn --arg avctl "$layer/bin/avctl" --arg config "$layer/sidecar.json" '
+        "[[processes]]",
+        "type = \"agentvisor-sidecar\"",
+        "command = [\($avctl | @json)]",
+        "args = [\"sidecar\", \"--config\", \($config | @json)]",
+        "default = false"' > "$layers_dir/launch.toml"
+fi
 cat > "$layers_dir/agentvisor.toml" <<'TOML'
 [types]
 build = false

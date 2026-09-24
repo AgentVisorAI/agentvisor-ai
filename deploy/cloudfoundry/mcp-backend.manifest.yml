@@ -1,0 +1,31 @@
+# Cloud Foundry manifest for an MCP server that only AgentVisor may reach.
+#
+# The backend maps ONLY an internal route: it has no public route through
+# the Gorouter, so nothing outside the foundation can call it. (An app
+# pushed with `no-route: true` has no route at all, internal ones included,
+# which leaves the gateway no DNS name to reach it by; the internal route
+# gives the same protection from the outside.) Container-to-container
+# traffic is denied by default, so after pushing, allow the gateway, and
+# only the gateway:
+#
+#   cf push -f deploy/cloudfoundry/mcp-backend.manifest.yml
+#   cf add-network-policy agentvisor-ai my-mcp-backend --port 8080 --protocol tcp
+#
+# Then add the backend to the gateway's harness.toml:
+#
+#   [[backends]]
+#   name = "my-mcp-backend"
+#   url = "http://my-mcp-backend.apps.internal:8080/mcp"
+#   auth = "exchange"
+#   tools = ["lookup_order"]
+#
+# and set `require_private_backends = true` so the gateway refuses to
+# connect to any backend address that is not private. Never add a network
+# policy from a client application to the backend.
+applications:
+- name: my-mcp-backend
+  instances: 1
+  memory: 256M
+  routes:
+  - route: my-mcp-backend.apps.internal
+  health-check-type: process

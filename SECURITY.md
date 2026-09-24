@@ -18,6 +18,12 @@ AgentVisor AI treats request bodies, JWTs, MCP arguments, upstream responses, ma
 - Bridge topics reject events that fail their declared JSON Schema.
 - Signing seeds use mode-0600 temporary files, exclusive atomic installation, file and parent `fsync`, and race-loser reload. The image build context and runtime copy exclude seed/key files.
 - Session ids are hashed before becoming spool filenames.
+- MCP session ids issued by `initialize` are HMAC-signed and bound to the caller's issuer and subject, so a leaked id is useless to another principal. Requests with a disallowed `Origin` are refused.
+- Backend credentials are chosen per backend: none, static, a per-call exchanged token limited to that backend and tool, or (`forward_token`) the caller's own token for that backend only. `require_private_backends` refuses tool connections to non-private addresses at every connection.
+- `identity_human_subject_pattern` refuses identities not attributable to a human. RFC 8693 actor tokens only narrow scopes, and revoking an actor revokes what it obtained.
+- The external AuthZEN PDP and every mission can only narrow the local policy; an unreachable PDP refuses calls (503).
+- Workload identity assertions must chain to the configured instance-identity CA with the clientAuth usage, verify with the certificate key, live at most 300 seconds, and are single-use per gateway instance (the replay cache is in memory, so with several replicas an intercepted assertion could be accepted once by each replica within its lifetime). Each registered workload names the human it acts for. `avctl sidecar` listens on loopback only.
+- Tenant telemetry content is redacted before export and uses an exporter separate from operational telemetry.
 
 ## Deployment
 

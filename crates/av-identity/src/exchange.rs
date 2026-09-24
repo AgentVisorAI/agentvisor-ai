@@ -7,11 +7,16 @@
 //! - `subject_token_type=urn:ietf:params:oauth:token-type:jwt`
 //! - `audience` — the target backend name
 //! - `scope` — requested scopes (space-separated, optional)
+//! - `actor_token` / `actor_token_type` — optional RFC 8693 §2.1 actor:
+//!   a validated NHI token naming the agent that will act
 //!
-//! The issued token preserves the original `sub` (human principal),
-//! places the agent identity in `act`, carries `azp` from the exchange
-//! client, and scopes = requested ∩ subject ∩ actor (intersection, never
-//! union).
+//! The issued token preserves the original `sub` (human principal) and
+//! records the acting agents in `act`, newest first. Without an actor
+//! token, `act.sub` and `azp` are the subject token's agent. With an actor
+//! token, `act.sub` and `azp` are the actor's agent and the subject's
+//! agent moves one level down (`act.act.sub`). Scopes are always an
+//! intersection, never a union: requested ∩ subject, and additionally
+//! ∩ actor when an actor token is present.
 
 use crate::claims::{ActorClaim, Audience, NhiClaims};
 use crate::revocation::{RevocationIdentity, RevocationStore, RevokedBy};
@@ -31,6 +36,10 @@ pub struct ExchangedClaims {
     pub claims: NhiClaims,
     /// Original identities, leaf first, for JTI and instance revocation.
     pub av_subject_tokens: Vec<RevocationIdentity>,
+    /// The RFC 8693 actor token's identity, when one was presented, so
+    /// revoking the actor also revokes every token it obtained.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub av_actor_tokens: Vec<RevocationIdentity>,
     /// Total delegation depth, including parent links removed during exchange.
     pub av_delegation_depth: usize,
 }
@@ -62,6 +71,12 @@ pub struct TokenExchangeRequest {
     /// Requested scopes (space-separated, optional).
     #[serde(default)]
     pub scope: Option<String>,
+    /// RFC 8693 actor token: a validated NHI token for the acting agent.
+    #[serde(default)]
+    pub actor_token: Option<String>,
+    /// Token type of the actor token (required when `actor_token` is set).
+    #[serde(default)]
+    pub actor_token_type: Option<String>,
 }
 
 /// Token exchange response.
@@ -122,6 +137,18 @@ pub enum ExchangeError {
     /// The requested audience is not a configured backend name.
     #[error("target audience {0:?} is not an allowed backend")]
     TargetNotAllowed(String),
+    /// The actor token is itself delegated; it must directly identify the
+    /// acting agent.
+    #[error("actor token must be an undelegated agent token")]
+    ActorNotDirect,
+}
+
+/// A validated RFC 8693 actor token.
+pub struct ExchangeActor<'a> {
+    /// The actor token's claims.
+    pub claims: &'a NhiClaims,
+    /// Verified identities of the actor token (a single root token).
+    pub chain: &'a [RevocationIdentity],
 }
 
 /// Compute the intersection of two scope sets, respecting wildcard rules.
@@ -187,7 +214,27 @@ pub struct ExchangeParams<'a> {
 /// chain, scopes to the intersection of requested and subject scopes,
 /// and narrows audience to the target backend.
 pub fn build_exchanged_claims(params: &ExchangeParams<'_>) -> Result<ExchangedClaims, ExchangeError> {
+    build_exchanged_claims_with_actor(params, None)
+}
+
+/// [`build_exchanged_claims`] with an optional RFC 8693 actor token. The
+/// actor must be an undelegated token; its scopes further narrow the
+/// result, its agent becomes `act.sub` and `azp`, the subject's agent
+/// becomes `act.act.sub`, and the delegation depth grows by two.
+pub fn build_exchanged_claims_with_actor(
+    params: &ExchangeParams<'_>,
+    actor: Option<&ExchangeActor<'_>>,
+) -> Result<ExchangedClaims, ExchangeError> {
     let subject = params.subject;
+    if let Some(actor) = actor {
+        if actor.claims.parent_token.is_some()
+            || actor.claims.act.is_some()
+            || actor.chain.len() != 1
+            || actor.chain.first() != Some(&RevocationIdentity::from(actor.claims))
+        {
+            return Err(ExchangeError::ActorNotDirect);
+        }
+    }
     if params.subject_chain.first() != Some(&RevocationIdentity::from(subject))
         || params.subject_chain.len().saturating_sub(1) > params.subject_delegation_depth
         || subject.act.as_ref().map_or(0, |a| 1 + a.depth()) > params.subject_delegation_depth
@@ -241,16 +288,30 @@ pub fn build_exchanged_claims(params: &ExchangeParams<'_>) -> Result<ExchangedCl
     {
         return Err(ExchangeError::InvalidScopes);
     }
-    let effective = scope_intersection(&requested, &subject.scopes);
+    let mut effective = scope_intersection(&requested, &subject.scopes);
+    if let Some(actor) = actor {
+        effective = scope_intersection(&effective, &actor.claims.scopes);
+    }
     if effective.is_empty() {
         return Err(ExchangeError::EmptyIntersection);
     }
 
-    let actor = ActorClaim {
+    let subject_agent = ActorClaim {
         sub: params.azp.to_owned(),
         act: subject.act.as_ref().map(|a| Box::new(a.clone())),
     };
-    let depth = params.subject_delegation_depth.saturating_add(1);
+    let (act, azp, links) = match actor {
+        None => (subject_agent, params.azp.to_owned(), 1_usize),
+        Some(actor) => (
+            ActorClaim {
+                sub: actor.claims.instance_uid.clone(),
+                act: Some(Box::new(subject_agent)),
+            },
+            actor.claims.instance_uid.clone(),
+            2,
+        ),
+    };
+    let depth = params.subject_delegation_depth.saturating_add(links);
     if depth > params.max_depth {
         return Err(ExchangeError::DelegationExceeded {
             depth,
@@ -261,7 +322,8 @@ pub fn build_exchanged_claims(params: &ExchangeParams<'_>) -> Result<ExchangedCl
     let exp = params
         .now_s
         .saturating_add(params.ttl_s.min(crate::MAX_TTL_SECS))
-        .min(subject.exp);
+        .min(subject.exp)
+        .min(actor.map_or(u64::MAX, |actor| actor.claims.exp));
     if exp <= params.now_s {
         return Err(ExchangeError::SubjectExpired);
     }
@@ -274,8 +336,8 @@ pub fn build_exchanged_claims(params: &ExchangeParams<'_>) -> Result<ExchangedCl
         nbf: Some(params.now_s.max(subject.nbf.unwrap_or(subject.iat))),
         exp,
         jti: av_core::ids::new_event_uid(),
-        azp: Some(params.azp.to_owned()),
-        act: Some(actor),
+        azp: Some(azp),
+        act: Some(act),
         instance_uid: subject.instance_uid.clone(),
         charter: subject.charter.clone(),
         version: subject.version.clone(),
@@ -286,6 +348,7 @@ pub fn build_exchanged_claims(params: &ExchangeParams<'_>) -> Result<ExchangedCl
     let exchanged = ExchangedClaims {
         claims,
         av_subject_tokens: params.subject_chain.to_vec(),
+        av_actor_tokens: actor.map(|actor| actor.chain.to_vec()).unwrap_or_default(),
         av_delegation_depth: depth,
     };
     // Leave room for base64url expansion, the JOSE header and Ed25519
@@ -389,19 +452,26 @@ pub fn verify_exchanged_token(
     {
         return Err(IdentityError::Verification("token is not yet active".into()));
     }
+    let act_links = token.act.as_ref().map_or(0, |a| 1 + a.depth());
     if token.av_subject_tokens.is_empty()
         || token.av_subject_tokens.len() > params.max_depth
+        || token.av_actor_tokens.len() > 1
         || token.av_delegation_depth == 0
         || token.av_delegation_depth > params.max_depth
-        || token.av_subject_tokens.len() > token.av_delegation_depth
-        || token.act.as_ref().map_or(0, |a| 1 + a.depth()) > token.av_delegation_depth
+        || token.av_subject_tokens.len().saturating_add(token.av_actor_tokens.len()) > token.av_delegation_depth
+        || act_links > token.av_delegation_depth
         || token.act.is_none()
+        // An actor-token exchange records the actor as `act.sub` above the
+        // subject's agent, so it always carries at least two act links.
+        || token.av_actor_tokens.first().is_some_and(|actor| {
+            act_links < 2 || token.act.as_ref().is_none_or(|act| act.sub != actor.instance_uid)
+        })
     {
         return Err(IdentityError::Verification(
             "invalid exchanged-token ancestry or depth".into(),
         ));
     }
-    for ancestor in &token.av_subject_tokens {
+    for ancestor in token.av_subject_tokens.iter().chain(&token.av_actor_tokens) {
         if ancestor.iss.is_empty()
             || ancestor.iss.chars().count() > MAX_IDENTITY_STRING_CHARS
             || av_core::text::contains_bidi_or_zero_width(&ancestor.iss)
@@ -446,7 +516,7 @@ pub fn check_exchanged_revocation(
     {
         return Err(IdentityError::Revoked(token.jti.clone()));
     }
-    for ancestor in &token.av_subject_tokens {
+    for ancestor in token.av_subject_tokens.iter().chain(&token.av_actor_tokens) {
         match upstream
             .check_token(&ancestor.iss, &ancestor.jti, &ancestor.instance_uid, ancestor.iat)
             .map_err(IdentityError::RevocationUnavailable)?
@@ -929,5 +999,170 @@ mod tests {
             build_exchanged_claims(&params).unwrap().scopes,
             ["tool:read", "tool:write"]
         );
+    }
+
+    fn actor_claims(scopes: &[&str]) -> NhiClaims {
+        let mut actor = base_claims(scopes);
+        actor.jti = "jti-actor".into();
+        actor.instance_uid = "inst-child".into();
+        actor.exp = 1500;
+        actor
+    }
+
+    #[test]
+    fn actor_token_narrows_scopes_three_ways_and_nests_act() {
+        let subject = base_claims(&["tool:read", "tool:write", "payout"]);
+        let chain = [RevocationIdentity::from(&subject)];
+        let actor = actor_claims(&["tool:read", "payout"]);
+        let actor_chain = [RevocationIdentity::from(&actor)];
+        let params = default_params(&subject, "backend-a", Some("tool:read tool:write"), &chain);
+        let result = build_exchanged_claims_with_actor(
+            &params,
+            Some(&ExchangeActor {
+                claims: &actor,
+                chain: &actor_chain,
+            }),
+        )
+        .unwrap();
+        assert_eq!(result.sub, "user:alice@corp.com", "sub stays the human");
+        assert_eq!(result.scopes, vec!["tool:read"], "requested ∩ subject ∩ actor");
+        assert_eq!(result.azp.as_deref(), Some("inst-child"));
+        let act = result.act.as_ref().unwrap();
+        assert_eq!(act.sub, "inst-child", "the actor is the current actor");
+        assert_eq!(
+            act.act.as_ref().unwrap().sub,
+            "client-1",
+            "the subject's agent is one level down"
+        );
+        assert_eq!(result.av_delegation_depth, 2);
+        assert_eq!(result.av_actor_tokens, actor_chain.to_vec());
+        assert!(result.exp <= actor.exp, "never outlives the actor");
+    }
+
+    #[test]
+    fn actor_scopes_disjoint_from_request_leave_nothing() {
+        let subject = base_claims(&["tool:read", "tool:write"]);
+        let chain = [RevocationIdentity::from(&subject)];
+        let actor = actor_claims(&["payout"]);
+        let actor_chain = [RevocationIdentity::from(&actor)];
+        let params = default_params(&subject, "backend-a", None, &chain);
+        let actor = ExchangeActor {
+            claims: &actor,
+            chain: &actor_chain,
+        };
+        assert!(matches!(
+            build_exchanged_claims_with_actor(&params, Some(&actor)),
+            Err(ExchangeError::EmptyIntersection)
+        ));
+    }
+
+    #[test]
+    fn delegated_actor_tokens_and_depth_overflow_are_refused() {
+        let subject = base_claims(&["tool:read"]);
+        let chain = [RevocationIdentity::from(&subject)];
+        let mut delegated = actor_claims(&["tool:read"]);
+        delegated.act = Some(ActorClaim {
+            sub: "someone".into(),
+            act: None,
+        });
+        let delegated_chain = [RevocationIdentity::from(&delegated)];
+        let params = default_params(&subject, "backend-a", None, &chain);
+        assert!(matches!(
+            build_exchanged_claims_with_actor(
+                &params,
+                Some(&ExchangeActor {
+                    claims: &delegated,
+                    chain: &delegated_chain,
+                })
+            ),
+            Err(ExchangeError::ActorNotDirect)
+        ));
+        let actor = actor_claims(&["tool:read"]);
+        let actor_chain = [RevocationIdentity::from(&actor)];
+        let mut params = default_params(&subject, "backend-a", None, &chain);
+        params.max_depth = 1;
+        assert!(matches!(
+            build_exchanged_claims_with_actor(
+                &params,
+                Some(&ExchangeActor {
+                    claims: &actor,
+                    chain: &actor_chain,
+                })
+            ),
+            Err(ExchangeError::DelegationExceeded { depth: 2, max: 1 })
+        ));
+    }
+
+    #[test]
+    fn actor_exchange_verifies_and_revoking_the_actor_revokes_the_token() {
+        let (encoding, decoding) = exchange_keys();
+        let now = av_core::time::now_ms() / 1000;
+        let mut subject = base_claims(&["tool:read"]);
+        subject.iat = now - 10;
+        subject.exp = now + 600;
+        let chain = [RevocationIdentity::from(&subject)];
+        let mut actor = actor_claims(&["tool:read"]);
+        actor.iat = now - 5;
+        actor.exp = now + 600;
+        let actor_chain = [RevocationIdentity::from(&actor)];
+        let mut params = default_params(&subject, "backend-a", None, &chain);
+        params.now_s = now;
+        let allowed = ["backend-a".to_owned()];
+        params.allowed_audiences = &allowed;
+        let exchanged = build_exchanged_claims_with_actor(
+            &params,
+            Some(&ExchangeActor {
+                claims: &actor,
+                chain: &actor_chain,
+            }),
+        )
+        .unwrap();
+        let jwt = signed_exchange(&exchanged, "JWT", &encoding);
+        let verified = verify_exchanged_token(
+            &jwt,
+            &ExchangedValidation {
+                key: &decoding,
+                kid: "exchange-key",
+                issuer: "agentvisor-ai",
+                allowed_audiences: &allowed,
+                max_depth: 4,
+                now_s: now,
+                token_type: "JWT",
+                for_revocation: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(verified.av_actor_tokens.len(), 1);
+
+        let exchanged_store = crate::InMemoryRevocationStore::new();
+        let upstream = crate::InMemoryRevocationStore::new();
+        check_exchanged_revocation(&verified, &exchanged_store, &upstream).unwrap();
+        upstream.revoke("jti-actor", now + 600).unwrap();
+        assert!(matches!(
+            check_exchanged_revocation(&verified, &exchanged_store, &upstream),
+            Err(IdentityError::Revoked(jti)) if jti == "jti-actor"
+        ));
+
+        // An actor record without the matching act link is forged ancestry.
+        let mut forged = exchanged.clone();
+        forged.claims.act = Some(ActorClaim {
+            sub: "inst-child".into(),
+            act: None,
+        });
+        let forged = signed_exchange(&forged, "JWT", &encoding);
+        assert!(verify_exchanged_token(
+            &forged,
+            &ExchangedValidation {
+                key: &decoding,
+                kid: "exchange-key",
+                issuer: "agentvisor-ai",
+                allowed_audiences: &allowed,
+                max_depth: 4,
+                now_s: now,
+                token_type: "JWT",
+                for_revocation: false,
+            },
+        )
+        .is_err());
     }
 }

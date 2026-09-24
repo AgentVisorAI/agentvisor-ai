@@ -100,9 +100,45 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
+  buildpack:
+    name: Package the service-binding buildpack
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      # Same pinned actions as the build job.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: musl
+          pattern: release-*-unknown-linux-musl
+          merge-multiple: true
+      - name: Package the buildpack with the static avctl sidecar binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            (cd musl && shasum -a 256 -c "agentvisor-ai-${version}-${target}.tar.gz.sha256")
+            tar -xzf "musl/agentvisor-ai-${version}-${target}.tar.gz" -C musl
+          done
+          python3 scripts/test-package-buildpack.py
+          python3 buildpack/tests/test_buildpack.py
+          python3 scripts/package-buildpack.py \
+            --avctl-x86_64 "musl/agentvisor-ai-${version}-x86_64-unknown-linux-musl/avctl" \
+            --avctl-aarch64 "musl/agentvisor-ai-${version}-aarch64-unknown-linux-musl/avctl" \
+            --output buildpack-dist
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-buildpack
+          path: buildpack-dist/*
+          retention-days: 7
+          if-no-files-found: error
+
   publish:
     name: Publish GitHub Release
-    needs: build
+    needs: [build, buildpack]
     runs-on: ubuntu-latest
     # R115 F3: only the publish job needs contents:write to call
     # `gh release create`. Every other job runs with the
@@ -159,7 +195,9 @@ jobs:
             --title "${GITHUB_REF_NAME}" \
             --notes-file notes.md \
             $prerelease_flag \
-            dist/*.tar.gz dist/*.tar.gz.sha256 dist/SHA256SUMS
+            dist/*.tar.gz dist/*.tar.gz.sha256 \
+            dist/agentvisor-buildpack-*.zip dist/agentvisor-buildpack-*.tgz \
+            dist/agentvisor-buildpack-*.sha256 dist/SHA256SUMS
       - name: Chain the installer pin bump
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

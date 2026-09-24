@@ -10,7 +10,7 @@ Before applying it:
 2. Replace `https://identity.example.invalid` in the ConfigMap with your trusted token issuer. Tokens must use audience `agentvisor-ai` and the application's required identity claims. See [identity configuration](../../docs/reference/CONFIGURATION.md).
 3. Create namespace `agentvisor-ai` and the five Secrets named in the manifest: `agentvisor-ai-upstream` (`api-key`), `agentvisor-ai-signing-seed` (`signing.seed`), `agentvisor-ai-identity` (`identity.hmac`), `agentvisor-ai-state` (`redis-url`), and `agentvisor-ai-trust` (`ca-bundle.crt`). The HMAC secret must match the trusted issuer. The Redis connection URI belongs in the Secret, never in the ConfigMap. Use `avctl keygen --output` to generate the signing seed, and retain a protected backup because it anchors receipt verification.
 4. For a JWKS-based issuer, replace `identity_hmac_secret_file` with `identity_jwks_url`, remove `identity.hmac` from the init container's copy loop, and remove the identity Secret volumes and mounts. Retain explicit issuer and audience constraints.
-5. Review the namespace's access controls, TLS termination, storage class, retention, resource limits, and network policy for your cluster. The template provides a ClusterIP Service and does not choose an ingress controller or a network allowlist.
+5. Review the namespace's access controls, TLS termination, storage class, retention, resource limits, and network policy for your cluster. The template provides a ClusterIP Service and does not choose an ingress controller. `network-policies.yaml` provides the network allowlist described below.
 6. Validate against your selected cluster with `kubectl --context YOUR_CONTEXT -n agentvisor-ai apply --dry-run=server -f deploy/kubernetes/agentvisor-ai.yaml`, then apply the same manifest and verify readiness and authenticated requests.
 
 The init container copies the signing and identity secrets into memory-backed storage, sets their owner to UID 65532 and mode to `0600`, and prepares the persistent spool directory. The application receives only read-only secret mounts. Missing or empty credentials prevent startup. Secret updates require a pod restart because the application reads the copied files at startup.
@@ -39,3 +39,25 @@ The drill applies this template with generated fixture credentials, a private CA
 The script records image identities and runtime versions, retains redacted logs, and removes only its own cluster, network, image aliases, credentials, and backup. The gateway image and cached upstream images remain available. Its three unit tests check cleanup ownership, token construction, and the template's identity and scope requirements.
 
 Local kind validation covers the scheduler and Secret projection, but its single node and local-path volumes do not establish production CSI behavior, multi-host recovery, ingress, network policy enforcement, or an external identity provider. Validate those properties in the selected deployment environment. No remote cluster is modified by these repository tests.
+
+## Network isolation for MCP backends
+
+`network-policies.yaml` makes the gateway the only way to reach your MCP
+servers. Its first policy lets only pods labeled `agentvisor.ai/client:
+"true"` reach the gateway port. Its second policy, which you apply in each
+namespace that runs MCP backends, lets pods labeled
+`agentvisor.ai/mcp-backend: "true"` accept traffic only from the gateway
+pods. Agents therefore cannot bypass the gateway's identity checks,
+authorization, credential handling, and audit by calling a backend
+directly.
+
+Set `require_private_backends = true` in the gateway configuration as
+well. The gateway then resolves every backend host when it connects and
+refuses any address that is not private (loopback, RFC 1918, unique-local
+IPv6, or link-local), so a misconfigured or rebinding backend name cannot
+send tool traffic to the internet.
+
+These policies take effect only when the cluster's network plugin enforces
+NetworkPolicy. The local kind validation above does not enforce them;
+verify enforcement in the target cluster, for example by calling a backend
+from a pod without the client label and confirming the connection fails.

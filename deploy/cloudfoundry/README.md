@@ -118,39 +118,76 @@ revocation storage are also required before increasing the instance count. Cloud
 container files across restaging. Set resource limits using measurements of your
 configured workload; the manifest's values are starting points.
 
-## Client discovery
+## Client discovery and identity (no code change)
 
-An `agentvisor` service binding describes how a **client** reaches the gateway.
-It does not configure authentication in the gateway itself. Create a
-user-provided service and bind it to the client, not to `agentvisor-ai`:
+An `agentvisor` service binding describes how a **client** reaches the
+gateway. Create a user-provided service and bind it to the client, not to
+`agentvisor-ai`:
 
 ```sh
 cf cups agentvisor -t agentvisor \
-  -p '{"gateway_url":"http://agentvisor-ai.apps.internal:8484","audience":"agentvisor-ai"}'
+  -p '{"gateway_url":"http://agentvisor-ai.apps.internal:8484","audience":"agentvisor-ai","backends":["my-mcp-backend"]}'
 cf bind-service my-ai-app agentvisor
 ```
 
-Package the repository's `buildpack` directory as your custom buildpack and
-explicitly list it before the application's language buildpack. The buildpack
-exports `AV_GATEWAY_URL`, `AV_AUDIENCE`, and `AV_IDENTITY_JWKS_URL`. Your client
-must read these variables, obtain an identity token for the configured audience,
-and send that token to the gateway. Standard provider SDKs do not automatically
-read them. For an OpenAI-compatible client, configure its base URL as
-`AV_GATEWAY_URL + "/v1"`; credentials still require explicit identity integration.
-See [the buildpack instructions](../../buildpack/README.md).
+Push the application with the packaged buildpack
+(`agentvisor-buildpack-<version>.zip` from a release, or built with
+`scripts/package-buildpack.py`) listed before the language buildpack. At
+staging it points `OPENAI_BASE_URL` and the MCP configuration
+(`$AGENTVISOR_MCP_CONFIG`) at a loopback sidecar, and declares that sidecar
+in `launch.yml`. At run time the sidecar proves the instance identity
+certificate Cloud Foundry gives the container and attaches the resulting
+agent token to every request. See [the buildpack
+instructions](../../buildpack/README.md).
+
+On the gateway, register the application as a workload and trust the
+foundation's instance-identity CA. In `harness.toml`:
+
+```toml
+token_exchange_seed_file = "/app/secrets/exchange.seed"
+identity_human_subject_pattern = "^user:"
+
+[workload_identity]
+ca_file = "/app/secrets/instance-identity-ca.pem"
+
+[[workload_identities]]
+name = "my-ai-app"
+cf_app_guid = "<output of: cf app my-ai-app --guid>"
+sub = "user:owner@example.com"     # the human this agent acts for
+charter = "support"
+scopes = ["chat", "tool:*"]
+```
+
+Ask the platform operator for the Diego instance identity CA certificate.
+Allow the client to reach the gateway with
+`cf add-network-policy my-ai-app agentvisor-ai --port 8484 --protocol tcp`
+(step 4 above). The sidecar needs no route and no network policy of its own.
 
 ## MCP backend networking
 
-Give the backend an internal route, such as `my-mcp-backend.apps.internal`, and
-configure its gateway backend URL as
-`http://my-mcp-backend.apps.internal:8080`. Allow the gateway to reach it:
+Give each MCP backend an internal route only, as in
+[`mcp-backend.manifest.yml`](mcp-backend.manifest.yml), for example
+`my-mcp-backend.apps.internal`, and configure its gateway backend URL as
+`http://my-mcp-backend.apps.internal:8080/mcp`. The backend then has no
+public route through the Gorouter. An app pushed with `no-route: true` has
+no route at all, internal ones included, so the gateway would have no DNS
+name to reach it by; the internal-only route gives the same protection from
+outside the foundation. Allow the gateway, and only the gateway, to reach
+the backend:
 
 ```sh
 cf add-network-policy agentvisor-ai my-mcp-backend --port 8080 --protocol tcp
 ```
 
-Do not grant client applications direct access to that backend if its calls must
-pass through AgentVisor's authorization and audit controls.
+Do not grant client applications direct access to a backend: its calls must
+pass through AgentVisor's authorization and audit controls. Set
+`require_private_backends = true` in `harness.toml` so the gateway refuses
+to connect to a backend address that is not private.
+
+All backends sit behind the one gateway host. Clients use
+`http://agentvisor-ai.apps.internal:8484/mcp` for every backend's tools, or
+`/mcp/<backend-name>` for one backend's tools only; each backend keeps its
+own authentication policy (`auth` in its `[[backends]]` entry).
 
 These examples follow Cloud Foundry's [container networking
 instructions](https://docs.cloudfoundry.org/devguide/deploy-apps/cf-networking.html).

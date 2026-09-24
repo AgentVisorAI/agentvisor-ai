@@ -130,6 +130,9 @@ pub struct AppState {
     pub(crate) hot_metrics: Arc<HotMetrics>,
     /// Reused upstream HTTP client.
     pub client: reqwest::Client,
+    /// HTTP client for tool backends (private addresses only when
+    /// `require_private_backends` is on; otherwise the shared client).
+    pub(crate) backend_client: reqwest::Client,
     /// Static credential injected into every chat-completions forward
     /// (resolved once at startup; value is marked sensitive).
     pub(crate) upstream_auth: Option<(HeaderName, HeaderValue)>,
@@ -211,6 +214,17 @@ pub struct AppState {
     /// Redaction engine (pillar 5). Strips sensitive data from event
     /// payloads and ATIF step text before they are journaled or published.
     pub redaction: Option<Arc<av_redact::RedactionEngine>>,
+    /// MCP Streamable HTTP client and per-agent-session backend sessions
+    /// for backends with `transport = "mcp"`.
+    pub mcp_backends: Arc<crate::mcp_client::McpBackendClient>,
+    /// Signs and verifies the `MCP-Session-Id` values this gateway issues.
+    pub(crate) mcp_sessions: Arc<crate::mcp::SessionSigner>,
+    /// External AuthZEN policy decision point, when `[authzen]` is set.
+    pub authzen: Option<Arc<crate::authzen::AuthzenClient>>,
+    /// Content sink slot shared with the audit worker (tenant telemetry).
+    pub(crate) content_sink: crate::content::SharedContentSink,
+    /// Workload assertion verifier, when `[workload_identity]` is set.
+    pub(crate) workload: crate::workload::SharedWorkloadIssuer,
 }
 
 /// Pre-resolved metric handles for the request hot path so the
@@ -1799,7 +1813,8 @@ impl AppState {
         } else {
             None
         };
-        let worker = crate::worker::spawn_worker_with_spool_authenticated(
+        let content_sink = crate::content::SharedContentSink::default();
+        let worker = crate::worker::spawn_worker_with_outputs(
             config.worker_channel_capacity,
             Arc::clone(&bridge),
             embedder,
@@ -1807,7 +1822,10 @@ impl AppState {
             Some(std::path::PathBuf::from(&config.atif_spool_dir)),
             journal_key,
             Arc::clone(&metrics),
-            redaction.clone(),
+            crate::content::AuditOutputs {
+                redaction: redaction.clone(),
+                content: Arc::clone(&content_sink),
+            },
         );
         let finalizer = Finalizer::with_bridge(
             signer.clone(),
@@ -1819,62 +1837,78 @@ impl AppState {
         // Closes delete the session's vector-store
         // points (best-effort).
         .with_vector_sink(Arc::clone(&vector_sink));
-        let mut client_builder = reqwest::Client::builder()
-            .connect_timeout(HTTP_CONNECT_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none())
-            // Providers (OpenAI, Anthropic, Azure, Bedrock fronting)
-            // downgrade or block empty / generic UAs; identifying
-            // ourselves also gives operators a stable string for
-            // provider-side triage. Version is baked in at compile
-            // time so a rolling deploy makes the change visible.
-            .user_agent(concat!("AgentVisor AI/", env!("CARGO_PKG_VERSION")))
-            // TCP keepalive so pooled connections behind NAT/L4 LBs
-            // with short idle windows (AWS NLB 350 s, GCP TCP 600 s,
-            // stateful FWs often 60-120 s) do not turn every first
-            // request per pool cycle into a full TCP+TLS re-handshake
-            // that manifests as a spurious 502/`connection reset`.
-            .tcp_keepalive(std::time::Duration::from_secs(30))
-            // Cap pool idle at 60 s: shorter than any realistic NAT
-            // window, longer than any burst-of-requests batch. Bounds
-            // the pool memory footprint and forces frequent-enough
-            // TLS refresh under a rolling cert rotation.
-            .pool_idle_timeout(std::time::Duration::from_secs(60));
-        // Reqwest 0.12 is built here
-        // without decompression features, so the proxy cannot decode any
-        // content-coding an origin might apply. RFC 9110 §12.5.3 says
-        // an ABSENT Accept-Encoding permits any coding, so a CDN in
-        // front of the upstream may legally gzip the response — which
-        // the chat path then 502's on and the tool path (with the
-        // decompression guard applied above) would also refuse. Advertise
-        // `Accept-Encoding: identity` so the routine outcome is
-        // "identity as requested" and the refusal guards are pure
-        // defense-in-depth.
-        let mut default_headers = reqwest::header::HeaderMap::new();
-        default_headers.insert(
-            reqwest::header::ACCEPT_ENCODING,
-            reqwest::header::HeaderValue::from_static("identity"),
-        );
-        client_builder = client_builder.default_headers(default_headers);
-        // Apply a read-timeout floor unconditionally so an
-        // adversarial or merely broken upstream (chat OR tool) cannot pin
-        // a session lease + WorkerPermit + tool-intent claim
-        // indefinitely by accepting the request and then never
-        // responding. TCP keepalive above only detects a hung
-        // *connection*, not a slow/silent HTTP response. Operators can
-        // widen or override via `upstream_read_timeout_s`; the shipped
-        // default (60 s) is well past any realistic first-token
-        // latency (Claude p99 ~15 s, GPT-4 p99 ~30 s) but firm enough
-        // that a stalled provider surfaces as a definite 502 rather
-        // than a resource-starving hang.
-        const DEFAULT_UPSTREAM_READ_TIMEOUT_S: u64 = crate::config::DEFAULT_UPSTREAM_READ_TIMEOUT_S;
-        let read_timeout_s = config
-            .upstream_read_timeout_s
-            .unwrap_or(DEFAULT_UPSTREAM_READ_TIMEOUT_S);
-        client_builder = client_builder.read_timeout(std::time::Duration::from_secs(read_timeout_s));
-        if config.upstream_http2_prior_knowledge {
-            client_builder = client_builder.http2_prior_knowledge();
-        }
-        let client = client_builder.build().map_err(PipelineError::upstream_source)?;
+        // One builder for every outbound client, so the backend client
+        // differs from the shared one only by its resolver.
+        let build_client = |private_only: bool| -> Result<reqwest::Client, PipelineError> {
+            let mut client_builder = reqwest::Client::builder()
+                .connect_timeout(HTTP_CONNECT_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none())
+                // Providers (OpenAI, Anthropic, Azure, Bedrock fronting)
+                // downgrade or block empty / generic UAs; identifying
+                // ourselves also gives operators a stable string for
+                // provider-side triage. Version is baked in at compile
+                // time so a rolling deploy makes the change visible.
+                .user_agent(concat!("AgentVisor AI/", env!("CARGO_PKG_VERSION")))
+                // TCP keepalive so pooled connections behind NAT/L4 LBs
+                // with short idle windows (AWS NLB 350 s, GCP TCP 600 s,
+                // stateful FWs often 60-120 s) do not turn every first
+                // request per pool cycle into a full TCP+TLS re-handshake
+                // that manifests as a spurious 502/`connection reset`.
+                .tcp_keepalive(std::time::Duration::from_secs(30))
+                // Cap pool idle at 60 s: shorter than any realistic NAT
+                // window, longer than any burst-of-requests batch. Bounds
+                // the pool memory footprint and forces frequent-enough
+                // TLS refresh under a rolling cert rotation.
+                .pool_idle_timeout(std::time::Duration::from_secs(60));
+            // Reqwest 0.12 is built here
+            // without decompression features, so the proxy cannot decode any
+            // content-coding an origin might apply. RFC 9110 §12.5.3 says
+            // an ABSENT Accept-Encoding permits any coding, so a CDN in
+            // front of the upstream may legally gzip the response — which
+            // the chat path then 502's on and the tool path (with the
+            // decompression guard applied above) would also refuse. Advertise
+            // `Accept-Encoding: identity` so the routine outcome is
+            // "identity as requested" and the refusal guards are pure
+            // defense-in-depth.
+            let mut default_headers = reqwest::header::HeaderMap::new();
+            default_headers.insert(
+                reqwest::header::ACCEPT_ENCODING,
+                reqwest::header::HeaderValue::from_static("identity"),
+            );
+            client_builder = client_builder.default_headers(default_headers);
+            // Apply a read-timeout floor unconditionally so an
+            // adversarial or merely broken upstream (chat OR tool) cannot pin
+            // a session lease + WorkerPermit + tool-intent claim
+            // indefinitely by accepting the request and then never
+            // responding. TCP keepalive above only detects a hung
+            // *connection*, not a slow/silent HTTP response. Operators can
+            // widen or override via `upstream_read_timeout_s`; the shipped
+            // default (60 s) is well past any realistic first-token
+            // latency (Claude p99 ~15 s, GPT-4 p99 ~30 s) but firm enough
+            // that a stalled provider surfaces as a definite 502 rather
+            // than a resource-starving hang.
+            const DEFAULT_UPSTREAM_READ_TIMEOUT_S: u64 = crate::config::DEFAULT_UPSTREAM_READ_TIMEOUT_S;
+            let read_timeout_s = config
+                .upstream_read_timeout_s
+                .unwrap_or(DEFAULT_UPSTREAM_READ_TIMEOUT_S);
+            client_builder = client_builder.read_timeout(std::time::Duration::from_secs(read_timeout_s));
+            if config.upstream_http2_prior_knowledge {
+                client_builder = client_builder.http2_prior_knowledge();
+            }
+            if private_only {
+                client_builder = client_builder.dns_resolver(Arc::new(crate::backend::PrivateOnlyResolver));
+            }
+            client_builder.build().map_err(PipelineError::upstream_source)
+        };
+        let client = build_client(false)?;
+        // Tool backends get their own client when `require_private_backends`
+        // is on: it refuses to connect to any address that is not private.
+        // The LLM upstream and the AuthZEN PDP keep the shared client.
+        let backend_client = if config.require_private_backends {
+            build_client(true)?
+        } else {
+            client.clone()
+        };
         let upstream_auth = resolve_upstream_auth(&config)?;
         let tool_auth = resolve_tool_auth(&config)?;
         let hot_metrics = Arc::new(HotMetrics::new(&metrics, config.strict_stage_budget));
@@ -1900,7 +1934,7 @@ impl AppState {
              tool-upstream slowdown, a burst-traffic event, or an undersized \
              `mcp_concurrency`.",
         );
-        for pdp_code in ["UNMAPPED_TOOL", "MISSION_EXPIRED", "MISSION_DENIED"] {
+        for pdp_code in ["UNMAPPED_TOOL", "MISSION_EXPIRED", "MISSION_DENIED", "PDP_DENIED"] {
             metrics.counter(
                 &format!("av_pdp_denials_total{{code=\"{pdp_code}\"}}"),
                 "PDP denials by denial code",
@@ -1915,7 +1949,19 @@ impl AppState {
             config.tool_upstream_url.as_deref(),
             tool_auth.clone(),
         )
-        .map_err(|e| PipelineError::bad_request(format!("backend routing: {e}")))?;
+        .map_err(|e| PipelineError::bad_request(format!("backend routing: {e}")))?
+        .with_fallback_transport(config.tool_upstream_transport);
+        let mcp_backends = Arc::new(crate::mcp_client::McpBackendClient::new(backend_client.clone()));
+        let mcp_sessions = Arc::new(crate::mcp::SessionSigner::derive(&journal_key));
+        let authzen = config
+            .authzen
+            .as_ref()
+            .map(|authzen| crate::authzen::AuthzenClient::from_config(authzen, client.clone()).map(Arc::new))
+            .transpose()
+            .map_err(|e| PipelineError::bad_request(format!("authzen: {e}")))?;
+        let workload = crate::workload::WorkloadIssuer::from_config(&config)
+            .map_err(|e| PipelineError::bad_request(format!("workload identity: {e}")))?
+            .map(Arc::new);
         let token_signer = if let Some(ref seed_path) = config.token_exchange_seed_file {
             let seed = load_exchange_seed(seed_path)
                 .map_err(|e| PipelineError::bad_request(format!("exchange signing key: {e}")))?;
@@ -1958,6 +2004,7 @@ impl AppState {
             hot_metrics,
             metrics,
             client,
+            backend_client,
             upstream_auth,
             tool_auth,
             tool_audit_gates: Arc::default(),
@@ -1974,7 +2021,23 @@ impl AppState {
             pdp: Arc::new(pdp),
             token_signer,
             redaction,
+            mcp_backends,
+            mcp_sessions,
+            authzen,
+            content_sink,
+            workload,
         })
+    }
+
+    /// Install the sink that receives every journaled step in content form
+    /// (used by `agentvisord` for full-content tenant telemetry).
+    ///
+    /// The sink runs on its own thread behind a bounded queue, so it can
+    /// neither slow down nor fail the audit worker.
+    pub fn set_content_sink(&self, sink: Arc<dyn crate::content::ContentSink>) -> std::io::Result<()> {
+        let dispatcher = crate::content::ContentDispatcher::spawn(sink, &self.metrics)?;
+        *self.content_sink.write() = Some(Arc::new(dispatcher));
+        Ok(())
     }
 
     /// Run identity, breaker, quota, sanitize, compression, and asynchronous
@@ -3032,26 +3095,31 @@ impl AppState {
                 // mission: a denied call must neither consume budget nor be
                 // audited as allowed. This also covers verdict-only mode, where
                 // no forwarding branch ever runs.
-                Some(request) => match self.pdp.decide(&request.tool, av_core::time::now_ms() / 1000) {
-                    crate::authz::AuthzDecision::Deny { code, reason } => {
-                        self.metrics
-                            .counter(
-                                &format!("av_pdp_denials_total{{code=\"{}\"}}", code.as_str()),
-                                "PDP denials by denial code",
-                            )
-                            .inc();
-                        ToolVerdict::Blocked {
-                            tool: request.tool.clone(),
-                            stage: "policy",
-                            policy: Some(pdp_policy_name(code).to_owned()),
-                            denial_code: code,
-                            response: av_sandbox::rpc::denial_error(request.id.as_ref(), code, &reason),
-                            reason,
-                            elapsed_us: 0,
+                Some(request) => {
+                    match self
+                        .pdp
+                        .decide_for(&request.tool, av_core::time::now_ms() / 1000, &caller.facts())
+                    {
+                        crate::authz::AuthzDecision::Deny { code, reason } => {
+                            self.metrics
+                                .counter(
+                                    &format!("av_pdp_denials_total{{code=\"{}\"}}", code.as_str()),
+                                    "PDP denials by denial code",
+                                )
+                                .inc();
+                            ToolVerdict::Blocked {
+                                tool: request.tool.clone(),
+                                stage: "policy",
+                                policy: Some(pdp_policy_name(code).to_owned()),
+                                denial_code: code,
+                                response: av_sandbox::rpc::denial_error(request.id.as_ref(), code, &reason),
+                                reason,
+                                elapsed_us: 0,
+                            }
                         }
+                        crate::authz::AuthzDecision::Permit { .. } => budgeted_check(),
                     }
-                    crate::authz::AuthzDecision::Permit { .. } => budgeted_check(),
-                },
+                }
                 None => budgeted_check(),
             }
         };
@@ -3677,6 +3745,22 @@ impl AuthenticatedCaller {
         Ok(())
     }
 
+    /// What the policy decision point may know about this caller.
+    pub(crate) fn facts(&self) -> crate::authz::CallerFacts<'_> {
+        match &self.validated {
+            Some(validated) => crate::authz::CallerFacts {
+                instance_uid: &validated.claims.instance_uid,
+                charter: &validated.claims.charter,
+                subject: Some(&validated.claims.sub),
+            },
+            None => crate::authz::CallerFacts {
+                instance_uid: &self.identity.instance_uid,
+                charter: "anonymous",
+                subject: None,
+            },
+        }
+    }
+
     pub(crate) fn principal_digest(&self) -> Option<String> {
         self.validated.as_ref().map(|validated| {
             let pair = serde_json::json!([validated.claims.iss, validated.claims.sub]);
@@ -3855,6 +3939,7 @@ fn pdp_policy_name(code: av_sandbox::DenialCode) -> &'static str {
     match code {
         av_sandbox::DenialCode::UnmappedTool => "pdp.intent_map",
         av_sandbox::DenialCode::MissionExpired | av_sandbox::DenialCode::MissionDenied => "pdp.mission",
+        av_sandbox::DenialCode::PdpDenied => "pdp.authzen",
         _ => "pdp",
     }
 }
@@ -4092,7 +4177,7 @@ fn validate_session_binding(
     Ok(())
 }
 
-fn scope_allows(scopes: &[String], required: &str) -> bool {
+pub(crate) fn scope_allows(scopes: &[String], required: &str) -> bool {
     scopes.iter().any(|scope| {
         scope == "*"
             || scope == required
@@ -4121,7 +4206,7 @@ fn inject_corrective_message(payload: &mut Value) -> Result<(), PipelineError> {
     Ok(())
 }
 
-fn load_exchange_seed(path: &str) -> Result<zeroize::Zeroizing<[u8; 32]>, String> {
+pub(crate) fn load_exchange_seed(path: &str) -> Result<zeroize::Zeroizing<[u8; 32]>, String> {
     use zeroize::Zeroizing;
     require_owner_only_secret(std::path::Path::new(path)).map_err(|e| format!("exchange seed file: {e}"))?;
     let encoded = Zeroizing::new(

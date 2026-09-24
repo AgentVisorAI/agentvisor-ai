@@ -1280,3 +1280,26 @@ fn jwks_declared_operations_and_metadata_types_cannot_be_ignored() {
     let permitted = serde_json::json!({"keys":[{"kty":"OKP", "crv":"Ed25519", "kid":"ops", "x":donor.public_x, "key_ops":["verify"], "use":"sig", "alg":"EdDSA"}]});
     assert_eq!(v.add_jwks(&permitted).unwrap(), 1);
 }
+
+#[test]
+fn human_subject_pattern_refuses_non_human_subjects_but_allows_holder_revocation() {
+    let keys = ed25519_keys("k-human");
+    let mut v = validator(&keys);
+    v.set_human_subject_pattern("^user:").unwrap();
+    let agent_subject = mint(&keys, &claims(&["tool:read"], 600, None));
+    assert_eq!(
+        v.validate(&agent_subject).unwrap_err(),
+        IdentityError::SubjectNotHuman
+    );
+    assert!(
+        v.validate_for_revocation(&agent_subject).is_ok(),
+        "a holder can still revoke a token whose subject is not human"
+    );
+    let mut human = claims(&["tool:read"], 600, None);
+    human.sub = "user:alice@corp.com".into();
+    assert!(v.validate(&mint(&keys, &human)).is_ok());
+    assert!(matches!(
+        v.set_human_subject_pattern("(unclosed"),
+        Err(IdentityError::SubjectPattern(_))
+    ));
+}

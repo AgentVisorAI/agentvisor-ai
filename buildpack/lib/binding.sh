@@ -35,13 +35,23 @@ read_binding() {
                     return 1
                 fi
             done
-            jwks_file=/dev/null
-            if [ -e "${match_dir}identity_jwks_url" ]; then
-                jwks_file=${match_dir}identity_jwks_url
-            fi
+            optional() {
+                if [ -e "$match_dir$1" ]; then printf '%s' "$match_dir$1"; else printf '/dev/null'; fi
+            }
+            # Optional files that are absent (read as "") are dropped, so
+            # fields.jq applies its defaults.
             binding=$(jq -cn --rawfile gateway_url "${match_dir}gateway_url" \
-                --rawfile audience "${match_dir}audience" --rawfile identity_jwks_url "$jwks_file" \
-                '{gateway_url:$gateway_url,audience:$audience,identity_jwks_url:$identity_jwks_url}') || return 1
+                --rawfile audience "${match_dir}audience" \
+                --rawfile identity_jwks_url "$(optional identity_jwks_url)" \
+                --rawfile backends "$(optional backends)" \
+                --rawfile sidecar "$(optional sidecar)" \
+                --rawfile sidecar_port "$(optional sidecar_port)" \
+                --rawfile sidecar_credential "$(optional sidecar_credential)" \
+                '{gateway_url:$gateway_url,audience:$audience,identity_jwks_url:$identity_jwks_url,
+                  backends:$backends,sidecar:$sidecar,sidecar_port:$sidecar_port,
+                  sidecar_credential:$sidecar_credential}
+                 | with_entries(select(.key == "gateway_url" or .key == "audience"
+                     or (.value | gsub("^\\s+|\\s+$"; "")) != ""))') || return 1
         fi
     fi
     if [ "$binding" = null ]; then

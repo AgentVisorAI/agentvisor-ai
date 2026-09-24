@@ -5,7 +5,7 @@
 //! the appropriate credential header. Backend URLs come only from config;
 //! redirects are not followed.
 
-use crate::config::{BackendAuth, BackendConfig};
+use crate::config::{BackendAuth, BackendConfig, BackendTransport};
 use axum::http::{HeaderName, HeaderValue};
 use std::collections::HashMap;
 
@@ -33,6 +33,82 @@ pub(crate) fn validate_http_endpoint(url: &str, field: &str) -> Result<(), Strin
         ));
     }
     Ok(())
+}
+
+/// True for an address that is not reachable from the public internet:
+/// loopback, RFC 1918, shared (CGNAT, RFC 6598), link-local, and IPv6
+/// unique-local or link-local addresses (including IPv4-mapped forms).
+pub fn is_private_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let [first, second, ..] = v4.octets();
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || (first == 100 && (second & 0xc0) == 64)
+        }
+        std::net::IpAddr::V6(v6) => {
+            let [first, ..] = v6.segments();
+            v6.is_loopback()
+                || (first & 0xfe00) == 0xfc00
+                || (first & 0xffc0) == 0xfe80
+                || v6
+                    .to_ipv4_mapped()
+                    .is_some_and(|v4| is_private_ip(std::net::IpAddr::V4(v4)))
+        }
+    }
+}
+
+/// DNS resolver for the backend client under `require_private_backends`:
+/// a backend host must resolve only to private addresses, checked on
+/// every connection (so a DNS change after boot cannot redirect tool
+/// traffic to the internet). A host with any public address is refused
+/// outright rather than filtered, because mixed answers indicate a
+/// misconfiguration or a rebinding attempt.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PrivateOnlyResolver;
+
+impl reqwest::dns::Resolve for PrivateOnlyResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_owned();
+        Box::pin(async move {
+            let addresses: Vec<std::net::SocketAddr> =
+                tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
+            if addresses.is_empty() {
+                return Err(format!("backend host {host} has no addresses").into());
+            }
+            if let Some(public) = addresses.iter().find(|address| !is_private_ip(address.ip())) {
+                tracing::warn!(%host, address = %public.ip(), "refused a backend host that resolves to a public address");
+                return Err(format!(
+                    "backend host {host} resolves to non-private address {}",
+                    public.ip()
+                )
+                .into());
+            }
+            Ok(Box::new(addresses.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+/// Under `require_private_backends`, an IP literal in a backend URL must be
+/// private (the resolver is not consulted for literals).
+pub(crate) fn validate_private_endpoint(url: &str, field: &str) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(url).map_err(|_| format!("{field} is not a valid URL"))?;
+    let host = parsed.host_str().unwrap_or_default();
+    let Ok(ip) = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+    else {
+        return Ok(());
+    };
+    if is_private_ip(ip) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{field} uses the public address {ip}, but require_private_backends only allows private backend addresses"
+        ))
+    }
 }
 
 /// Validate routing structure without reading credentials or contacting services.
@@ -101,6 +177,10 @@ pub struct ResolvedBackend {
     pub auth_header: Option<(HeaderName, HeaderValue)>,
     /// Auth mode (for token exchange decisions).
     pub auth_mode: BackendAuthMode,
+    /// Wire protocol spoken to this backend.
+    pub transport: BackendTransport,
+    /// Tools explicitly routed here. Empty for the default backend.
+    pub tools: Vec<String>,
 }
 
 /// Simplified auth mode for runtime decisions.
@@ -112,6 +192,8 @@ pub enum BackendAuthMode {
     Static,
     /// Credential obtained via RFC 8693 token exchange.
     Exchange,
+    /// The caller's own validated bearer token, forwarded to this backend only.
+    ForwardToken,
 }
 
 /// Routes tool names to backends. Built once at startup from config.
@@ -145,7 +227,7 @@ impl BackendRouter {
         for (idx, cfg) in configs.iter().enumerate() {
             let what = format!("backend {:?} bearer token", cfg.name);
             let secret = match &cfg.auth {
-                BackendAuth::None | BackendAuth::Exchange => None,
+                BackendAuth::None | BackendAuth::Exchange | BackendAuth::ForwardToken => None,
                 BackendAuth::StaticEnv(var) => {
                     crate::pipeline::read_secret(Some(var), None, &what).map_err(|e| e.to_string())?
                 }
@@ -166,12 +248,15 @@ impl BackendRouter {
                 BackendAuth::None => BackendAuthMode::None,
                 BackendAuth::StaticEnv(_) | BackendAuth::StaticFile(_) => BackendAuthMode::Static,
                 BackendAuth::Exchange => BackendAuthMode::Exchange,
+                BackendAuth::ForwardToken => BackendAuthMode::ForwardToken,
             };
             backends.push(ResolvedBackend {
                 name: cfg.name.clone(),
                 url: cfg.url.clone(),
                 auth_header,
                 auth_mode,
+                transport: cfg.transport,
+                tools: cfg.tools.clone(),
             });
             if cfg.tools.is_empty() {
                 if default_idx.is_some() {
@@ -207,6 +292,8 @@ impl BackendRouter {
                     url: url.to_owned(),
                     auth_header: fallback_auth.map(|value| (HeaderName::from_static("authorization"), value)),
                     auth_mode,
+                    transport: BackendTransport::JsonRpc,
+                    tools: Vec::new(),
                 });
                 default_idx = Some(0);
             }
@@ -240,6 +327,24 @@ impl BackendRouter {
     pub fn iter(&self) -> impl Iterator<Item = &ResolvedBackend> {
         self.backends.iter()
     }
+
+    /// The backend with this name, if configured.
+    pub fn get(&self, name: &str) -> Option<&ResolvedBackend> {
+        self.backends.iter().find(|backend| backend.name == name)
+    }
+
+    /// Set the wire protocol of the implicit backend built from
+    /// `tool_upstream_url` (`tool_upstream_transport`). Explicit
+    /// `[[backends]]` entries keep their own setting.
+    #[must_use]
+    pub fn with_fallback_transport(mut self, transport: BackendTransport) -> Self {
+        for backend in &mut self.backends {
+            if backend.name == DEFAULT_BACKEND_NAME {
+                backend.transport = transport;
+            }
+        }
+        self
+    }
 }
 
 #[cfg(test)]
@@ -254,7 +359,55 @@ mod tests {
             url: url.into(),
             auth: BackendAuth::None,
             tools: tools.iter().map(|s| (*s).to_owned()).collect(),
+            transport: BackendTransport::default(),
         }
+    }
+
+    #[test]
+    fn private_address_classification() {
+        for private in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.1.1",
+            "100.64.0.1",
+            "::1",
+            "fd00::1",
+            "fe80::1",
+            "::ffff:10.0.0.1",
+        ] {
+            assert!(is_private_ip(private.parse().unwrap()), "{private} is private");
+        }
+        for public in [
+            "8.8.8.8",
+            "100.128.0.1",
+            "172.32.0.1",
+            "2001:4860::8888",
+            "::ffff:8.8.8.8",
+            "0.0.0.0",
+        ] {
+            assert!(!is_private_ip(public.parse().unwrap()), "{public} is public");
+        }
+    }
+
+    #[test]
+    fn private_endpoint_literals() {
+        assert!(validate_private_endpoint("http://10.0.0.5:8080/mcp", "f").is_ok());
+        assert!(validate_private_endpoint("http://[fd00::5]:8080/mcp", "f").is_ok());
+        assert!(validate_private_endpoint("http://backend.internal:8080/mcp", "f").is_ok());
+        assert!(validate_private_endpoint("http://8.8.8.8/mcp", "f").is_err());
+    }
+
+    #[tokio::test]
+    async fn private_only_resolver_allows_localhost_only() {
+        use reqwest::dns::Resolve as _;
+        let resolved: Vec<std::net::SocketAddr> = PrivateOnlyResolver
+            .resolve("localhost".parse().unwrap())
+            .await
+            .unwrap()
+            .collect();
+        assert!(resolved.iter().all(|address| address.ip().is_loopback()));
     }
 
     #[test]
@@ -363,6 +516,7 @@ mod tests {
                     url: "http://a:8080".into(),
                     auth: BackendAuth::StaticEnv("TEST_BACKEND_A_KEY".into()),
                     tools: vec!["tool_a".into()],
+                    transport: Default::default(),
                 },
                 backend("b", "http://b:8080", &["tool_b"]),
             ],
@@ -383,6 +537,7 @@ mod tests {
             url: format!("http://{name}:8080"),
             auth: BackendAuth::StaticEnv(var.into()),
             tools: vec![format!("{name}_tool")],
+            transport: Default::default(),
         }
     }
 
@@ -468,6 +623,7 @@ mod tests {
             url: "http://filed:8080".into(),
             auth: BackendAuth::StaticFile(p.to_string_lossy().into_owned()),
             tools: vec!["filed_tool".into()],
+            transport: Default::default(),
         };
 
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();

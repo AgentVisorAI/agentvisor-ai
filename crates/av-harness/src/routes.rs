@@ -30,8 +30,28 @@ pub fn build_router(state: AppState) -> Router {
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
         .route("/v1/chat/completions", post(chat_completions).options(cors_deny))
-        .route("/v1/mcp", post(mcp_call).options(cors_deny))
-        .route("/mcp", post(mcp_call).options(cors_deny))
+        .route(
+            "/v1/mcp",
+            post(mcp_call).get(mcp_get).delete(mcp_delete).options(cors_deny),
+        )
+        .route(
+            "/mcp",
+            post(mcp_call).get(mcp_get).delete(mcp_delete).options(cors_deny),
+        )
+        .route(
+            "/v1/mcp/{backend}",
+            post(mcp_backend_call)
+                .get(mcp_get)
+                .delete(mcp_delete)
+                .options(cors_deny),
+        )
+        .route(
+            "/mcp/{backend}",
+            post(mcp_backend_call)
+                .get(mcp_get)
+                .delete(mcp_delete)
+                .options(cors_deny),
+        )
         .route("/v1/sessions/{id}/close", post(close_session).options(cors_deny))
         .route(
             "/v1/sessions/{id}/promote",
@@ -251,6 +271,7 @@ fn route(path: &str) -> crate::pipeline::Route {
         "/v1/introspect" => Route::Introspect,
         "/admin/v1/revocations" => Route::AdminRevocation,
         "/.well-known/jwks.json" => Route::Jwks,
+        _ if path.starts_with("/v1/mcp/") || path.starts_with("/mcp/") => Route::Mcp,
         _ if path.starts_with("/v1/sessions/") && path.ends_with("/close") => Route::SessionClose,
         _ if path.starts_with("/v1/sessions/") && path.ends_with("/promote") => Route::SessionPromote,
         _ if path.starts_with("/dashboard") || path.starts_with("/api/v1/dashboard") => Route::Dashboard,
@@ -1036,6 +1057,86 @@ fn tool_audit_gate(state: &AppState, key: &str) -> Arc<tokio::sync::Mutex<()>> {
 }
 
 async fn mcp_call(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    mcp_entry(state, headers, body, crate::mcp::Scope::All).await
+}
+
+/// `/mcp/{backend}`: the same MCP endpoint, restricted to one backend's
+/// tools. Each backend gets its own route behind the one gateway host.
+async fn mcp_backend_call(
+    State(state): State<AppState>,
+    Path(backend): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if state.backend_router.get(&backend).is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(openai_error_body(StatusCode::NOT_FOUND, "unknown MCP backend")),
+        )
+            .into_response();
+    }
+    mcp_entry(state, headers, body, crate::mcp::Scope::Backend(backend)).await
+}
+
+/// The gateway opens no server-to-client SSE stream, which the Streamable
+/// HTTP transport allows by answering `GET` with 405.
+async fn mcp_get(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(response) = crate::mcp::check_origin(&state, &headers) {
+        return *response;
+    }
+    let mut response = StatusCode::METHOD_NOT_ALLOWED.into_response();
+    response.headers_mut().insert(
+        axum::http::header::ALLOW,
+        HeaderValue::from_static("POST, DELETE"),
+    );
+    response
+}
+
+/// `DELETE` with an `MCP-Session-Id` ends the MCP session: its AgentVisor
+/// session is closed exactly like `POST /v1/sessions/{id}/close`, so the
+/// session's receipt or trajectory is finalized.
+async fn mcp_delete(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(response) = crate::mcp::check_origin(&state, &headers) {
+        return *response;
+    }
+    let caller = match lifecycle_caller(&state, &headers, &state.config.session_close_scope).await {
+        Ok(caller) => caller,
+        Err(error) => return pipeline_error(error),
+    };
+    let mut headers = headers;
+    let session = match crate::mcp::bind_session(&state, &mut headers, &caller) {
+        Ok(Some(session)) => session,
+        Ok(None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(openai_error_body(
+                    StatusCode::BAD_REQUEST,
+                    "MCP-Session-Id is required",
+                )),
+            )
+                .into_response()
+        }
+        Err(response) => return *response,
+    };
+    state.mcp_backends.forget_agent_session(&session.agent_session);
+    let Some(agent_session) = state.sessions.get(&session.agent_session) else {
+        // No call ever opened the audited session: nothing to finalize.
+        return StatusCode::NO_CONTENT.into_response();
+    };
+    if let Err(error) = caller.authorize_session(&state, &agent_session, &state.config.session_close_scope) {
+        return pipeline_error(error);
+    }
+    match state
+        .finalizer
+        .close_session(agent_session, StopReason::SessionClosed)
+        .await
+    {
+        Ok(outcome) => Json(outcome).into_response(),
+        Err(error) => finalize_error_response(&error),
+    }
+}
+
+async fn mcp_entry(state: AppState, headers: HeaderMap, body: Bytes, scope: crate::mcp::Scope) -> Response {
     // Reject an inbound request whose declared
     // `Content-Type` is not `application/json`. MCP is JSON-RPC 2.0
     // (spec: MUST be `application/json`), and a client sending e.g.
@@ -1103,7 +1204,7 @@ async fn mcp_call(State(state): State<AppState>, headers: HeaderMap, body: Bytes
     match tokio::spawn(async move {
         let _admission_permit = admission_permit;
         let _inflight_guard = inflight_guard;
-        mcp_call_inner(state, headers, body).await
+        mcp_call_inner(state, headers, body, scope).await
     })
     .await
     {
@@ -1139,7 +1240,21 @@ async fn refund_tool_admission(
     .map_err(|_| "tool admission refund task failed".to_owned())
 }
 
-async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Response {
+async fn mcp_call_inner(
+    state: AppState,
+    headers: HeaderMap,
+    body: Bytes,
+    scope: crate::mcp::Scope,
+) -> Response {
+    // Streamable HTTP transport rules come first: a refused Origin or an
+    // unsupported protocol version never reaches authentication.
+    if let Err(response) = crate::mcp::check_origin(&state, &headers) {
+        return *response;
+    }
+    if let Err(response) = crate::mcp::check_protocol_version(&headers) {
+        return *response;
+    }
+    let mut headers = headers;
     // Idempotent execution tracking is needed whenever a call CAN be
     // forwarded — through `tool_upstream_url` or any `[[backends]]` entry —
     // because the forwarding branch below has no other execution state.
@@ -1157,7 +1272,32 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
             }
             Err(error) => return pipeline_error(crate::pipeline::PipelineError::unavailable_source(error)),
         };
-    let (execution, unaudited_outcome, caller) = if forwarding_configured {
+    // An `MCP-Session-Id` names the audited session every call of that
+    // MCP session belongs to; bind it as `X-AV-Session` for the tool path.
+    let mcp_session = match crate::mcp::bind_session(&state, &mut headers, &authenticated) {
+        Ok(session) => session,
+        Err(response) => return *response,
+    };
+    match crate::mcp::answer(
+        &state,
+        &headers,
+        &authenticated,
+        crate::mcp::classify(&body),
+        &scope,
+        mcp_session.as_ref(),
+    )
+    .await
+    {
+        Ok(Some(response)) => return response,
+        Ok(None) => {}
+        Err(error) => {
+            if let Err(audit_error) = state.audit_authentication_error(&headers, &error) {
+                return pipeline_error(audit_error);
+            }
+            return pipeline_error(error);
+        }
+    }
+    let (execution, unaudited_outcome) = if forwarding_configured {
         // Same cheap pre-parse identity gate as the intercept path
         // (pipeline::refuse_unauthenticated_tool_call): required
         // identity + no Authorization header can never be admitted —
@@ -1215,7 +1355,7 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
                         if let Err(response) = authorized_session("pending tool audit") {
                             return *response;
                         }
-                        (Some(execution), Some(outcome), Some(identity))
+                        (Some(execution), Some(outcome))
                     }
                     Ok(ToolExecutionState::Pending) => {
                         if let Err(response) = authorized_session("pending tool execution") {
@@ -1227,7 +1367,7 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
                         )
                             .into_response();
                     }
-                    Ok(ToolExecutionState::Missing) => (Some(execution), None, Some(identity)),
+                    Ok(ToolExecutionState::Missing) => (Some(execution), None),
                     Err(error) if error == TOOL_REQUEST_MISMATCH => {
                         // Same session-binding discipline as every other
                         // `load()` arm above: without it, any holder of a
@@ -1261,7 +1401,7 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
             Err(error) => return pipeline_error(error),
         }
     } else {
-        (None, None, None)
+        (None, None)
     };
     if let (Some(execution), Some(_)) = (execution.as_ref(), unaudited_outcome.as_ref()) {
         let _lease = match state.lease_session(&headers) {
@@ -1301,8 +1441,110 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
     // Credential exchange is an authorization gate: finish it before the
     // sandbox charges budget or records an allowed verdict.
     let mut exchange_token = None;
-    let mut exchange_denial = None;
-    if let Some(execution) = &execution {
+    let mut preflight_denial = None;
+    // A per-backend endpoint serves only its own backend's tools. The
+    // refusal is an audited policy denial, decided before any budget spend.
+    if let crate::mcp::Scope::Backend(name) = &scope {
+        if let Ok(request) = av_sandbox::parse_tool_call(&body) {
+            let routed = state
+                .backend_router
+                .resolve(&request.tool)
+                .map(|backend| backend.name.as_str());
+            if routed != Some(name.as_str()) {
+                let code = av_sandbox::DenialCode::NoBackend;
+                let reason = format!("tool {:?} is not served by backend {name:?}", request.tool);
+                preflight_denial = Some(ToolVerdict::Blocked {
+                    tool: request.tool.clone(),
+                    stage: "policy",
+                    policy: Some("backend.route".into()),
+                    denial_code: code,
+                    response: av_sandbox::rpc::denial_error(request.id.as_ref(), code, &reason),
+                    reason,
+                    elapsed_us: 0,
+                });
+            }
+        }
+    }
+    // External AuthZEN PDP: consulted only when the local intent map and
+    // missions permit the call (a local denial is audited by the
+    // intercept), before any budget is spent. Its denial is an audited
+    // policy denial; an unreachable PDP fails closed with 503.
+    if let (None, Some(authzen)) = (&preflight_denial, &state.authzen) {
+        if let Ok(request) = av_sandbox::parse_tool_call(&body) {
+            let facts = authenticated.facts();
+            let now_s = av_core::time::now_ms() / 1000;
+            if let crate::authz::AuthzDecision::Permit { intent } =
+                state.pdp.decide_for(&request.tool, now_s, &facts)
+            {
+                let missions: Vec<String> = state
+                    .pdp
+                    .applicable_missions(&facts)
+                    .into_iter()
+                    .map(|mission| mission.id.clone())
+                    .collect();
+                let backend = state
+                    .backend_router
+                    .resolve(&request.tool)
+                    .map(|backend| backend.name.as_str());
+                let session = crate::pipeline::single_header(&headers, crate::pipeline::SESSION_HEADER)
+                    .ok()
+                    .flatten()
+                    .and_then(|value| value.to_str().ok());
+                let evaluation = crate::authzen::evaluation_request(
+                    &authenticated,
+                    &request.tool,
+                    &intent,
+                    backend,
+                    session,
+                    &missions,
+                );
+                match authzen.evaluate(&evaluation).await {
+                    Ok(crate::authzen::AuthzenDecision::Permit) => {
+                        state
+                            .metrics
+                            .counter(
+                                "av_authzen_decisions_total{decision=\"permit\"}",
+                                "External AuthZEN decisions by outcome",
+                            )
+                            .inc();
+                    }
+                    Ok(crate::authzen::AuthzenDecision::Deny(reason)) => {
+                        state
+                            .metrics
+                            .counter(
+                                "av_authzen_decisions_total{decision=\"deny\"}",
+                                "External AuthZEN decisions by outcome",
+                            )
+                            .inc();
+                        let code = av_sandbox::DenialCode::PdpDenied;
+                        preflight_denial = Some(ToolVerdict::Blocked {
+                            tool: request.tool.clone(),
+                            stage: "policy",
+                            policy: Some("pdp.authzen".into()),
+                            denial_code: code,
+                            response: av_sandbox::rpc::denial_error(request.id.as_ref(), code, &reason),
+                            reason,
+                            elapsed_us: 0,
+                        });
+                    }
+                    Err(error) => {
+                        state
+                            .metrics
+                            .counter(
+                                "av_authzen_decisions_total{decision=\"error\"}",
+                                "External AuthZEN decisions by outcome",
+                            )
+                            .inc();
+                        tracing::warn!(%error, "external policy decision point unavailable; refusing the call");
+                        return pipeline_error(crate::pipeline::PipelineError::unavailable(
+                            "the external policy decision point is unavailable; retry shortly".to_owned(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    if let (Some(execution), None) = (&execution, &preflight_denial) {
         if let Some(backend) = state
             .backend_router
             .resolve(&execution.tool)
@@ -1313,7 +1555,7 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
                 Err(crate::pipeline::PipelineError::Blocked { context: reason, .. }) => {
                     let request = av_sandbox::parse_tool_call(&body).ok();
                     let code = av_sandbox::DenialCode::PolicyDenied;
-                    exchange_denial = Some(ToolVerdict::Blocked {
+                    preflight_denial = Some(ToolVerdict::Blocked {
                         tool: execution.tool.clone(),
                         stage: "policy",
                         policy: Some("backend.exchange".into()),
@@ -1331,8 +1573,10 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
             }
         }
     }
+    // Kept for the intent token: the intercept consumes the caller.
+    let intent_caller = authenticated.clone();
     match state
-        .intercept_authenticated_nonblocking(&headers, &body, authenticated, exchange_denial)
+        .intercept_authenticated_nonblocking(&headers, &body, authenticated, preflight_denial)
         .await
     {
         Ok(ToolVerdict::Allowed {
@@ -1368,13 +1612,40 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
                 let intent = state.pdp.intent_for(&tool);
                 let audience =
                     resolved_backend.map_or(crate::backend::DEFAULT_BACKEND_NAME, |b| b.name.as_str());
-                let subject = caller.as_ref().map_or_else(
-                    || "anonymous".to_owned(),
-                    crate::pipeline::principal_id_for_budget,
-                );
-                let intent_token = state
-                    .pdp
-                    .mint_intent_token(&tool, &intent, &subject, audience, now_s);
+                let intent_token =
+                    state
+                        .pdp
+                        .mint_intent_token(&tool, &intent, &intent_caller.facts(), audience, now_s);
+                // The credential this backend (and only this backend)
+                // receives, resolved before the execution is claimed so a
+                // missing forwarded token fails without an uncertain claim.
+                let credential: Option<(axum::http::HeaderName, HeaderValue)> =
+                    if let Some(token) = &exchange_token {
+                        crate::mcp::bearer_header(token)
+                    } else if let Some(backend) = resolved_backend {
+                        if backend.auth_mode == crate::backend::BackendAuthMode::ForwardToken {
+                            let Some(header) = crate::mcp::caller_bearer(&headers) else {
+                                if let Err(error) = refund_admission().await {
+                                    return lifecycle_error(error);
+                                }
+                                return pipeline_error(crate::pipeline::PipelineError::Unauthorized(
+                                    "this backend requires the caller's bearer token".to_owned(),
+                                ));
+                            };
+                            Some(header)
+                        } else {
+                            backend.auth_header.clone()
+                        }
+                    } else {
+                        state
+                            .tool_auth
+                            .clone()
+                            .map(|bearer| (axum::http::header::AUTHORIZATION, bearer))
+                    };
+                let intent_header = intent_token
+                    .as_deref()
+                    .and_then(|token| HeaderValue::from_str(token).ok())
+                    .map(|value| (axum::http::HeaderName::from_static("x-av-intent-token"), value));
                 let _lease = match state.lease_session(&headers) {
                     Ok(lease) => lease,
                     Err(error) => {
@@ -1445,36 +1716,104 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
                         session.mark_capture_failed();
                     }
                 };
+                // A fixed request-local deadline follows the response
+                // through body reads. Idle reads alone let a slow drip
+                // occupy this detached task and its admission slot forever.
+                let tool_timeout = std::time::Duration::from_secs(
+                    state
+                        .config
+                        .mcp_request_timeout_s
+                        .unwrap_or(crate::config::DEFAULT_MCP_REQUEST_TIMEOUT_S),
+                );
+                if let Some(backend) = resolved_backend
+                    .filter(|backend| backend.transport == crate::config::BackendTransport::Mcp)
+                {
+                    // MCP Streamable HTTP: the backend session of this
+                    // agent session, SSE decoding, and one retry after a
+                    // session-expiry 404 (see mcp_client.rs).
+                    let request_id = serde_json::from_slice::<Value>(&body)
+                        .ok()
+                        .and_then(|request| request.get("id").cloned())
+                        .unwrap_or(Value::Null);
+                    let endpoint = crate::mcp_client::BackendEndpoint {
+                        url: url.to_owned(),
+                        auth: credential,
+                        extra: intent_header.into_iter().collect(),
+                        deadline: tokio::time::Instant::now() + tool_timeout,
+                    };
+                    let exchanged = state
+                        .mcp_backends
+                        .request(
+                            &execution.session_id,
+                            &backend.name,
+                            &endpoint,
+                            &body,
+                            &request_id,
+                        )
+                        .await;
+                    let outcome = match exchanged {
+                        Ok((status, bytes, content_type)) => ToolOutcome {
+                            status,
+                            body_hex: hex::encode(&bytes),
+                            content_type,
+                        },
+                        Err(crate::mcp_client::McpError::NotDelivered(category)) => {
+                            // The call itself never reached the backend:
+                            // release the claim and refund, exactly like a
+                            // connect failure on the plain transport.
+                            match execution.release_unexecuted().await {
+                                Ok(()) => {
+                                    if let Err(error) = refund_admission().await {
+                                        return lifecycle_error(error);
+                                    }
+                                }
+                                Err(release_error) => {
+                                    mark_incomplete();
+                                    tracing::warn!(
+                                        session = %execution.session_id,
+                                        error = %release_error,
+                                        "failed to release undelivered MCP tool intent; charge kept, key stays claimed"
+                                    );
+                                }
+                            }
+                            return pipeline_error(crate::pipeline::PipelineError::upstream(format!(
+                                "forward tool call: {category}"
+                            )));
+                        }
+                        Err(crate::mcp_client::McpError::AfterDelivery(error)) => ToolOutcome {
+                            status: StatusCode::BAD_GATEWAY.as_u16(),
+                            body_hex: hex::encode(
+                                serde_json::to_vec(&json!({
+                                    "error": format!("tool executed but its response could not be read: {error}"),
+                                }))
+                                .unwrap_or_default(),
+                            ),
+                            content_type: Some("application/json".to_owned()),
+                        },
+                    };
+                    let gate = tool_audit_gate(&state, &execution.key);
+                    let _gate = gate.lock().await;
+                    if let Err(error) = execution.persist(&outcome).await {
+                        mark_incomplete();
+                        return lifecycle_error(error);
+                    }
+                    let Some(session) = state.sessions.get(&execution.session_id) else {
+                        return lifecycle_error("tool session disappeared".to_owned());
+                    };
+                    return complete_tool_audit(&state, &execution, outcome, completion_permit, session)
+                        .await;
+                }
                 let mut tool_request = state
-                    .client
+                    .backend_client
                     .post(url)
-                    // A fixed request-local deadline follows the response
-                    // through body reads. Idle reads alone let a slow drip
-                    // occupy this detached task and its admission slot forever.
-                    .timeout(std::time::Duration::from_secs(
-                        state
-                            .config
-                            .mcp_request_timeout_s
-                            .unwrap_or(crate::config::DEFAULT_MCP_REQUEST_TIMEOUT_S),
-                    ))
+                    .timeout(tool_timeout)
                     .header(axum::http::header::CONTENT_TYPE, "application/json")
                     .body(body);
-                if let Some(token) = &exchange_token {
-                    if let Ok(mut val) = HeaderValue::from_str(&format!("Bearer {token}")) {
-                        val.set_sensitive(true);
-                        tool_request = tool_request.header(axum::http::header::AUTHORIZATION, val);
-                    }
-                } else if let Some(backend) = resolved_backend {
-                    if let Some((name, value)) = &backend.auth_header {
-                        tool_request = tool_request.header(name.clone(), value.clone());
-                    }
-                } else if let Some(bearer) = &state.tool_auth {
-                    tool_request = tool_request.header(axum::http::header::AUTHORIZATION, bearer.clone());
+                if let Some((name, value)) = &credential {
+                    tool_request = tool_request.header(name.clone(), value.clone());
                 }
-                if let Some(token) = &intent_token {
-                    if let Ok(value) = HeaderValue::from_str(token) {
-                        tool_request = tool_request.header("x-av-intent-token", value);
-                    }
+                if let Some((name, value)) = &intent_header {
+                    tool_request = tool_request.header(name.clone(), value.clone());
                 }
                 match tool_request.send().await {
                     Ok(upstream) => {
@@ -2793,6 +3132,15 @@ async fn token_exchange(State(state): State<AppState>, body: Bytes) -> Response 
 }
 
 fn token_exchange_inner(state: AppState, body: Bytes) -> Response {
+    // RFC 7523 workload assertions have their own grant and their own gate
+    // (`[workload_identity]`), independent of `token_exchange_enabled`.
+    let grant_type = serde_urlencoded::from_bytes::<Vec<(String, String)>>(&body)
+        .ok()
+        .and_then(|pairs| pairs.into_iter().find(|(key, _)| key == "grant_type"))
+        .map(|(_, value)| value);
+    if grant_type.as_deref() == Some(av_identity::JWT_BEARER_GRANT_TYPE) {
+        return crate::workload::grant(&state, &body);
+    }
     if !state.config.token_exchange_enabled {
         return StatusCode::NOT_FOUND.into_response();
     }
@@ -2886,6 +3234,50 @@ fn token_exchange_inner(state: AppState, body: Bytes) -> Response {
         )
             .into_response();
     }
+    // RFC 8693 §2.1: `actor_token_type` is REQUIRED when `actor_token` is
+    // present and MUST NOT be sent without it. The actor is validated
+    // exactly like the subject (signature, revocation, human subject).
+    let actor = match (req.actor_token.as_deref(), req.actor_token_type.as_deref()) {
+        (None, None) => None,
+        (Some(token), Some(av_identity::exchange::JWT_TOKEN_TYPE)) => match validator.validate(token) {
+            Ok(actor) => Some(actor),
+            Err(av_identity::IdentityError::RevocationUnavailable(detail)) => {
+                tracing::error!(%detail, "identity revocation list unavailable; refusing token exchange");
+                return oauth_unavailable();
+            }
+            Err(error) => {
+                tracing::warn!(%error, "token exchange actor token rejected");
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(oauth_error(
+                        "invalid_request",
+                        crate::pipeline::classify_identity_error(&error),
+                    )),
+                )
+                    .into_response();
+            }
+        },
+        (Some(_), Some(other)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(oauth_error(
+                    "invalid_request",
+                    &format!("unsupported actor_token_type: {other:?}"),
+                )),
+            )
+                .into_response();
+        }
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(oauth_error(
+                    "invalid_request",
+                    "actor_token and actor_token_type must be sent together",
+                )),
+            )
+                .into_response();
+        }
+    };
     let params = av_identity::ExchangeParams {
         subject: &validated.claims,
         subject_chain: &validated.chain_tokens,
@@ -2899,14 +3291,19 @@ fn token_exchange_inner(state: AppState, body: Bytes) -> Response {
         max_depth: state.config.max_delegation_depth,
         allowed_audiences: &allowed_audiences,
     };
-    let exchanged = match av_identity::build_exchanged_claims(&params) {
+    let actor = actor.as_ref().map(|actor| av_identity::ExchangeActor {
+        claims: &actor.claims,
+        chain: &actor.chain_tokens,
+    });
+    let exchanged = match av_identity::build_exchanged_claims_with_actor(&params, actor.as_ref()) {
         Ok(c) => c,
         Err(e) => {
             let code = match &e {
                 av_identity::ExchangeError::EmptyIntersection
                 | av_identity::ExchangeError::ScopeExceedsSubject(_)
                 | av_identity::ExchangeError::InvalidScopes => "invalid_scope",
-                av_identity::ExchangeError::DelegationExceeded { .. } => "invalid_grant",
+                av_identity::ExchangeError::DelegationExceeded { .. }
+                | av_identity::ExchangeError::ActorNotDirect => "invalid_grant",
                 av_identity::ExchangeError::TargetNotAllowed(_) => "invalid_target",
                 _ => "invalid_request",
             };
@@ -3058,6 +3455,17 @@ fn exchange_for_backend(
     target_audience: &str,
     tool: &str,
 ) -> Result<String, crate::pipeline::PipelineError> {
+    exchange_token_for(state, caller, target_audience, &crate::pipeline::tool_scope(tool))
+}
+
+/// Mint a gateway-signed, backend-scoped token for `caller` holding
+/// `requested_scopes ∩ caller scopes` (space-separated request).
+pub(crate) fn exchange_token_for(
+    state: &AppState,
+    caller: &crate::pipeline::AuthenticatedCaller,
+    target_audience: &str,
+    requested_scopes: &str,
+) -> Result<String, crate::pipeline::PipelineError> {
     use crate::pipeline::PipelineError;
     let refused = |reason: String| PipelineError::blocked(format!("backend token exchange failed: {reason}"));
     let Some(signer) = state.token_signer.as_ref() else {
@@ -3072,13 +3480,12 @@ fn exchange_for_backend(
     let now_s = av_core::time::now_ms() / 1000;
     let ttl = state.config.token_exchange_ttl_s.min(900);
     let allowed_audiences: Vec<String> = state.config.backends.iter().map(|b| b.name.clone()).collect();
-    let tool_scope = crate::pipeline::tool_scope(tool);
     let params = av_identity::ExchangeParams {
         subject: &validated.claims,
         subject_chain: &validated.chain_tokens,
         subject_delegation_depth: validated.total_delegation_depth,
         target_audience,
-        requested_scopes: Some(&tool_scope),
+        requested_scopes: Some(requested_scopes),
         azp: &validated.claims.instance_uid,
         now_s,
         ttl_s: ttl,
@@ -3135,7 +3542,7 @@ fn pipeline_error_for_session(error: crate::pipeline::PipelineError, session_id:
     response
 }
 
-fn pipeline_error(error: crate::pipeline::PipelineError) -> Response {
+pub(crate) fn pipeline_error(error: crate::pipeline::PipelineError) -> Response {
     use crate::pipeline::PipelineError;
     let close = matches!(error, PipelineError::Abort(_));
     let status = error.status();

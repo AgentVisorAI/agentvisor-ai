@@ -113,6 +113,9 @@ fn pdp_expired_mission_denied() {
         id: "m-expired".into(),
         allowed_intents: vec!["data.mutate".into()],
         expires_at: 500,
+        agents: Vec::new(),
+        charters: Vec::new(),
+        subjects: Vec::new(),
     };
     let pdp = test_pdp(&[("db_write", "data.mutate")], false, Some(mission));
     match pdp.decide("db_write", 1000) {
@@ -133,6 +136,9 @@ fn pdp_mission_denies_unlisted_intent() {
         id: "m-narrow".into(),
         allowed_intents: vec!["data.read".into()],
         expires_at: 9999,
+        agents: Vec::new(),
+        charters: Vec::new(),
+        subjects: Vec::new(),
     };
     let pdp = test_pdp(&[("db_write", "data.mutate")], false, Some(mission));
     match pdp.decide("db_write", 1000) {
@@ -154,8 +160,18 @@ fn pdp_no_token_without_signer() {
         "expected permit"
     );
     assert!(
-        pdp.mint_intent_token("search", "data.read", "inst-1", "backend-a", 1000)
-            .is_none(),
+        pdp.mint_intent_token(
+            "search",
+            "data.read",
+            &av_harness::authz::CallerFacts {
+                instance_uid: "inst-1",
+                charter: "support",
+                subject: Some("user:alice@corp.com"),
+            },
+            "backend-a",
+            1000
+        )
+        .is_none(),
         "no signer → no intent token"
     );
 }
@@ -348,6 +364,7 @@ fn credential_isolation_between_backends() {
                 url: "http://a:8080".into(),
                 auth: BackendAuth::StaticEnv("E2E_TEST_BACKEND_KEY".into()),
                 tools: vec!["tool_a".into()],
+                transport: Default::default(),
             },
             backend_cfg("b", "http://b:8080", &["tool_b"]),
         ],
@@ -448,6 +465,9 @@ fn mission_narrowing_never_widens_static_policy() {
         id: "narrow".into(),
         allowed_intents: vec!["data.read".into()],
         expires_at: 9999,
+        agents: Vec::new(),
+        charters: Vec::new(),
+        subjects: Vec::new(),
     };
     let pdp = test_pdp(
         &[("db_write", "data.mutate"), ("db_read", "data.read")],
@@ -537,6 +557,7 @@ fn backend_cfg(name: &str, url: &str, tools: &[&str]) -> BackendConfig {
         url: url.into(),
         auth: BackendAuth::None,
         tools: tools.iter().map(|s| (*s).to_owned()).collect(),
+        transport: Default::default(),
     }
 }
 
@@ -593,7 +614,17 @@ fn signed_intent_token_is_valid_jwt() {
     };
     assert_eq!(intent, "data.mutate");
     let token = pdp
-        .mint_intent_token("db_write", &intent, "inst-1", "db-backend", now_s)
+        .mint_intent_token(
+            "db_write",
+            &intent,
+            &av_harness::authz::CallerFacts {
+                instance_uid: "inst-1",
+                charter: "support",
+                subject: Some("user:alice@corp.com"),
+            },
+            "db-backend",
+            now_s,
+        )
         .expect("must have intent token");
     assert_eq!(token.matches('.').count(), 2, "intent token must be a signed JWT");
     let header = jsonwebtoken::decode_header(&token).unwrap();
@@ -893,6 +924,7 @@ fn backend_static_file_rejects_world_readable() {
         url: "http://backend:8080".into(),
         auth: BackendAuth::StaticFile(path.to_string_lossy().into_owned()),
         tools: vec!["tool_a".into()],
+        transport: Default::default(),
     }];
     let result = av_harness::backend::BackendRouter::new(&configs, None, None);
     #[cfg(unix)]
@@ -914,6 +946,7 @@ fn backend_static_file_accepts_owner_only() {
         url: "http://backend:8080".into(),
         auth: BackendAuth::StaticFile(path.to_string_lossy().into_owned()),
         tools: vec!["tool_a".into()],
+        transport: Default::default(),
     }];
     let result = av_harness::backend::BackendRouter::new(&configs, None, None);
     assert!(
@@ -934,6 +967,7 @@ fn validate_exchange_backend_without_identity() {
         url: "http://ext:8080".into(),
         auth: BackendAuth::Exchange,
         tools: vec!["ext_tool".into()],
+        transport: Default::default(),
     });
     let err = config.validate().unwrap_err();
     assert!(
@@ -952,6 +986,7 @@ fn validate_exchange_backend_without_seed() {
         url: "http://ext:8080".into(),
         auth: BackendAuth::Exchange,
         tools: vec!["ext_tool".into()],
+        transport: Default::default(),
     });
     let err = config.validate().unwrap_err();
     assert!(
@@ -984,6 +1019,7 @@ async fn exchange_endpoint_returns_valid_signed_token() {
         url: "http://backend-a:8080".into(),
         auth: BackendAuth::None,
         tools: vec!["tool_a".into()],
+        transport: Default::default(),
     });
     let state = common::app_state_with_identity(
         config,
@@ -1121,6 +1157,7 @@ async fn exchange_endpoint_rejects_unknown_audience() {
         url: "http://backend-a:8080".into(),
         auth: BackendAuth::None,
         tools: vec!["tool_a".into()],
+        transport: Default::default(),
     });
     let state = common::app_state_with_identity(
         config,
@@ -1238,6 +1275,7 @@ async fn exchange_endpoint_rejects_garbage_subject_token() {
         url: "http://backend-a:8080".into(),
         auth: BackendAuth::None,
         tools: vec!["tool_a".into()],
+        transport: Default::default(),
     });
     let state = common::app_state_with_identity(
         config,
@@ -1293,6 +1331,7 @@ async fn exchange_endpoint_rejects_disjoint_scopes() {
         url: "http://backend-a:8080".into(),
         auth: BackendAuth::None,
         tools: vec!["tool_a".into()],
+        transport: Default::default(),
     });
     let state = common::app_state_with_identity(
         config,
@@ -1405,6 +1444,7 @@ fn backend(name: &str, url: &str, auth: BackendAuth, tools: &[&str]) -> BackendC
         url: url.into(),
         auth,
         tools: tools.iter().map(|tool| (*tool).to_owned()).collect(),
+        transport: Default::default(),
     }
 }
 
@@ -1510,7 +1550,7 @@ async fn exchange_backend_gets_a_least_privilege_token_and_never_the_caller_bear
     assert_eq!(reply.json["id"], 7);
     assert_eq!(reply.json["result"]["content"][0]["text"], "ok");
 
-    let received = upstream.requests();
+    let received = upstream.tool_calls();
     assert_eq!(received.len(), 1, "exactly one forwarded request");
     let forwarded = &received[0];
     assert!(
@@ -1554,8 +1594,15 @@ async fn exchange_backend_gets_a_least_privilege_token_and_never_the_caller_bear
     );
     assert_eq!(intent.iss, state.config.audience);
     assert_eq!(
-        intent.sub, "inst-backend-test",
-        "intent tokens name the calling agent"
+        intent.sub, "user:bob@acme.io",
+        "intent tokens name the human principal"
+    );
+    assert_eq!(
+        intent.act,
+        Some(av_harness::authz::IntentActor {
+            sub: "inst-backend-test".into()
+        }),
+        "and the calling agent as the actor"
     );
     assert_eq!(intent.tool, "lookup");
     assert_eq!(intent.intent, "lookup");
@@ -1577,7 +1624,7 @@ async fn exchange_backend_narrows_a_wildcard_grant_to_the_called_tool() {
     let reply = send(&state, tool_call("p4-wildcard", Some(&caller), "lookup", 1)).await;
     assert_eq!(reply.status, 200, "{}", reply.json);
     let jwks = served_jwks(&state).await;
-    let received = upstream.requests();
+    let received = upstream.tool_calls();
     let token = common::verify_with_jwks::<av_identity::NhiClaims>(&jwks, bearer_of(&received[0])).claims;
     assert_eq!(token.scopes, vec!["tool:lookup"]);
 }
@@ -1616,7 +1663,7 @@ async fn refused_exchange_refunds_the_budget_and_leaves_no_pending_claim() {
         "the one budgeted call must still be available after three refusals: {}",
         reply.json
     );
-    assert_eq!(upstream.requests().len(), 1);
+    assert_eq!(upstream.tool_calls().len(), 1);
 
     let over_cap = send(&state, tool_call("p4-refund", Some(&scoped), "lookup", 2)).await;
     assert_eq!(over_cap.status, 403, "{}", over_cap.json);
@@ -1663,8 +1710,8 @@ async fn static_and_open_backends_never_see_the_caller_bearer_or_each_others_sec
         200
     );
 
-    let static_seen = static_upstream.requests();
-    let open_seen = open_upstream.requests();
+    let static_seen = static_upstream.tool_calls();
+    let open_seen = open_upstream.tool_calls();
     assert_eq!((static_seen.len(), open_seen.len()), (1, 1));
     assert_eq!(
         static_seen[0].header("authorization"),
@@ -1675,14 +1722,19 @@ async fn static_and_open_backends_never_see_the_caller_bearer_or_each_others_sec
         None,
         "an auth = none backend receives no credential at all"
     );
-    for request in static_seen.iter().chain(&open_seen) {
+    // Every request counts here, the MCP handshake included.
+    let static_all = static_upstream.requests();
+    let open_all = open_upstream.requests();
+    for request in static_all.iter().chain(&open_all) {
         assert!(
             !request.everything().contains(&caller),
             "caller bearer leaked to a backend"
         );
     }
     assert!(
-        !open_seen[0].everything().contains("static-backend-secret"),
+        open_all
+            .iter()
+            .all(|request| !request.everything().contains("static-backend-secret")),
         "one backend's credential must never reach another"
     );
 }
@@ -1700,7 +1752,7 @@ async fn tool_upstream_bearer_reaches_the_implicit_default_backend() {
     let state = common::app_state(config, sandbox, Arc::new(common::CountingBus::default()), 2);
     let reply = send(&state, tool_call("p4-default", None, "anything", 1)).await;
     assert_eq!(reply.status, 200, "{}", reply.json);
-    let received = upstream.requests();
+    let received = upstream.tool_calls();
     assert_eq!(received.len(), 1);
     assert_eq!(
         received[0].header("authorization"),
@@ -1736,7 +1788,7 @@ async fn each_tool_reaches_only_its_backend_and_unrouted_tools_are_decided_not_f
     assert_eq!(unrouted.status, 200, "{}", unrouted.json);
     assert_eq!(unrouted.json["result"]["allowed"], true);
 
-    let (alpha_seen, beta_seen) = (alpha.requests(), beta.requests());
+    let (alpha_seen, beta_seen) = (alpha.tool_calls(), beta.tool_calls());
     assert_eq!((alpha_seen.len(), beta_seen.len()), (1, 1));
     assert!(String::from_utf8_lossy(&alpha_seen[0].body).contains("alpha_tool"));
     assert!(String::from_utf8_lossy(&beta_seen[0].body).contains("beta_tool"));
@@ -1827,6 +1879,9 @@ async fn expired_mission_blocks_a_forwarded_call_before_any_backend_contact() {
                 id: "m-over".into(),
                 allowed_intents: vec!["ops.read".into()],
                 expires_at: 1,
+                agents: Vec::new(),
+                charters: Vec::new(),
+                subjects: Vec::new(),
             });
         },
     );
@@ -1961,7 +2016,7 @@ async fn revoked_token_is_refused_on_the_next_call_and_other_tokens_keep_working
         "revocation is per token, not per agent"
     );
     assert_eq!(
-        upstream.requests().len(),
+        upstream.tool_calls().len(),
         2,
         "the refused call never reached the backend"
     );
@@ -2077,7 +2132,7 @@ async fn revoking_a_token_stops_its_backend_exchanges() {
         401
     );
     assert_eq!(
-        upstream.requests().len(),
+        upstream.tool_calls().len(),
         1,
         "no exchanged token is minted for a revoked caller"
     );
@@ -2410,7 +2465,7 @@ async fn operator_revokes_by_jti_and_by_instance_without_holding_tokens() {
         401
     );
     assert_eq!(introspection(&state, &exchange).await.json["active"], false);
-    assert_eq!(upstream.requests().len(), 1);
+    assert_eq!(upstream.tool_calls().len(), 1);
     assert_eq!(
         send(
             &state,
@@ -2560,7 +2615,7 @@ async fn cached_results_and_sessions_are_bound_to_the_human_principal() {
         &bob,
     );
     assert_eq!(send(&state, close).await.status, 401);
-    assert_eq!(upstream.requests().len(), 1);
+    assert_eq!(upstream.tool_calls().len(), 1);
 }
 
 #[tokio::test]
@@ -2594,7 +2649,7 @@ async fn exchange_refusal_is_a_denial_and_does_not_spend_budget() {
     use std::sync::atomic::Ordering;
     assert_eq!(session.totals.tool_allowed.load(Ordering::Relaxed), 1);
     assert_eq!(session.totals.tool_blocked.load(Ordering::Relaxed), 1);
-    assert_eq!(upstream.requests().len(), 1);
+    assert_eq!(upstream.tool_calls().len(), 1);
     let metrics = state.metrics.render();
     assert!(metrics.contains("av_identity_validations_total 2"), "{metrics}");
 }
@@ -2829,6 +2884,7 @@ async fn gateway_signed_tokens_keep_the_exchanged_revocation_namespace() {
         .sign(&av_identity::ExchangedClaims {
             claims: claims.clone(),
             av_subject_tokens: Vec::new(),
+            av_actor_tokens: Vec::new(),
             av_delegation_depth: 1,
         })
         .unwrap();

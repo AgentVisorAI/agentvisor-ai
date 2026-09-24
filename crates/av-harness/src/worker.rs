@@ -710,6 +710,31 @@ pub fn spawn_worker_with_spool_authenticated(
     metrics: Arc<Registry>,
     redaction: Option<Arc<av_redact::RedactionEngine>>,
 ) -> WorkerHandle {
+    spawn_worker_with_outputs(
+        capacity,
+        bridge,
+        embedder,
+        vector_sink,
+        spool_dir,
+        journal_key,
+        metrics,
+        crate::content::AuditOutputs::with_redaction(redaction),
+    )
+}
+
+/// Start the worker pool with authenticated journals, redaction, and an
+/// optional content sink that receives every journaled step.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_worker_with_outputs(
+    capacity: usize,
+    bridge: Arc<dyn EventBus>,
+    embedder: Arc<dyn Embedder>,
+    vector_sink: Arc<dyn VectorSink>,
+    spool_dir: Option<std::path::PathBuf>,
+    journal_key: [u8; 32],
+    metrics: Arc<Registry>,
+    outputs: crate::content::AuditOutputs,
+) -> WorkerHandle {
     // Sharding is decoupled from `capacity`: routing is by
     // `partition_for(session_id, senders.len())`, so every spawned
     // shard is routable by construction. Under `capacity = 1` all
@@ -770,7 +795,7 @@ pub fn spawn_worker_with_spool_authenticated(
             Arc::clone(&metrics),
             Arc::clone(&pending),
             Arc::clone(&drained),
-            redaction.clone(),
+            outputs.clone(),
         );
     }
     WorkerHandle {
@@ -810,7 +835,7 @@ fn spawn_worker_shard(
     worker_metrics: Arc<Registry>,
     worker_pending: Arc<std::sync::atomic::AtomicU64>,
     worker_drained: Arc<tokio::sync::Notify>,
-    redaction: Option<Arc<av_redact::RedactionEngine>>,
+    outputs: crate::content::AuditOutputs,
 ) {
     // To avoid intra-shard head-of-line blocking, the shard is
     // a DISPATCHER over per-session FIFO queues, not a serial loop.
@@ -855,7 +880,7 @@ fn spawn_worker_shard(
             let worker_metrics = Arc::clone(&worker_metrics);
             let worker_pending = Arc::clone(&worker_pending);
             let worker_drained = Arc::clone(&worker_drained);
-            let redaction = redaction.clone();
+            let outputs = outputs.clone();
             tasks.spawn(async move {
                 use futures::future::FutureExt as _;
                 // Supervise the whole envelope (routing + process_job)
@@ -876,7 +901,7 @@ fn spawn_worker_shard(
                         worker_metrics,
                         worker_pending,
                         worker_drained,
-                        redaction,
+                        outputs,
                     ))
                     .catch_unwind()
                     .await;
@@ -1079,7 +1104,7 @@ async fn process_envelope_batch(
     worker_metrics: Arc<Registry>,
     worker_pending: Arc<std::sync::atomic::AtomicU64>,
     worker_drained: Arc<tokio::sync::Notify>,
-    redaction: Option<Arc<av_redact::RedactionEngine>>,
+    outputs: crate::content::AuditOutputs,
 ) {
     let mut iterator = envelopes.into_iter();
     let Some(first) = iterator.next() else { return };
@@ -1095,7 +1120,7 @@ async fn process_envelope_batch(
             worker_metrics,
             worker_pending,
             worker_drained,
-            redaction,
+            outputs,
         )
         .await;
     }
@@ -1146,7 +1171,7 @@ async fn process_envelope_batch(
                 journal_key,
                 &batch_metrics,
                 /* sync_journal */ false,
-                redaction.as_ref(),
+                &outputs,
             )
             .instrument(span)
             .await;
@@ -1248,7 +1273,7 @@ async fn process_envelope(
     worker_metrics: Arc<Registry>,
     worker_pending: Arc<std::sync::atomic::AtomicU64>,
     worker_drained: Arc<tokio::sync::Notify>,
-    redaction: Option<Arc<av_redact::RedactionEngine>>,
+    outputs: crate::content::AuditOutputs,
 ) {
     // `worker_pending` was previously decremented at the
     // bottom of this function. Any panic between here and that line
@@ -1295,7 +1320,7 @@ async fn process_envelope(
                     spool_dir,
                     journal_key,
                     job_metrics,
-                    redaction,
+                    outputs,
                 )
                 .await
             }
@@ -1408,6 +1433,12 @@ struct PersistedJob {
     event_uid: String,
     record: ActiveJournalRecord,
     response_marker: Option<String>,
+    /// Content form of the step, handed to the content dispatcher only
+    /// after the step is durable and published.
+    content: Option<(
+        Arc<crate::content::ContentDispatcher>,
+        crate::content::ContentRecord,
+    )>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1419,7 +1450,7 @@ async fn process_job(
     spool_dir: Option<std::path::PathBuf>,
     journal_key: [u8; 32],
     metrics: Arc<Registry>,
-    redaction: Option<Arc<av_redact::RedactionEngine>>,
+    outputs: crate::content::AuditOutputs,
 ) -> Result<(), String> {
     match persist_job(
         job,
@@ -1429,7 +1460,7 @@ async fn process_job(
         journal_key,
         &metrics,
         /* sync_journal */ true,
-        redaction.as_ref(),
+        &outputs,
     )
     .await?
     {
@@ -1501,7 +1532,7 @@ async fn persist_job(
     journal_key: [u8; 32],
     metrics: &Arc<Registry>,
     sync_journal: bool,
-    redaction: Option<&Arc<av_redact::RedactionEngine>>,
+    outputs: &crate::content::AuditOutputs,
 ) -> Result<Option<PersistedJob>, String> {
     // A queued envelope for a session that has already been poisoned must not
     // consume a sequence number or write to the journal — otherwise the seq
@@ -1651,6 +1682,8 @@ async fn persist_job(
         _ => (job.class, job.status, job.stop_reason, job.payload),
     };
 
+    // Kept for the content sink: the event builder consumes it.
+    let native_finish_reason = job.native_stop_reason.clone();
     let mut builder = OcsfEventBuilder::new(
         class,
         job.session.id.clone(),
@@ -1706,7 +1739,7 @@ async fn persist_job(
     };
     // Redaction scans caller-controlled text. Keep that CPU work off the
     // async runtime, while still completing it before any journal or bus write.
-    let (value, atif_step) = if let Some(engine) = redaction {
+    let (value, atif_step) = if let Some(engine) = outputs.redaction.as_ref() {
         let engine = Arc::clone(engine);
         tokio::task::spawn_blocking(move || redact_audit_capture(value, atif_step, submitted_class, &engine))
             .await
@@ -1762,6 +1795,26 @@ async fn persist_job(
         )
         .await?;
     }
+    let content = outputs.dispatcher().map(|dispatcher| {
+        (
+            dispatcher,
+            content_record(
+                ContentSource {
+                    session_id: &job.session.id,
+                    identity: &job.identity,
+                    capture: job.atif.as_ref(),
+                    metrics: &job.metrics,
+                    attempt: job.response_attempt.as_ref(),
+                },
+                atif_step.as_ref(),
+                class,
+                status,
+                &value,
+                &event_uid,
+                native_finish_reason,
+            ),
+        )
+    });
     Ok(Some(PersistedJob {
         session: job.session,
         identity: job.identity,
@@ -1770,7 +1823,87 @@ async fn persist_job(
         event_uid,
         record,
         response_marker,
+        content,
     }))
+}
+
+/// The journaled step in content form. Unsigned sessions supply the
+/// (redacted) trajectory step; signed sessions supply the original capture,
+/// which the sink redacts itself.
+struct ContentSource<'a> {
+    session_id: &'a str,
+    identity: &'a av_events::AgentIdentity,
+    capture: Option<&'a AtifCapture>,
+    metrics: &'a EventMetrics,
+    attempt: Option<&'a ResponseAttempt>,
+}
+
+fn content_record(
+    job: ContentSource<'_>,
+    step: Option<&av_atif::Step>,
+    class: EventClass,
+    status: StatusId,
+    event: &Value,
+    event_uid: &str,
+    finish_reason: Option<String>,
+) -> crate::content::ContentRecord {
+    let label = |source: av_atif::Source| {
+        match source {
+            av_atif::Source::User => "user",
+            av_atif::Source::Agent => "agent",
+            _ => "system",
+        }
+        .to_owned()
+    };
+    let (source, message, reasoning, model, tool_calls, observation) = match (step, job.capture) {
+        (Some(step), _) => (
+            Some(label(step.source)),
+            Some(step.message.clone()),
+            step.reasoning_content.clone(),
+            step.model_name.clone(),
+            step.tool_calls
+                .as_ref()
+                .and_then(|calls| serde_json::to_value(calls).ok()),
+            step.observation
+                .as_ref()
+                .and_then(|observation| serde_json::to_value(observation).ok()),
+        ),
+        (None, Some(capture)) => (
+            Some(label(capture.source)),
+            Some(capture.message.clone()),
+            capture.reasoning_content.clone(),
+            capture.model_name.clone(),
+            capture
+                .tool_calls
+                .as_ref()
+                .and_then(|calls| serde_json::to_value(calls).ok()),
+            capture
+                .observation
+                .as_ref()
+                .and_then(|observation| serde_json::to_value(observation).ok()),
+        ),
+        (None, None) => (None, None, None, None, None, None),
+    };
+    crate::content::ContentRecord {
+        session_id: job.session_id.to_owned(),
+        event_uid: event_uid.to_owned(),
+        class,
+        success: status == StatusId::Success,
+        identity: job.identity.clone(),
+        time_ms: av_core::time::now_ms(),
+        event: event.clone(),
+        source,
+        message,
+        reasoning,
+        model,
+        tool_calls,
+        observation,
+        prompt_tokens: job.metrics.prompt_tokens,
+        completion_tokens: job.metrics.completion_tokens,
+        finish_reason,
+        attempt_id: job.attempt.map(|attempt| attempt.id.clone()),
+        terminal: job.attempt.is_some_and(|attempt| attempt.terminal),
+    }
 }
 
 /// Phase B: everything that makes the job externally visible. MUST
@@ -1792,6 +1925,7 @@ async fn finish_job(
         event_uid,
         record,
         response_marker,
+        content,
     } = persisted;
     match session.workflow {
         Workflow::Signed => session
@@ -1835,6 +1969,11 @@ async fn finish_job(
         .map_err(|error| error.to_string())?;
     if let (Some(directory), Some(attempt_id)) = (spool_dir, response_marker.as_deref()) {
         clear_response_marker(directory, &journal_key, &session.id, attempt_id).await?;
+    }
+    // Content leaves the process only after the step is durable and
+    // published; the dispatcher never blocks and never fails this job.
+    if let Some((dispatcher, content)) = content {
+        dispatcher.submit(content);
     }
     Ok(())
 }

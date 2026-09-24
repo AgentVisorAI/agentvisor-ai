@@ -58,6 +58,9 @@ pub enum DenialCode {
     /// Payout amount field could not be parsed or is negative.
     #[serde(rename = "PAYOUT_INVALID")]
     PayoutInvalid,
+    /// The external AuthZEN policy decision point denied the call.
+    #[serde(rename = "PDP_DENIED")]
+    PdpDenied,
 }
 
 impl DenialCode {
@@ -79,6 +82,7 @@ impl DenialCode {
             Self::NoBackend => "NO_BACKEND",
             Self::IntentTokenError => "INTENT_TOKEN_ERROR",
             Self::PayoutInvalid => "PAYOUT_INVALID",
+            Self::PdpDenied => "PDP_DENIED",
         }
     }
 }
@@ -113,6 +117,7 @@ mod tests {
             DenialCode::NoBackend,
             DenialCode::IntentTokenError,
             DenialCode::PayoutInvalid,
+            DenialCode::PdpDenied,
         ];
         for code in codes {
             let json = serde_json::to_string(&code).unwrap();

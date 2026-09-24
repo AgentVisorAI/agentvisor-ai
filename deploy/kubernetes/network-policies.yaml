@@ -1,0 +1,63 @@
+# Network isolation for AgentVisor AI and the MCP servers behind it.
+#
+# These policies make the gateway the only path to your MCP backends, and
+# limit who can reach the gateway. They take effect only on a cluster whose
+# network plugin enforces NetworkPolicy (for example Calico or Cilium).
+#
+#   kubectl -n agentvisor-ai apply -f network-policies.yaml
+#
+# Apply the second policy in EVERY namespace that runs MCP backends (edit
+# its `namespace:`), and label each backend pod
+# `agentvisor.ai/mcp-backend: "true"`. Label each client (agent) pod that
+# may call the gateway `agentvisor.ai/client: "true"`.
+#
+# Pair these with `require_private_backends = true` in agentvisor.toml: the
+# gateway then refuses to connect to a backend whose address is public,
+# and these policies refuse every caller except the gateway.
+---
+# Only labeled client pods (in any namespace) may reach the gateway port.
+# Add a rule for your ingress controller if the gateway is exposed
+# through one.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: agentvisor-ai-ingress
+  namespace: agentvisor-ai
+spec:
+  podSelector:
+    matchLabels:
+      app: agentvisor-ai
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              agentvisor.ai/client: "true"
+      ports:
+        - protocol: TCP
+          port: 8484
+---
+# MCP backends accept traffic from the gateway pods only. Agents cannot
+# bypass the gateway's identity, authorization, and audit controls by
+# calling a backend directly.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mcp-backends-only-from-agentvisor
+  namespace: mcp-backends
+spec:
+  podSelector:
+    matchLabels:
+      agentvisor.ai/mcp-backend: "true"
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: agentvisor-ai
+          podSelector:
+            matchLabels:
+              app: agentvisor-ai

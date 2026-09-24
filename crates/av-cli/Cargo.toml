@@ -60,10 +60,15 @@ hex = { workspace = true }
 base64 = { workspace = true }
 zeroize = { workspace = true }
 toml = { workspace = true }
+# `avctl sidecar`: loopback proxy server and RFC 7523 assertion signing.
+axum = { workspace = true }
+jsonwebtoken = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-axum = { workspace = true }
+av-identity = { workspace = true }
+parking_lot = { workspace = true }
+serde_urlencoded = "0.7"
 
 [lints]
 workspace = true

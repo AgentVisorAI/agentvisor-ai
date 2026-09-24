@@ -172,6 +172,7 @@ jobs:
           AVCTL: ${{ github.workspace }}/target/debug/avctl
         run: |
           python3 buildpack/tests/test_buildpack.py
+          python3 scripts/test-package-buildpack.py
           python3 scripts/live-pillars-helper.py self-test
           cargo build -p av-harness --features redis -p av-cli --bins
           python3 scripts/test-provider-smoke.py

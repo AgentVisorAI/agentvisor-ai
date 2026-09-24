@@ -133,11 +133,27 @@ def serve_mock(port, path):
                 output.write(json.dumps({"path": self.path,
                                          "headers": {k.lower(): v for k, v in self.headers.items()},
                                          "body": data.decode()}) + "\n")
-            request_id = json.loads(data).get("id")
-            body = json.dumps({"jsonrpc": "2.0", "id": request_id,
-                               "result": {"content": [{"type": "text", "text": "ok"}]}}).encode()
+            message = json.loads(data)
+            request_id = message.get("id")
+            method = message.get("method", "")
+            # Speak just enough MCP Streamable HTTP for `transport = "mcp"`
+            # backends: a handshake with a session id, and 202 for
+            # notifications. Plain JSON-RPC calls get the echo as before.
+            if request_id is None and method.startswith("notifications/"):
+                self.send_response(202)
+                self.send_header("content-length", "0")
+                self.end_headers()
+                return
+            if method == "initialize":
+                result = {"protocolVersion": "2025-11-25", "capabilities": {"tools": {}},
+                          "serverInfo": {"name": "live-pillars-mock", "version": "1"}}
+            else:
+                result = {"content": [{"type": "text", "text": "ok"}]}
+            body = json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result}).encode()
             self.send_response(200)
             self.send_header("content-type", "application/json")
+            if method == "initialize":
+                self.send_header("mcp-session-id", "live-pillars-session")
             self.send_header("content-length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -320,14 +336,16 @@ class LiveChecks:
             values.update(state_backend="redis", state_endpoint=redis_url)
         content = "\n".join("{} = {}".format(key, json.dumps(value)) for key, value in values.items())
         content += '\n\n[intent_map]\nlookup = "customer.read"\nread_static = "docs.read"\nread_open = "docs.read"\n'
-        for name_, tool, route, auth in (
-            ("secure-backend", "lookup", "secure", '"exchange"'),
-            ("static-backend", "read_static", "static", '{ static_file = ' + json.dumps(str(self.work / "static.token")) + ' }'),
-            ("open-backend", "read_open", "open", '"none"'),
+        # Two backends use the default MCP transport; the open backend keeps
+        # the plain JSON-RPC transport so both stay exercised end to end.
+        for name_, tool, route, auth, transport in (
+            ("secure-backend", "lookup", "secure", '"exchange"', "mcp"),
+            ("static-backend", "read_static", "static", '{ static_file = ' + json.dumps(str(self.work / "static.token")) + ' }', "mcp"),
+            ("open-backend", "read_open", "open", '"none"', "json_rpc"),
         ):
-            content += '\n[[backends]]\nname = {}\nurl = {}\nauth = {}\ntools = {}\n'.format(
+            content += '\n[[backends]]\nname = {}\nurl = {}\nauth = {}\ntools = {}\ntransport = {}\n'.format(
                 json.dumps(name_), json.dumps("http://127.0.0.1:{}/{}".format(self.mock_port, route)),
-                auth, json.dumps([tool]))
+                auth, json.dumps([tool]), json.dumps(transport))
         content += '\n[[operator_tokens]]\nname = "live-operator"\nsha256 = ' + json.dumps(hashlib.sha256(self.operator_secret.encode()).hexdigest()) + '\n'
         for backend, secret in (("secure-backend", self.backend_secret), ("static-backend", self.static_backend_secret)):
             content += '\n[[introspection_tokens]]\nbackend = {}\nsha256 = {}\n'.format(
@@ -412,8 +430,13 @@ class LiveChecks:
         self.check("the exchanged token has the configured lifetime", lambda: claims["exp"] - claims["iat"] == 120)
         intent = request["headers"].get("x-av-intent-token", "")
         self.check("the intent token has type av-intent+jwt", lambda: decode_part(intent, 0)["typ"] == "av-intent+jwt")
-        self.check("the intent token is bound to the backend and agent",
-                   lambda: decode_part(intent)["aud"] == "secure-backend" and decode_part(intent)["sub"] == "inst-" + self.run_id)
+        self.check("the intent token is bound to the backend, the human, and the agent",
+                   lambda: decode_part(intent)["aud"] == "secure-backend"
+                   and decode_part(intent)["sub"] == "user:live-" + self.run_id
+                   and decode_part(intent)["act"]["sub"] == "inst-" + self.run_id)
+        self.check("the MCP backend received the handshake and the session id",
+                   lambda: any(json.loads(r["body"]).get("method") == "initialize" for r in requests)
+                   and request["headers"].get("mcp-session-id") == "live-pillars-session")
         jwks = self.request("/.well-known/jwks.json")
         self.check("JWKS publishes the exchanged token's signing key",
                    lambda: jwks.status == 200 and decode_part(exchanged, 0)["kid"] in [key["kid"] for key in jwks.json()["keys"]])

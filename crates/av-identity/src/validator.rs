@@ -187,6 +187,13 @@ pub enum IdentityError {
     /// credential fault.
     #[error("revocation list unavailable: {0}")]
     RevocationUnavailable(String),
+    /// The token's `sub` does not match the configured human-principal
+    /// pattern, so the identity is not attributable to a human.
+    #[error("token subject is not a human principal")]
+    SubjectNotHuman,
+    /// The human-principal pattern itself is invalid.
+    #[error("invalid human subject pattern: {0}")]
+    SubjectPattern(String),
 }
 
 /// A successfully validated identity.
@@ -228,6 +235,7 @@ pub struct IdentityValidator {
     max_chain_depth: usize,
     leeway_secs: u64,
     revocation: Option<std::sync::Arc<dyn crate::revocation::RevocationStore>>,
+    human_subject: Option<regex::Regex>,
 }
 
 impl IdentityValidator {
@@ -241,7 +249,29 @@ impl IdentityValidator {
             max_chain_depth: 4,
             leeway_secs: DEFAULT_LEEWAY_SECS,
             revocation: None,
+            human_subject: None,
         }
+    }
+
+    /// Require every validated token's `sub` to match `pattern`, so each
+    /// agent identity is attributable to a human principal (for example
+    /// `^user:` or an identity provider's user-id prefix). Anchor the
+    /// pattern: it is matched with `is_match`, anywhere in `sub`.
+    pub fn set_human_subject_pattern(&mut self, pattern: &str) -> Result<(), IdentityError> {
+        let compiled = regex::RegexBuilder::new(pattern)
+            .size_limit(1 << 20)
+            .build()
+            .map_err(|error| IdentityError::SubjectPattern(error.to_string()))?;
+        self.human_subject = Some(compiled);
+        Ok(())
+    }
+
+    /// True when `sub` satisfies the human-principal rule (always true
+    /// when no pattern is configured).
+    pub fn subject_is_human(&self, sub: &str) -> bool {
+        self.human_subject
+            .as_ref()
+            .is_none_or(|pattern| pattern.is_match(sub))
     }
 
     /// Register key material under a `kid`.
@@ -534,6 +564,11 @@ impl IdentityValidator {
         let leaf = self.validate_single(token, for_revocation)?;
         if !for_revocation {
             self.check_not_revoked(&leaf)?;
+            // Holder revocation stays possible for any token; only access
+            // requires a human-attributable subject.
+            if !self.subject_is_human(&leaf.sub) {
+                return Err(IdentityError::SubjectNotHuman);
+            }
         }
         let mut chain_tokens = vec![RevocationIdentity::from(&leaf)];
 

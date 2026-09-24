@@ -85,6 +85,7 @@ source. All are optional.
 | --- | --- | --- |
 | `identity_hmac_secret_file` | none | File containing an HS256 development secret (owner-only permissions enforced). Development alternative to `identity_jwks_url`. |
 | `identity_hmac_kid` | `dev-hmac` | Key id assigned to the development HMAC secret. |
+| `identity_human_subject_pattern` | none | Regular expression every validated token's `sub` must match, so each agent identity is attributable to a human principal (for example `^user:`, or your identity provider's user-id prefix). A token whose subject does not match is refused with `401`; holder revocation still works for it. The pattern applies to requests, token-exchange subjects, and actor tokens. Anchor it: it matches anywhere in `sub`. |
 
 ## Tool proxy (`/v1/mcp`)
 
@@ -96,6 +97,48 @@ source. All are optional.
 | `require_tool_schema` | `true` | Reject tool calls with no matching schema (fail closed). `false` skips the schema gate — policy and budget gates still apply. |
 | `payout_field` | `amount_usd` | Tool-call argument field carrying a payout in USD, charged against `max_payout_usd_micros`. Set this to match YOUR tool schema — the cap only fires on calls carrying this exact field. |
 | `wasm_policy_paths` | `["config/policies/payload_limit.wat"]` | WASM/WAT policy modules, evaluated in order. The default path resolves to an embedded built-in when no file exists on disk. |
+| `tool_upstream_transport` | `json_rpc` | Wire protocol for `tool_upstream_url`: `json_rpc` sends one plain JSON-RPC POST per call (the historical behavior); `mcp` speaks the MCP Streamable HTTP transport described under [Backend routing](#backend-routing). `[[backends]]` entries choose their own `transport` and default to `mcp`. |
+| `mcp_allowed_origins` | `[]` | Browser origins (`scheme://host[:port]`) allowed to call the MCP endpoints. A request that carries any other `Origin` header is refused with `403`, as the MCP transport requires. Agents run server-side and send no `Origin`, so the empty default refuses only browser pages. |
+
+### MCP protocol on `/mcp`
+
+`/mcp` and `/v1/mcp` are MCP servers for the
+[Streamable HTTP transport](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports)
+(protocol versions `2025-11-25`, `2025-06-18`, `2025-03-26`, and
+`2024-11-05`), so a stock MCP client connects without code changes:
+
+- `initialize` negotiates the protocol version (the client's version when
+  supported, otherwise the latest) and returns an `MCP-Session-Id`. The id
+  is an HMAC-signed value bound to the caller's identity (issuer and
+  subject) and valid for 24 hours. It also names the audited session, so
+  every call of one MCP session lands in one AgentVisor session. A request
+  with an id that is forged, expired, or issued to another principal gets
+  `404`, which tells the client to initialize again.
+- `ping` returns an empty result. Notifications and client responses are
+  acknowledged with `202`.
+- `tools/list` returns, in one page, the tools of every backend the
+  endpoint serves, and only tools the caller can call: names the tool gate
+  accepts (lowercase ASCII without whitespace), routed to that backend,
+  covered by the caller's scopes when `enforce_identity_scopes` is on, and
+  permitted by the intent map, the missions, and the external AuthZEN PDP
+  when one is configured. Withheld tools are counted in
+  `av_mcp_tools_withheld_total{reason}`; a backend whose discovery fails is
+  counted in `av_mcp_discovery_failures_total{backend}` and skipped.
+  Backends on the `mcp` transport are asked with their own `tools/list`;
+  `json_rpc` backends list their configured `tools`, with `inputSchema`
+  and `description` taken from `tool_schema_dir`.
+- `tools/call` runs through the audited tool path. A forwarded call needs
+  a session: an `MCP-Session-Id`, or the `X-AV-Session` header.
+- `GET` answers `405` (the gateway opens no server-to-client stream).
+  `DELETE` with an `MCP-Session-Id` closes the audited session exactly like
+  `POST /v1/sessions/{id}/close` (it requires `session_close_scope`).
+- An unsupported `MCP-Protocol-Version` header is refused with `400`.
+
+Every lifecycle message still requires the caller's identity when
+`require_identity` is on. `/mcp/{backend}` and `/v1/mcp/{backend}` expose
+the same protocol restricted to one backend: `tools/list` shows only that
+backend's tools, and a `tools/call` for a tool routed elsewhere is an
+audited denial with the code `NO_BACKEND` (policy `backend.route`).
 
 ## Budgets
 
@@ -147,6 +190,17 @@ max_payout_usd_micros }`).
 | `token_exchange_seed_file` | none | Ed25519 signing seed file for exchanged tokens and intent tokens (owner-only permissions enforced; must be distinct from the receipt signing seed). Its public key is served at `/.well-known/jwks.json` so backends can verify both kinds of token. |
 | `token_exchange_ttl_s` | `300` | TTL in seconds for exchanged tokens. Capped at 900 to prevent indefinite delegation. |
 
+The request may carry an RFC 8693 actor token (`actor_token` together
+with `actor_token_type=urn:ietf:params:oauth:token-type:jwt`). The actor
+token is validated like the subject token and must be undelegated (no
+`parent_token` and no `act`). The issued token then keeps the subject's
+`sub` (the human), names the actor's agent in `act.sub` and `azp`, moves
+the subject's agent to `act.act.sub`, holds the scopes requested ∩ subject
+∩ actor, never outlives either token, and counts two delegation links
+against `max_delegation_depth`. Revoking the actor token revokes every
+token obtained with it. `actor_token` without `actor_token_type` (or the
+reverse), or another token type, is refused with `invalid_request`.
+
 The exchange signs tokens only for audiences that name a configured
 backend. A request for any other audience, or any request while no
 backends exist, is refused with the RFC 8693 `invalid_target` error. A
@@ -154,6 +208,61 @@ subject token that fails validation is refused with `invalid_request`, and
 the description is deliberately generic: it never names key ids, issuers,
 or algorithms. When the revocation list cannot be read, the endpoint
 answers `503` with `temporarily_unavailable` and `Retry-After`.
+
+## Platform workload identity (Cloud Foundry)
+
+With `[workload_identity]`, an application instance on Cloud Foundry can
+obtain an AgentVisor agent token without any stored secret, by proving the
+instance identity certificate the platform gives every container
+(`CF_INSTANCE_CERT` / `CF_INSTANCE_KEY`, rotated before expiry). The
+`avctl sidecar` that the buildpack starts beside the application does this
+automatically; see [the buildpack instructions](../../buildpack/README.md).
+The settings are `workload_identity` (TOML `[workload_identity]`) and
+`workload_identities` (TOML `[[workload_identities]]`).
+
+| `[workload_identity]` key | Default | Notes |
+| --- | --- | --- |
+| `ca_file` | required | PEM bundle of the foundation's instance-identity root CA certificate(s). Ask the platform operator for the Diego instance identity CA. |
+| `token_ttl_s` | `300` | Lifetime of issued agent tokens, 60 to 900 seconds. |
+
+| `[[workload_identities]]` key | Default | Notes |
+| --- | --- | --- |
+| `name` | required | Unique name (ASCII letters, digits, `-`, `_`, `.`), used in metrics and logs. |
+| `cf_app_guid` / `cf_space_guid` / `cf_org_guid` | none | At least one is required; every one that is set must match the instance certificate. |
+| `sub` | required | The human principal this workload's agents act for; it becomes the token's `sub` and must match `identity_human_subject_pattern` when that is set. |
+| `charter` | required | Agent charter recorded in the token and in every audit event. |
+| `version` | `"1"` | Agent version recorded in the token. |
+| `scopes` | required | Scopes granted to the workload's agents. |
+
+The instance sends `/v1/token` an RFC 7523 assertion:
+`grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=<JWT>`.
+The JWT is signed `RS256` with the instance key, carries the instance
+certificate and its intermediates in `x5c`, and has `aud` = the gateway's
+`audience`, `sub` = the instance GUID, a unique `jti`, and a lifetime of at
+most 300 seconds. The gateway verifies the chain up to `ca_file` (with the
+clientAuth extended key usage), the signature, the claims, and that the
+`jti` was not used before (the replay cache is kept in memory per gateway
+instance, so with several replicas an intercepted assertion could be
+accepted once by each replica within its lifetime of at most 300 seconds); reads the app, space, and organization GUIDs from
+the certificate subject; and picks the one `[[workload_identities]]` entry
+that matches (none or several is refused). It answers with a standard token
+response (`access_token`, `token_type`, `expires_in`, `scope`). An optional
+`scope` parameter can only narrow the entry's scopes. Refusals use the
+OAuth `invalid_grant` or `invalid_scope` errors with a generic description;
+the reason is counted in `av_workload_assertions_rejected_total{reason}`
+and logged under the `agentvisor.workload` target, and issued tokens are
+counted in `av_workload_tokens_issued_total{workload}`.
+
+The agent token is signed with `token_exchange_seed_file` (required), its
+issuer is `<audience>#workload` (added to `identity_allowed_issuers` when an
+allowlist is configured), and its claims are `sub` (the entry's human),
+`instance_uid` (the instance GUID), `azp` (`cf-app:<app guid>`), `charter`,
+`version`, `scopes`, a unique `jti`, and `exp`. The gateway's validator
+trusts it on every route, and it can be revoked with `POST /v1/revoke` or by
+operator revocation of its `jti` or instance GUID. To stop an application
+from obtaining new tokens, remove its entry or stop the application.
+`[workload_identity]` also makes the gateway build an identity validator
+when no external identity provider is configured.
 
 ## Token revocation (`POST /v1/revoke`)
 
@@ -313,36 +422,89 @@ operator network. Never pass the bearer itself as a command-line argument.
 | --- | --- | --- |
 | `intent_map` | `{}` | Maps tool names to business intents (TOML `[intent_map]`, e.g. `db_write = "data.mutate"`). When `require_intent_mapping` is true, tools not in the map are denied with `UNMAPPED_TOOL`. |
 | `require_intent_mapping` | `false` | When true, every tool call must have a configured intent mapping. |
-| `mission` | none | Active mission constraint (TOML `[mission]`). Contains `id`, `allowed_intents`, and `expires_at`. Only narrows static policy, never widens. |
+| `mission` | none | Active mission constraint for every caller (TOML `[mission]`). Contains `id`, `allowed_intents`, and `expires_at`. Only narrows static policy, never widens. |
+| `missions` | `[]` | Per-agent missions (TOML `[[missions]]`). Each entry has `id`, `allowed_intents`, `expires_at`, and at least one selector: `agents` (token `instance_uid` values), `charters`, or `subjects` (human `sub` values). An entry applies to a caller when every selector it sets matches. A call must satisfy the global `[mission]` and every per-agent mission that applies, so missions only ever narrow. Mission ids must be unique. |
 | `intent_token_ttl_s` | `60` | TTL in seconds for per-call intent tokens issued by the local PDP. |
+| `authzen` | none | External AuthZEN policy decision point (TOML `[authzen]`), described below. |
 
 The policy decision point runs before the tool budget is charged, in every
 mode, including verdict-only mode (no `tool_upstream_url` and no
 `[[backends]]`). A denied call consumes no budget, and its audit event
 records `allowed: false` with the denial code and a `policy` name of
-`pdp.intent_map` or `pdp.mission`. The JSON-RPC error echoes the request
-`id` and carries the machine-readable code in `error.data.code` (for
-example `UNMAPPED_TOOL`, `MISSION_EXPIRED`, `MISSION_DENIED`).
+`pdp.intent_map`, `pdp.mission`, or `pdp.authzen`. The JSON-RPC error
+echoes the request `id` and carries the machine-readable code in
+`error.data.code` (for example `UNMAPPED_TOOL`, `MISSION_EXPIRED`,
+`MISSION_DENIED`, `PDP_DENIED`).
+
+### External AuthZEN policy decision point
+
+| `[authzen]` key | Default | Notes |
+| --- | --- | --- |
+| `evaluation_endpoint` | required | Access Evaluation endpoint of an [AuthZEN 1.0](https://openid.net/specs/authorization-api-1_0.html) PDP, for example `https://pdp.example.com/access/v1/evaluation`. |
+| `evaluations_endpoint` | none | Access Evaluations (batch) endpoint, used to filter `tools/list` in one request. Without it, `tools/list` sends one evaluation per tool. |
+| `auth_file` | none | File holding a bearer token for the PDP (owner-only permissions enforced). |
+| `timeout_ms` | `1000` | Per-request timeout, 1 to 10 000 ms. |
+
+When `[authzen]` is set, every tool call that the intent map and missions
+permit is also evaluated by the PDP, before any budget is charged. The
+request's `subject` is the human principal (`type: "user"`, `id`: the
+token's `sub`) with the acting agent, `azp`, `act`, issuer, and scopes in
+`subject.properties`; the `action` is the resolved intent (`name`) with the
+tool in `properties`; the `resource` is `{type: "tool", id: <tool>,
+properties: {backend}}`; the `context` carries `session_id`, the applicable
+`missions`, and `time`. Requests carry `X-Request-ID`. `{"decision":
+false}` is an audited denial with the code `PDP_DENIED`; a reason from the
+response context (`reason_admin`, `reason_user`, or `reason`) is included
+in the error. A timeout, a non-200 status, or a body without a boolean
+`decision` fails closed with `503`. Outcomes are counted in
+`av_authzen_decisions_total{decision}`.
 
 When `token_exchange_seed_file` is set, every forwarded tool call carries a
 signed intent token in the `x-av-intent-token` header. It is an EdDSA JWT
 with the header `typ: av-intent+jwt`, so a backend can tell it apart from
 an access token signed by the same key. Its claims are `iss` (the harness
 `audience`), `aud` (the receiving backend's `name`, or `default` for
-`tool_upstream_url`), `sub` (the calling agent's `instance_uid`), `tool`,
-`intent`, `iat`, `exp`, and a unique `jti`. Backends should check `typ`,
-`aud`, and `exp`, and may reject a repeated `jti`.
+`tool_upstream_url`), `sub` (the human principal: the caller token's `sub`,
+or the caller's `instance_uid` when no identity was validated), `act`
+(`{"sub": <calling agent instance_uid>}`, present when an identity was
+validated), `tool`, `intent`, `missions` (the ids of the missions that
+applied, when any), `iat`, `exp`, and a unique `jti`. The token never
+outlives an applicable mission. Backends should check `typ`, `aud`, and
+`exp`, and may reject a repeated `jti`.
 
 ## Backend routing
 
 | Key | Default | Notes |
 | --- | --- | --- |
-| `backends` | `[]` | Per-backend MCP server routing (TOML `[[backends]]`). Each entry has `name`, `url`, `auth`, and `tools`. An entry with an empty `tools` list is the default for unmapped tools (at most one). When `backends` is empty, `tool_upstream_url` becomes an implicit backend named `default`, and it carries the `tool_upstream_bearer_env` / `tool_upstream_bearer_file` credential. |
+| `backends` | `[]` | Per-backend MCP server routing (TOML `[[backends]]`). Each entry has `name`, `url`, `auth`, `tools`, and `transport`. An entry with an empty `tools` list is the default for unmapped tools (at most one). When `backends` is empty, `tool_upstream_url` becomes an implicit backend named `default`, and it carries the `tool_upstream_bearer_env` / `tool_upstream_bearer_file` credential. |
+
+| Key | Default | Notes |
+| --- | --- | --- |
+| `require_private_backends` | `false` | Refuse to connect to a tool backend (every `[[backends]]` URL and `tool_upstream_url`) whose address is not private: loopback, RFC 1918, shared address space (RFC 6598), link-local, or IPv6 unique-local and link-local. Tool traffic uses its own HTTP client, whose resolver checks every address a backend host name resolves to on every new connection, and refuses the host if any address is public, so a DNS change after boot cannot send tool calls to the internet. IP literals are checked at boot. The LLM upstream and the AuthZEN PDP are not affected. Pair it with the network policies in `deploy/kubernetes/network-policies.yaml` or the internal routes and network policies in `deploy/cloudfoundry/`, which stop anything but the gateway from reaching a backend. |
+
+A backend may not be named like `audience`: tokens the gateway signs for a
+backend carry the backend's name as their audience, so that name must never
+be the gateway's own.
+
+Each backend's `transport` is `mcp` (the default) or `json_rpc`. On `mcp`,
+the gateway is a conforming Streamable HTTP client: it opens one backend
+session per audited session with `initialize` and
+`notifications/initialized`, sends `Accept: application/json,
+text/event-stream`, `MCP-Session-Id`, and `MCP-Protocol-Version` on every
+request, accepts either a JSON reply or an SSE stream (it stops reading at
+the matching response and resumes an early-ended stream with `GET` and
+`Last-Event-ID`), answers a backend's `ping` requests and refuses its other
+requests with "method not found" (the gateway declares no client
+capabilities), and after a session-expiry `404` starts a new backend
+session and retries once. A handshake failure is treated like a connect
+failure: the call was not delivered, its budget is refunded, and it can be
+retried. On `json_rpc`, each call is one plain POST.
 
 A tool that maps to no backend, when there is no default backend, is sent
 to `tool_upstream_url` with its bearer if that is set. Otherwise the call
 is decided (allowed or denied, and audited) but not forwarded. The
-caller's own `Authorization` header is never forwarded to any backend.
+caller's own `Authorization` header is never forwarded to a backend unless
+that backend uses `auth = "forward_token"`.
 
 ### Backend `auth` modes
 
@@ -355,6 +517,7 @@ to that MCP server:
 | `{ static_env = "VAR" }` | Bearer token read from the named environment variable at boot. Surrounding whitespace is trimmed; an unset or empty variable refuses boot. |
 | `{ static_file = "path" }` | Bearer token read from a file at boot (owner-only permissions and no symlinks, enforced on Unix). Surrounding whitespace is trimmed; an empty file refuses boot. |
 | `"exchange"` | On-the-fly RFC 8693 token exchange for every call: the caller's NHI bearer is exchanged for a short-lived token whose `aud` is this backend's `name` and whose only scope is `tool:<called tool>`. The caller's token must hold that scope (directly or through a wildcard such as `tool:*`); otherwise the call is refused with `403` before anything reaches the backend or charges the budget. `sub` stays the human principal, and `azp` and `act.sub` carry the caller's `instance_uid`. Requires `require_identity = true` and `token_exchange_seed_file`; boot refuses the combination otherwise. |
+| `"forward_token"` | The caller's own validated bearer token is forwarded to this backend, and to no other. Requires `require_identity = true`. The backend receives a token whose audience is the gateway, so it could replay that token against the gateway: use this mode only for a backend that must see the original identity-provider token and that you trust as much as the gateway. Prefer `"exchange"` otherwise. |
 
 Static credentials are marked as sensitive header values, so they are kept
 out of debug output and HTTP/2 header compression tables.
@@ -365,8 +528,45 @@ out of debug output and HTTP/2 header compression tables.
 | --- | --- | --- |
 | `otel_tenant_endpoint` | none | Tenant OTLP/HTTP trace endpoint (including `/v1/traces`), exported alongside any operational collector. Requires the `otel` build feature. Operational authentication headers are not forwarded to this endpoint. |
 | `otel_tenant_auth_file` | none | Bearer token file for the tenant OTEL endpoint (owner-only permissions enforced). |
+| `otel_tenant_content` | `redacted` | What the tenant endpoint receives beyond request metadata spans. `redacted` also exports every audited step as an OpenTelemetry GenAI span with its content, after redaction (see below). `off` exports metadata spans only. |
 | `redaction_patterns` | `[]` | Regex patterns for sensitive-data stripping. Applied to event payloads and ATIF step fields before journal write. Setting either patterns or pointer paths also enables the builtin patterns (API keys, email, SSN, cards, and IPv4 addresses). |
 | `redaction_paths` | `[]` | JSON pointer paths to always redact in event payloads and their ATIF observation copies. Configuring paths also enables builtins. |
+
+### Full-content tenant telemetry
+
+With `otel_tenant_endpoint` set and `otel_tenant_content = "redacted"` (the
+default), every audited step is exported to the tenant collector as a span
+that follows the OpenTelemetry
+[GenAI semantic conventions](https://github.com/open-telemetry/semantic-conventions-genai):
+
+- A chat call becomes one `chat {model}` span of kind `CLIENT`, from the
+  request to the response, with `gen_ai.operation.name = "chat"`,
+  `gen_ai.provider.name` (the `provider` setting), `gen_ai.request.model`,
+  `gen_ai.response.model`, `gen_ai.usage.input_tokens`,
+  `gen_ai.usage.output_tokens`, `gen_ai.response.finish_reasons`,
+  `gen_ai.input.messages` (the new input message of this turn), and
+  `gen_ai.output.messages` (the output text, reasoning, and requested tool
+  calls).
+- A tool authorization becomes an `execute_tool {tool}` span with
+  `gen_ai.tool.name`, `gen_ai.tool.call.id`, `gen_ai.tool.call.arguments`,
+  and the gateway's verdict (`agentvisor.tool.allowed`, `denial_code`,
+  `policy`, `stage`, `reason`). A tool completion becomes an
+  `execute_tool.result` span with `gen_ai.tool.call.result`.
+- Every other audit event becomes an `agentvisor.{class}` span that carries
+  the event as JSON.
+
+Every span carries `gen_ai.conversation.id` (the session id, so a whole
+conversation can be reassembled), `gen_ai.agent.id` (the agent's
+`instance_uid`), `gen_ai.agent.name` (its charter), and the audit event
+uid. Content is redacted before export with the built-in patterns plus
+`redaction_patterns` and `redaction_paths`, even when journal redaction is
+not configured. Each content attribute is capped at 256 KiB; a longer value
+is cut and ends with a marker that states how many bytes were removed.
+
+Content spans use a tracer provider whose only exporter is the tenant
+endpoint, so the operational collector (`OTEL_EXPORTER_OTLP_*`) receives
+metadata spans only and never content. Both are flushed at shutdown.
+Tenant export requires the `otel` build feature.
 
 ## Performance
 

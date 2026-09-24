@@ -171,6 +171,12 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
         Arc::clone(&metrics),
     )
     .map_err(anyhow::Error::new)?;
+    #[cfg(feature = "otel")]
+    let content_provider = tenant_content_provider(&config)?;
+    #[cfg(feature = "otel")]
+    if let Some(provider) = &content_provider {
+        install_tenant_content_sink(&config, &state, provider)?;
+    }
     let revocation_sweeper = state
         .identity
         .as_ref()
@@ -619,7 +625,7 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
     }
     #[cfg(feature = "otel")]
     let flush_telemetry = move || {
-        if let Some(provider) = telemetry_provider {
+        for provider in [content_provider, telemetry_provider].into_iter().flatten() {
             provider
                 .shutdown_with_timeout(std::time::Duration::from_secs(
                     av_harness::config::OTEL_FLUSH_SECS,
@@ -1006,6 +1012,76 @@ impl opentelemetry_http::HttpClient for TenantOtelClient {
     }
 }
 
+/// OTLP/HTTP exporter for the tenant collector. The SDK merges
+/// operational `OTEL_*` headers after explicit headers; the dedicated
+/// client removes those inherited secrets and applies only this tenant's
+/// authorization at send time.
+#[cfg(feature = "otel")]
+fn tenant_exporter(config: &HarnessConfig, endpoint: &str) -> Result<opentelemetry_otlp::SpanExporter> {
+    use opentelemetry_otlp::{WithExportConfig as _, WithHttpConfig as _};
+    let authorization = config.tenant_otel_authorization().map_err(anyhow::Error::msg)?;
+    let client = TenantOtelClient::new(authorization)?;
+    opentelemetry_otlp::SpanExporter::builder()
+        .with_http()
+        .with_protocol(opentelemetry_otlp::Protocol::HttpBinary)
+        .with_endpoint(endpoint.to_owned())
+        .with_http_client(client)
+        .build()
+        .map_err(|error| anyhow::anyhow!("build tenant OTLP exporter: {error}"))
+}
+
+/// A tracer provider whose ONLY exporter is the tenant collector, used for
+/// content spans, so the operational collector can never receive content.
+/// `None` when no tenant endpoint is set or content export is off.
+#[cfg(feature = "otel")]
+fn tenant_content_provider(
+    config: &HarnessConfig,
+) -> Result<Option<opentelemetry_sdk::trace::SdkTracerProvider>> {
+    let Some(endpoint) = config
+        .otel_tenant_endpoint
+        .as_deref()
+        .filter(|_| config.otel_tenant_content == av_harness::config::TenantContent::Redacted)
+    else {
+        return Ok(None);
+    };
+    Ok(Some(
+        opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_resource(
+                opentelemetry_sdk::Resource::builder()
+                    .with_service_name("agentvisor-ai")
+                    .build(),
+            )
+            .with_batch_exporter(tenant_exporter(config, endpoint)?)
+            .with_sampler(opentelemetry_sdk::trace::Sampler::AlwaysOn)
+            .build(),
+    ))
+}
+
+/// Install the full-content tenant sink on `state`: every audited step,
+/// redacted with the built-in patterns plus the configured ones, becomes a
+/// GenAI span on `provider`.
+#[cfg(feature = "otel")]
+fn install_tenant_content_sink(
+    config: &HarnessConfig,
+    state: &AppState,
+    provider: &opentelemetry_sdk::trace::SdkTracerProvider,
+) -> Result<()> {
+    let redaction = av_redact::RedactionEngine::new(av_redact::RedactionConfig {
+        regex_patterns: config.redaction_patterns.clone(),
+        pointer_paths: config.redaction_paths.clone(),
+        include_builtin_patterns: true,
+        ..av_redact::RedactionConfig::default()
+    })
+    .map_err(|error| anyhow::anyhow!("tenant content redaction: {error}"))?;
+    state
+        .set_content_sink(Arc::new(av_harness::otel_content::TenantContentSink::new(
+            provider,
+            redaction,
+            &config.provider,
+        )))
+        .map_err(|error| anyhow::anyhow!("start the tenant content exporter thread: {error}"))
+}
+
 #[cfg(feature = "otel")]
 fn init_tracing(config: &HarnessConfig) -> Result<Option<opentelemetry_sdk::trace::SdkTracerProvider>> {
     use opentelemetry::trace::TracerProvider as _;
@@ -1028,21 +1104,8 @@ fn init_tracing(config: &HarnessConfig) -> Result<Option<opentelemetry_sdk::trac
             builder = builder.with_batch_exporter(exporter);
         }
         if let Some(endpoint) = &config.otel_tenant_endpoint {
-            use opentelemetry_otlp::WithHttpConfig as _;
-            let authorization = config.tenant_otel_authorization().map_err(anyhow::Error::msg)?;
-            // The SDK merges operational OTEL_* headers after explicit
-            // headers. The dedicated client removes those inherited secrets
-            // and applies only this tenant's authorization at send time.
-            let client = TenantOtelClient::new(authorization)?;
-            let exporter = opentelemetry_otlp::SpanExporter::builder()
-                .with_http()
-                .with_protocol(opentelemetry_otlp::Protocol::HttpBinary)
-                .with_endpoint(endpoint.clone())
-                .with_http_client(client)
-                .build()
-                .map_err(|error| anyhow::anyhow!("build tenant OTLP exporter: {error}"))?;
             builder = builder
-                .with_batch_exporter(exporter)
+                .with_batch_exporter(tenant_exporter(config, endpoint)?)
                 .with_sampler(opentelemetry_sdk::trace::Sampler::AlwaysOn);
         }
         Some(builder.build())
@@ -1437,13 +1500,22 @@ async fn build_identity(
         .identity_hmac_secret_file
         .as_deref()
         .is_some_and(|path| !path.is_empty());
-    if !has_jwks && !has_hmac {
+    // Workload identity makes the gateway itself an issuer of agent tokens,
+    // so it needs a validator even without an external identity provider.
+    let has_workload = config.workload_identity.is_some();
+    if !has_jwks && !has_hmac && !has_workload {
         return Ok((None, None));
     }
 
     let mut validator = IdentityValidator::new(&config.audience);
     validator.set_max_chain_depth(config.max_delegation_depth);
     validator.set_revocation_store(revocation);
+    if let Some(pattern) = &config.identity_human_subject_pattern {
+        validator
+            .set_human_subject_pattern(pattern)
+            .map_err(|error| anyhow::anyhow!("identity_human_subject_pattern: {error}"))?;
+    }
+    av_harness::workload::trust_gateway_tokens(&mut validator, config).map_err(anyhow::Error::msg)?;
     if !config.identity_allowed_issuers.is_empty() {
         validator.allow_issuers(config.identity_allowed_issuers.clone());
     }
@@ -2992,9 +3064,25 @@ mod tests {
             url: "http://db".into(),
             auth: av_harness::config::BackendAuth::None,
             tools: vec!["read".into()],
+            transport: Default::default(),
         }];
         let error = load_sandbox(&config).err().unwrap();
         assert!(error.to_string().contains("no tool schemas"));
+    }
+
+    #[cfg(feature = "otel")]
+    #[test]
+    fn tenant_content_provider_exists_only_with_a_tenant_endpoint_and_content_on() {
+        let mut config = av_harness::config::HarnessConfig::for_tests("http://127.0.0.1:9", "/tmp", "/tmp");
+        assert!(tenant_content_provider(&config).unwrap().is_none());
+        config.otel_tenant_endpoint = Some("http://127.0.0.1:9/v1/traces".into());
+        let provider = tenant_content_provider(&config).unwrap();
+        assert!(provider.is_some());
+        if let Some(provider) = provider {
+            let _ = provider.shutdown();
+        }
+        config.otel_tenant_content = av_harness::config::TenantContent::Off;
+        assert!(tenant_content_provider(&config).unwrap().is_none());
     }
 
     #[cfg(feature = "otel")]

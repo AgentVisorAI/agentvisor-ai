@@ -18,6 +18,7 @@ use av_receipts::{Ed25519Signer, Keyring, Signer};
 use av_sandbox::Sandbox;
 use av_state::InMemoryStore;
 use axum::http::{HeaderMap, HeaderValue};
+use axum::response::IntoResponse as _;
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -222,6 +223,10 @@ pub fn app_state_with_revocation(
 ) -> Arc<AppState> {
     let mut validator = av_identity::IdentityValidator::new(&config.audience);
     validator.set_max_chain_depth(config.max_delegation_depth);
+    if let Some(pattern) = &config.identity_human_subject_pattern {
+        validator.set_human_subject_pattern(pattern).unwrap();
+    }
+    av_harness::workload::trust_gateway_tokens(&mut validator, &config).unwrap();
     if !config.identity_allowed_issuers.is_empty() {
         validator.allow_issuers(config.identity_allowed_issuers.clone());
     }
@@ -315,8 +320,12 @@ impl CapturedRequest {
     }
 }
 
-/// Tool backend on 127.0.0.1 that records every request and answers each
-/// with a JSON-RPC success echoing the request id.
+/// MCP backend on 127.0.0.1 that records every request. It answers
+/// `initialize` like a Streamable HTTP server (protocol version
+/// 2025-11-25, a session id), notifications with 202, `tools/list` with
+/// the tools it was started with, and every other request with a JSON-RPC
+/// success echoing the request id. A plain JSON-RPC client that never
+/// sends `initialize` sees exactly the historical echo behavior.
 pub struct MockBackend {
     /// URL to put in `[[backends]].url` or `tool_upstream_url`.
     pub url: String,
@@ -325,13 +334,21 @@ pub struct MockBackend {
 }
 
 impl MockBackend {
-    /// Bind an ephemeral port and start serving.
+    /// Bind an ephemeral port and start serving, advertising no tools.
     pub async fn start() -> Self {
+        Self::with_tools(Vec::new()).await
+    }
+
+    /// Bind an ephemeral port and start serving, advertising `tools` in
+    /// `tools/list`.
+    pub async fn with_tools(tools: Vec<Value>) -> Self {
         let requests: Arc<Mutex<Vec<CapturedRequest>>> = Arc::default();
         let recorded = Arc::clone(&requests);
+        let tools = Arc::new(tools);
         let app = axum::Router::new().fallback(
             move |uri: axum::http::Uri, headers: HeaderMap, body: axum::body::Bytes| {
                 let recorded = Arc::clone(&recorded);
+                let tools = Arc::clone(&tools);
                 async move {
                     recorded.lock().push(CapturedRequest {
                         path: uri.path().to_owned(),
@@ -346,15 +363,42 @@ impl MockBackend {
                             .collect(),
                         body: body.to_vec(),
                     });
-                    let id = serde_json::from_slice::<Value>(&body)
-                        .ok()
-                        .and_then(|request| request.get("id").cloned())
-                        .unwrap_or(Value::Null);
-                    axum::Json(json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": {"content": [{"type": "text", "text": "ok"}]}
-                    }))
+                    let request = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+                    let id = request.get("id").cloned().unwrap_or(Value::Null);
+                    let method = request.get("method").and_then(Value::as_str).unwrap_or_default();
+                    if request.get("id").is_none() && method.starts_with("notifications/") {
+                        return axum::http::StatusCode::ACCEPTED.into_response();
+                    }
+                    match method {
+                        "initialize" => {
+                            let mut response = axum::Json(json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": {
+                                    "protocolVersion": "2025-11-25",
+                                    "capabilities": {"tools": {}},
+                                    "serverInfo": {"name": "mock-backend", "version": "1"}
+                                }
+                            }))
+                            .into_response();
+                            response
+                                .headers_mut()
+                                .insert("mcp-session-id", HeaderValue::from_static("mock-backend-session"));
+                            response
+                        }
+                        "tools/list" => axum::Json(json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {"tools": *tools}
+                        }))
+                        .into_response(),
+                        _ => axum::Json(json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {"content": [{"type": "text", "text": "ok"}]}
+                        }))
+                        .into_response(),
+                    }
                 }
             },
         );
@@ -366,9 +410,23 @@ impl MockBackend {
         Self { url, requests, task }
     }
 
-    /// Requests received so far, in arrival order.
+    /// Requests received so far, in arrival order (handshakes included).
     pub fn requests(&self) -> Vec<CapturedRequest> {
         self.requests.lock().clone()
+    }
+
+    /// Only the `tools/call` requests received so far.
+    pub fn tool_calls(&self) -> Vec<CapturedRequest> {
+        self.requests()
+            .into_iter()
+            .filter(|request| {
+                serde_json::from_slice::<Value>(&request.body)
+                    .ok()
+                    .and_then(|body| body.get("method").and_then(Value::as_str).map(str::to_owned))
+                    .as_deref()
+                    == Some("tools/call")
+            })
+            .collect()
     }
 }
 

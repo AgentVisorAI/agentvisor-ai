@@ -13,12 +13,18 @@
 //! worker panics are supervised and counted.
 
 pub mod authz;
+pub mod authzen;
 pub mod backend;
 pub mod config;
+pub mod content;
 pub mod dashboard;
 pub mod http_serve;
 pub(crate) mod inflight;
 pub(crate) mod journal;
+pub(crate) mod mcp;
+pub mod mcp_client;
+#[cfg(feature = "otel")]
+pub mod otel_content;
 pub mod pipeline;
 pub(crate) mod provider;
 pub mod reconciler;
@@ -29,6 +35,7 @@ pub mod session;
 pub(crate) mod spool;
 pub(crate) mod token_routes;
 pub mod worker;
+pub mod workload;
 
 #[cfg(feature = "service-binding")]
 pub mod service_binding;

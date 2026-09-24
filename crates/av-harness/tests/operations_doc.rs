@@ -18,6 +18,9 @@ const RECONCILER: &str = include_str!("../src/reconciler.rs");
 const ROUTES: &str = include_str!("../src/routes.rs");
 const WORKER: &str = include_str!("../src/worker.rs");
 const RECOVERY: &str = include_str!("../src/recovery.rs");
+const MCP: &str = include_str!("../src/mcp.rs");
+const CONTENT: &str = include_str!("../src/content.rs");
+const WORKLOAD: &str = include_str!("../src/workload.rs");
 const CLI_MAIN: &str = include_str!("../../av-cli/src/main.rs");
 const K8S_MANIFEST: &str = include_str!("../../../deploy/kubernetes/agentvisor-ai.yaml");
 
@@ -26,7 +29,9 @@ const K8S_MANIFEST: &str = include_str!("../../../deploy/kubernetes/agentvisor-a
 /// operator's alert rules on a series that stops existing.
 #[test]
 fn alert_table_metrics_are_registered_in_the_sources() {
-    let sources = [MAIN_RS, PIPELINE, RECONCILER, ROUTES, WORKER, RECOVERY];
+    let sources = [
+        MAIN_RS, PIPELINE, RECONCILER, ROUTES, WORKER, RECOVERY, MCP, CONTENT, WORKLOAD,
+    ];
     let mut checked = 0;
     for chunk in DOC.split('`').skip(1).step_by(2) {
         let name = chunk.split('{').next().unwrap_or(chunk);
