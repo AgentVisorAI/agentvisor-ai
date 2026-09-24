@@ -13,6 +13,7 @@ members = [
     "crates/av-sandbox",
     "crates/av-harness",
     "crates/av-cli",
+    "crates/av-redact",
 ]
 
 [workspace.package]
@@ -41,6 +42,7 @@ av-compress = { path = "crates/av-compress", version = "0.1.0" }
 av-loopdetect = { path = "crates/av-loopdetect", version = "0.1.0" }
 av-sandbox = { path = "crates/av-sandbox", version = "0.1.0" }
 av-harness = { path = "crates/av-harness", version = "0.1.0" }
+av-redact = { path = "crates/av-redact", version = "0.1.0" }
 
 tokio = { version = "1.47", features = ["full"] }
 axum = { version = "0.8", features = ["macros"] }
@@ -84,6 +86,7 @@ tempfile = "3.14"
 object_store = { version = "0.14", default-features = false }
 url = "2.5"
 rdkafka = { version = "0.39", default-features = false, features = ["tokio", "cmake-build", "ssl-vendored"] }
+regex = "1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

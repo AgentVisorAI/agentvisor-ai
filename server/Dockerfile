@@ -1,89 +1,40 @@
-# AgentVisor AI hosted API — production image.
-#
-# Design goals:
-#   - Portable: standard Node 22 slim, deploys as-is to Fly.io, Cloud Run,
-#     Render, Railway, Kubernetes, or any Docker host.
-#   - Small: multi-stage build ships only compiled JS + runtime deps.
-#   - Secure: non-root user; the final CMD does invoke `sh -c` for the
-#     migrate→exec chain, but runs under dumb-init as PID 1 (signals
-#     forwarded, zombies reaped) — no long-lived shell, and no shell
-#     access from a running container without an explicit `docker exec`.
-#     Healthcheck reads /readyz.
-#   - Deterministic: `npm ci` locks the tree, base image pinned to a digest.
-#
-# Rebuild the digest pins periodically to pull in patched base images:
-#   docker manifest inspect node:22-slim | grep digest
-
-# ---------- build stage ----------
-# For fully reproducible builds, replace the tag with a digest, e.g.
-# `node:22-slim@sha256:<sha>`. Fetch the current digest with:
-#   docker manifest inspect node:22-slim | grep digest | head -1
-FROM node:22-slim AS build
+# Build and generate Prisma on the same Debian/glibc family as the runtime.
+# The runtime contains Node and its libraries, without a shell or package manager.
+# Inspect both manifest digests when preparing an image update.
+FROM node:22-trixie-slim@sha256:b26b04c123d9ff8ab646ceb18b9d75a1173acf64b9a401094b906d27b29338d4 AS build
 WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends openssl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY package.json package-lock.json* ./
+COPY package.json package-lock.json ./
 RUN npm ci --no-audit --no-fund
-
 COPY prisma ./prisma
-RUN npx prisma generate
-
+RUN node node_modules/prisma/build/index.js generate
 COPY tsconfig.json ./
+COPY database-url.mjs database-url.d.mts ./
 COPY src ./src
 RUN npm run build
+# Prisma is a production dependency because startup applies migrations. Remove
+# only declared development dependencies, then regenerate the native client.
+RUN npm prune --omit=dev --ignore-scripts --no-audit --no-fund \
+    && node node_modules/prisma/build/index.js generate
 
-# NOTE: we intentionally do NOT `npm prune --omit=dev` here. `prisma` is
-# a runtime dependency (the entrypoint runs `prisma migrate deploy` on
-# boot), and every other devDep is small enough that trading a few MB
-# of image size for one less pruning-caused footgun is worth it.
-
-# ---------- runtime stage ----------
-FROM node:22-slim AS runtime
+FROM gcr.io/distroless/nodejs22-debian13:nonroot@sha256:5ef534d3db0ac0c43bee379af4ae49cfbfc0ef38a46c94c52d87c68f32f34d8a AS runtime
 WORKDIR /app
+# Debian 13 Distroless includes libssl, zlib, libgcc, CA certificates, and
+# timezone data. Preserve its package metadata for complete vulnerability scans.
 ENV NODE_ENV=production \
-    NPM_CONFIG_UPDATE_NOTIFIER=false \
-    NPM_CONFIG_FUND=false
-
-# `openssl` needed by Prisma for the Postgres TLS handshake at runtime.
-# `dumb-init` gives us a proper PID 1 so SIGTERM propagates cleanly (fast
-# shutdowns are important on autoscaling platforms).
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends openssl ca-certificates dumb-init \
-    && rm -rf /var/lib/apt/lists/*
-
-# Delete the base image's globally-installed npm + npx CLIs. They ship
-# a large transitive dep graph (brace-expansion, tar, deepmerge-ts,
-# sigstore, …) that Trivy flags as HIGH/CRITICAL. The runtime never
-# invokes npm — the entrypoint runs the local prisma binary directly —
-# so nothing here depends on the global tools.
-RUN rm -rf /usr/local/lib/node_modules/npm \
-    && rm -f /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack
-
+    PATH=/nodejs/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    PORT=8080
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/prisma ./prisma
-COPY package.json ./
-
-# Node's `node` user (uid 1000) exists in the base image already.
-USER node
-
-# The hosting platform (Fly / Cloud Run / Render / …) sets PORT; we listen on
-# whatever they hand us. 8080 is a portable default.
-ENV PORT=8080
+COPY package.json package-lock.json container-entrypoint.mjs database-url.mjs ./
+USER 65532:65532
 EXPOSE 8080
 
-# Cheap liveness probe. Container orchestrators (Fly checks, Cloud Run health,
-# k8s liveness) all understand this format. Uses /readyz — a 200 there means
-# both the API process and the database it depends on are healthy, so an
-# unhealthy DB drains traffic instead of returning 500s.
+# Exec form is required: this image deliberately contains no /bin/sh.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=15s --retries=3 \
-    CMD node -e "fetch('http://127.0.0.1:'+process.env.PORT+'/readyz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
-
-# dumb-init reaps zombies + forwards signals so `docker stop` and Fly's rolling
-# deploys finish in <100ms instead of the default 10s SIGKILL wait.
-# Invoke prisma via its local binary (`node_modules/.bin/prisma`) so we
-# don't need `npx` (deleted above) and so the runtime doesn't have to
-# reach out to npm to fetch anything on boot.
-ENTRYPOINT ["dumb-init", "--"]
-CMD ["sh", "-c", "./node_modules/.bin/prisma migrate deploy && node dist/index.js"]
+    CMD ["/nodejs/bin/node", "-e", "fetch('http://127.0.0.1:'+process.env.PORT+'/readyz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+ENTRYPOINT ["/nodejs/bin/node"]
+CMD ["container-entrypoint.mjs"]

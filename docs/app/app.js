@@ -932,6 +932,11 @@
           // timestamp so re-signing-out later fires the event again.
           try { localStorage.setItem("av_signed_out_at", String(Date.now())); } catch (e) {}
           navigate("#/login");
+        }).catch(function () {
+          // Logout only succeeds after the shared session fence is
+          // persisted. Keep the current session usable for a retry.
+          startLiveStream();
+          toast("Could not sign out. Your session is still active. Please try again.");
         });
       },
     });
@@ -1312,6 +1317,8 @@
             ? "An account already exists for that email in another workspace. Contact support to consolidate."
             : errCode === "saml_config_uses_sha1_reject"
               ? "Your identity provider is signing with SHA-1 which we no longer accept. Ask your IdP admin to switch to SHA-256."
+              : errCode === "saml_request_unavailable" || errCode === "saml_assertion_request_state_unavailable"
+                ? "SAML sign-in is temporarily unavailable. Please start sign-in again."
               : "SAML sign-in could not complete. Ask an admin to check the IdP configuration.";
       noteHtml = '<div class="auth-note">' + esc(samlMsg) + '</div>';
     } else if (joinedFlag) {
@@ -1326,10 +1333,8 @@
     // label comes from the server's OIDC_DISPLAY_NAME env — operator
     // input, so esc() it like everything else user-controlled.
     if (byId.oidc)      ssoButtons += '<button type="button" data-sso="oidc">' + iconKey() + '<span>Continue with ' + esc(byId.oidc.displayName || "SSO") + '</span></button>';
-    // SAML/Okta = enterprise path. We're honest about not shipping it
-    // yet: click routes to a contact-sales mailto. Still visible so the
-    // login page communicates the roadmap without pretending.
-    ssoButtons += '<button type="button" data-sso="saml">' + iconKey() + '<span>SAML SSO (contact sales)</span></button>';
+    // SAML discovery selects the workspace's configured identity provider.
+    ssoButtons += '<button type="button" data-sso="saml">' + iconKey() + '<span>Continue with SAML SSO</span></button>';
     var showSsoBlock = ssoButtons !== "";
     app.innerHTML = "";
     app.appendChild(h(
@@ -2397,6 +2402,7 @@
     var STALL_MS = 30 * 60 * 1000;
     function statusPill(s) {
       if (s.status === "completed") return '<span class="pill ok" title="Sealed — the daemon signed the receipt">sealed</span>';
+      if (s.status === "quarantined_crash_evidence") return '<span class="pill warn" title="The daemon recovered incomplete evidence after a crash. Counts are partial and no receipt is available.">quarantined · incomplete</span>';
       if (s.status !== "in_progress") return '<span class="pill neutral">' + esc(s.status || "—") + '</span>';
       var started = new Date(s.startedAt).getTime();
       // A "live" session that has not sealed after 30 minutes is not
@@ -2412,7 +2418,7 @@
     var rows = sessions.map(function (s) {
       var blocks = s.toolsBlocked > 0
         ? '<span class="pill err">' + s.toolsBlocked + " blocked</span>"
-        : '<span class="pill ok">clean</span>';
+        : (s.status === "quarantined_crash_evidence" ? '<span class="pill warn">unknown · partial</span>' : '<span class="pill ok">clean</span>');
       return '<tr data-clickable data-id="' + esc(s.id) + '" data-nav="#/sessions/" tabindex="0">' +
         '<td title="' + esc(s.agent + " · " + s.externalId) + '"><div style="font-weight:500">' + esc(s.agent) + '</div><div class="id">' + esc(s.externalId) + "</div></td>" +
         '<td title="' + esc(s.user || "") + '"><div class="actor"><span class="av">' + esc(initials(s.user)) + '</span>' + esc(s.user || "—") + '</div></td>' +
@@ -2527,6 +2533,8 @@
     } catch (e) { return renderError(main, e); }
     var s = data.session;
     var events = data.events || [];
+    var quarantined = s.status === "quarantined_crash_evidence";
+    if (quarantined) receipt = { note: "No receipt is available. The daemon recovered incomplete evidence after a crash; this session cannot be sealed." };
 
     // Compute cumulative offsets from session start so the waterfall shows
     // when each event actually happened relative to the session's timeline,
@@ -2619,9 +2627,10 @@
     // re-renders and arms them the moment it does). Print stays: the
     // evidence pack truthfully prints the trail + "no receipt yet".
     var unsealed = !!(receipt && receipt.note);
-    var rcptDis = unsealed ? ' disabled title="Available when the session seals — the daemon signs the receipt at seal"' : "";
+    var rcptDis = unsealed ? ' disabled title="' + (quarantined ? "No receipt is available for incomplete crash evidence" : "Available when the session seals — the daemon signs the receipt at seal") + '"' : "";
     main.innerHTML =
       pageHeader("Session " + s.externalId, s.agent + " · " + (s.user || "—") + " · " + (s.model || ""), '<a href="' + esc(backToListUrl("sessions")) + '" class="btn">← All sessions</a> ' + nav + '<button class="btn" id="printPack" title="Print this page as a clean evidence pack — receipt and event trail included">🖨 Print evidence pack</button> <button class="btn" id="copyRcpt"' + rcptDis + '>Copy receipt</button> <button class="btn" id="shareRcpt"' + rcptDis + '>🔗 Share verify link</button> <button class="btn accent" id="dlRcpt"' + rcptDis + '>↓ Download receipt</button>') +
+      (quarantined ? '<div class="notice" role="status"><div><strong>Quarantined crash evidence.</strong> This session contains incomplete evidence recovered after a daemon crash. All counts and totals are partial. No signed receipt is available.</div></div>' : "") +
       '<div class="session-summary">' +
         cell("Events", s.events, "streamed") +
         cell("Allowed", s.toolsAllowed, "tool calls") +
@@ -2657,6 +2666,7 @@
       '<div class="print-only" style="margin-top:16px; padding-top:10px; border-top:1px solid var(--border); font-size:11px; color:var(--fg-2);">' +
         "Evidence pack · session " + esc(s.externalId) + " · " + events.length + " event" + (events.length === 1 ? "" : "s") +
         (data.nextEventCursor != null ? " (partial — more events not loaded; use Load more before printing for the full trail)" : "") +
+        (quarantined ? " · INCOMPLETE CRASH EVIDENCE — counts and totals are partial; no signed receipt is available" : "") +
         " · printed " + esc(new Date().toLocaleString()) +
         (receipt && receipt.receiptId ? " · receipt " + esc(receipt.receiptId) : "") +
         (receipt && receipt.signingKeyFingerprint ? " · signing key " + esc(receipt.signingKeyFingerprint) : "") +

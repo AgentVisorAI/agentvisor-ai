@@ -694,10 +694,12 @@ pub fn spawn_worker_with_spool(
         spool_dir,
         [0; 32],
         metrics,
+        None,
     )
 }
 
 /// Start the worker pool with authenticated active-workflow journals.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_worker_with_spool_authenticated(
     capacity: usize,
     bridge: Arc<dyn EventBus>,
@@ -706,6 +708,7 @@ pub fn spawn_worker_with_spool_authenticated(
     spool_dir: Option<std::path::PathBuf>,
     journal_key: [u8; 32],
     metrics: Arc<Registry>,
+    redaction: Option<Arc<av_redact::RedactionEngine>>,
 ) -> WorkerHandle {
     // Sharding is decoupled from `capacity`: routing is by
     // `partition_for(session_id, senders.len())`, so every spawned
@@ -767,6 +770,7 @@ pub fn spawn_worker_with_spool_authenticated(
             Arc::clone(&metrics),
             Arc::clone(&pending),
             Arc::clone(&drained),
+            redaction.clone(),
         );
     }
     WorkerHandle {
@@ -806,6 +810,7 @@ fn spawn_worker_shard(
     worker_metrics: Arc<Registry>,
     worker_pending: Arc<std::sync::atomic::AtomicU64>,
     worker_drained: Arc<tokio::sync::Notify>,
+    redaction: Option<Arc<av_redact::RedactionEngine>>,
 ) {
     // To avoid intra-shard head-of-line blocking, the shard is
     // a DISPATCHER over per-session FIFO queues, not a serial loop.
@@ -850,6 +855,7 @@ fn spawn_worker_shard(
             let worker_metrics = Arc::clone(&worker_metrics);
             let worker_pending = Arc::clone(&worker_pending);
             let worker_drained = Arc::clone(&worker_drained);
+            let redaction = redaction.clone();
             tasks.spawn(async move {
                 use futures::future::FutureExt as _;
                 // Supervise the whole envelope (routing + process_job)
@@ -870,6 +876,7 @@ fn spawn_worker_shard(
                         worker_metrics,
                         worker_pending,
                         worker_drained,
+                        redaction,
                     ))
                     .catch_unwind()
                     .await;
@@ -1072,6 +1079,7 @@ async fn process_envelope_batch(
     worker_metrics: Arc<Registry>,
     worker_pending: Arc<std::sync::atomic::AtomicU64>,
     worker_drained: Arc<tokio::sync::Notify>,
+    redaction: Option<Arc<av_redact::RedactionEngine>>,
 ) {
     let mut iterator = envelopes.into_iter();
     let Some(first) = iterator.next() else { return };
@@ -1087,6 +1095,7 @@ async fn process_envelope_batch(
             worker_metrics,
             worker_pending,
             worker_drained,
+            redaction,
         )
         .await;
     }
@@ -1137,6 +1146,7 @@ async fn process_envelope_batch(
                 journal_key,
                 &batch_metrics,
                 /* sync_journal */ false,
+                redaction.as_ref(),
             )
             .instrument(span)
             .await;
@@ -1238,6 +1248,7 @@ async fn process_envelope(
     worker_metrics: Arc<Registry>,
     worker_pending: Arc<std::sync::atomic::AtomicU64>,
     worker_drained: Arc<tokio::sync::Notify>,
+    redaction: Option<Arc<av_redact::RedactionEngine>>,
 ) {
     // `worker_pending` was previously decremented at the
     // bottom of this function. Any panic between here and that line
@@ -1284,6 +1295,7 @@ async fn process_envelope(
                     spool_dir,
                     journal_key,
                     job_metrics,
+                    redaction,
                 )
                 .await
             }
@@ -1398,6 +1410,7 @@ struct PersistedJob {
     response_marker: Option<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_job(
     job: WorkerJob,
     bridge: Arc<dyn EventBus>,
@@ -1406,6 +1419,7 @@ async fn process_job(
     spool_dir: Option<std::path::PathBuf>,
     journal_key: [u8; 32],
     metrics: Arc<Registry>,
+    redaction: Option<Arc<av_redact::RedactionEngine>>,
 ) -> Result<(), String> {
     match persist_job(
         job,
@@ -1415,6 +1429,7 @@ async fn process_job(
         journal_key,
         &metrics,
         /* sync_journal */ true,
+        redaction.as_ref(),
     )
     .await?
     {
@@ -1423,11 +1438,61 @@ async fn process_job(
     }
 }
 
+/// Redact both copies of the audit data before they reach durable storage.
+fn redact_audit_capture(
+    mut value: Value,
+    mut atif_step: Option<av_atif::Step>,
+    class: EventClass,
+    engine: &av_redact::RedactionEngine,
+) -> (Value, Option<av_atif::Step>) {
+    // Tool authorization stores the event payload as a JSON string in the
+    // observation. Preserve that schema, but reuse the redacted payload for
+    // exact copies. Arbitrary tool output is not a payload-relative document.
+    let original_payload = (class == EventClass::ToolCall)
+        .then(|| value.get("payload").map(Value::to_string))
+        .flatten();
+    if let Some(payload) = value.get_mut("payload") {
+        engine.redact_value(payload);
+    }
+    if let Some(step) = &mut atif_step {
+        engine.redact_value(&mut step.message);
+        if let Some(reasoning) = &mut step.reasoning_content {
+            let mut text = Value::String(std::mem::take(reasoning));
+            engine.redact_value(&mut text);
+            if let Value::String(redacted) = text {
+                *reasoning = redacted;
+            }
+        }
+        if let Some(calls) = &mut step.tool_calls {
+            for call in calls {
+                engine.redact_user_value(&mut call.arguments);
+            }
+        }
+        if let Some(observation) = &mut step.observation {
+            for result in &mut observation.results {
+                if let Some(content) = &mut result.content {
+                    if original_payload
+                        .as_deref()
+                        .is_some_and(|original| content.as_str() == Some(original))
+                    {
+                        if let Some(payload) = value.get("payload") {
+                            *content = Value::String(payload.to_string());
+                        }
+                    }
+                    engine.redact_value(content);
+                }
+            }
+        }
+    }
+    (value, atif_step)
+}
+
 /// Phase A: analyze, build the event + journal record, and append it
 /// to the session journal (fsynced only when `sync_journal` — a batch
 /// syncs once after its last append). Returns `None` when the session
 /// is poisoned (capture-failed guard) and the job must be skipped
 /// without consuming a sequence number.
+#[allow(clippy::too_many_arguments)]
 async fn persist_job(
     mut job: WorkerJob,
     embedder: Arc<dyn Embedder>,
@@ -1436,6 +1501,7 @@ async fn persist_job(
     journal_key: [u8; 32],
     metrics: &Arc<Registry>,
     sync_journal: bool,
+    redaction: Option<&Arc<av_redact::RedactionEngine>>,
 ) -> Result<Option<PersistedJob>, String> {
     // A queued envelope for a session that has already been poisoned must not
     // consume a sequence number or write to the journal — otherwise the seq
@@ -1637,6 +1703,16 @@ async fn persist_job(
         })
     } else {
         None
+    };
+    // Redaction scans caller-controlled text. Keep that CPU work off the
+    // async runtime, while still completing it before any journal or bus write.
+    let (value, atif_step) = if let Some(engine) = redaction {
+        let engine = Arc::clone(engine);
+        tokio::task::spawn_blocking(move || redact_audit_capture(value, atif_step, submitted_class, &engine))
+            .await
+            .map_err(|error| format!("redaction task failed: {error}"))?
+    } else {
+        (value, atif_step)
     };
     let is_tool_call = submitted_class == EventClass::ToolCall;
     let is_response_accounting = is_llm_agent_response && submitted_class != EventClass::Compression;
@@ -2155,6 +2231,7 @@ async fn append_journal(
     let directory = directory.to_path_buf();
     let session_id = session.id.clone();
     let identity = session.identity.clone();
+    let principal_binding = session.principal_binding();
     let workflow = session.workflow.as_str();
     tokio::task::spawn_blocking(move || -> Result<(), String> {
         use std::io::Write as _;
@@ -2174,6 +2251,7 @@ async fn append_journal(
             "journal_version": 2,
             "session_id": session_id,
             "identity": identity,
+            "principal_binding": principal_binding,
             "workflow": workflow,
         });
         // `symlink_metadata` (NOT `exists()`) so a dangling symlink
@@ -2208,7 +2286,7 @@ async fn append_journal(
                 )
             })?;
         } else {
-            let stored: serde_json::Value = crate::journal::open(
+            let mut stored: serde_json::Value = crate::journal::open(
                 &journal_key,
                 "metadata",
                 0,
@@ -2217,8 +2295,18 @@ async fn append_journal(
                 &av_core::fsutil::read_capped(&metadata_path, av_core::fsutil::MAX_CONTROL_BYTES)
                     .map_err(|error| error.to_string())?,
             )?;
+            // Older anonymous journals have no binding field. They may only
+            // continue anonymously; a verified principal must never inherit
+            // a journal whose owner was not durably recorded.
+            if principal_binding.is_none() && stored.get("principal_binding").is_none() {
+                if let Some(metadata) = stored.as_object_mut() {
+                    metadata.insert("principal_binding".into(), Value::Null);
+                }
+            }
             if stored != metadata_payload {
-                return Err("journal metadata does not match session workflow and identity".to_owned());
+                return Err(
+                    "journal metadata does not match session workflow, identity, and principal".to_owned(),
+                );
             }
         }
         let journal_path = directory.join(format!("{stem}.events.ndjson"));
@@ -2947,6 +3035,7 @@ mod tests {
             Some(directory.path().to_path_buf()),
             journal_key,
             Arc::new(Registry::new()),
+            None,
         );
         let session = session(Workflow::Signed);
         let mut response = job(session);
@@ -3037,6 +3126,7 @@ mod tests {
             Some(directory.path().to_path_buf()),
             journal_key,
             Arc::new(Registry::new()),
+            None,
         );
         let session = session(Workflow::Signed);
         worker.submit_and_wait(job(Arc::clone(&session))).await.unwrap();
@@ -3060,6 +3150,73 @@ mod tests {
         assert_eq!(record.event["class_name"], "agent.compression");
     }
 
+    #[tokio::test]
+    async fn journal_metadata_binds_principal_and_rejects_mismatch() {
+        let directory = tempfile::tempdir().unwrap();
+        let key = [9; 32];
+        let first = session(Workflow::Signed);
+        assert!(first.bind_principal(Some("principal-a")));
+        append_journal(directory.path(), &first, b"first".to_vec(), key, true)
+            .await
+            .unwrap();
+        let digest = av_core::digest::sha256_hex(first.id.as_bytes());
+        let stem = digest.get(..32).unwrap();
+        let metadata: Value = crate::journal::open(
+            &key,
+            "metadata",
+            0,
+            &std::fs::read(directory.path().join(format!("{stem}.session.json"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(metadata["principal_binding"], "principal-a");
+        let journal_path = directory.path().join(format!("{stem}.events.ndjson"));
+        let original_journal = std::fs::read(&journal_path).unwrap();
+        for principal in [Some("principal-b"), None] {
+            let other = session(Workflow::Signed);
+            assert!(other.bind_principal(principal));
+            let error = append_journal(directory.path(), &other, b"second".to_vec(), key, true)
+                .await
+                .unwrap_err();
+            assert!(error.contains("principal"));
+            assert_eq!(std::fs::read(&journal_path).unwrap(), original_journal);
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_journal_metadata_only_allows_anonymous_continuation() {
+        let directory = tempfile::tempdir().unwrap();
+        let key = [9; 32];
+        let anonymous = session(Workflow::Signed);
+        let digest = av_core::digest::sha256_hex(anonymous.id.as_bytes());
+        let stem = digest.get(..32).unwrap();
+        let legacy = serde_json::json!({
+            "journal_version": 2,
+            "session_id": anonymous.id,
+            "identity": anonymous.identity,
+            "workflow": "signed",
+        });
+        std::fs::write(
+            directory.path().join(format!("{stem}.session.json")),
+            crate::journal::seal(&key, "metadata", 0, &legacy).unwrap(),
+        )
+        .unwrap();
+        append_journal(directory.path(), &anonymous, b"first".to_vec(), key, true)
+            .await
+            .unwrap();
+        let authenticated = session(Workflow::Signed);
+        assert!(authenticated.bind_principal(Some("principal-a")));
+        assert!(
+            append_journal(directory.path(), &authenticated, b"second".to_vec(), key, true)
+                .await
+                .unwrap_err()
+                .contains("principal")
+        );
+        assert_eq!(
+            std::fs::read(directory.path().join(format!("{stem}.events.ndjson"))).unwrap(),
+            b"first\n"
+        );
+    }
+
     /// A session marked `capture_failed` (typically because a prior envelope's
     /// journal append failed) must not have subsequent queued envelopes advance
     /// `next_seq` and land in the journal — their `event.metadata.sequence`
@@ -3079,6 +3236,7 @@ mod tests {
             Some(directory.path().to_path_buf()),
             journal_key,
             Arc::new(Registry::new()),
+            None,
         );
         let session = session(Workflow::Signed);
         worker.submit_and_wait(job(Arc::clone(&session))).await.unwrap();
@@ -3133,6 +3291,7 @@ mod tests {
             Some(directory.path().to_path_buf()),
             journal_key,
             Arc::clone(&metrics),
+            None,
         );
         let active = session(Workflow::Signed);
         worker.submit_and_wait(job(Arc::clone(&active))).await.unwrap();
@@ -3186,6 +3345,7 @@ mod tests {
             Some(directory.path().to_path_buf()),
             journal_key,
             Arc::clone(&metrics),
+            None,
         );
         let incomplete = Arc::new(Session::new(
             "incomplete-signed".to_owned(),
@@ -3251,6 +3411,7 @@ mod tests {
             Some(directory.path().to_path_buf()),
             journal_key,
             Arc::clone(&metrics),
+            None,
         );
         let active = session(Workflow::Unsigned);
         let mut incomplete_request = job(Arc::clone(&active));
@@ -3309,6 +3470,7 @@ mod tests {
             Some(directory.path().to_path_buf()),
             journal_key,
             Arc::new(Registry::new()),
+            None,
         );
         let active = session(Workflow::Signed);
         worker.submit_and_wait(job(Arc::clone(&active))).await.unwrap();
@@ -3365,6 +3527,7 @@ mod tests {
             Some(directory.path().to_path_buf()),
             journal_key,
             Arc::new(Registry::new()),
+            None,
         );
         let active = session(Workflow::Signed);
         worker.submit_and_wait(job(Arc::clone(&active))).await.unwrap();
@@ -3428,6 +3591,7 @@ mod tests {
             Some(directory.path().to_path_buf()),
             journal_key,
             Arc::new(Registry::new()),
+            None,
         );
         let session = session(Workflow::Unsigned);
         worker.submit_and_wait(job(Arc::clone(&session))).await.unwrap();
@@ -3469,6 +3633,7 @@ mod tests {
             Some(directory.path().to_path_buf()),
             journal_key,
             Arc::clone(&metrics),
+            None,
         );
         let active = session(Workflow::Unsigned);
         worker.submit_and_wait(job(Arc::clone(&active))).await.unwrap();
@@ -3979,6 +4144,7 @@ mod tests {
             Some(directory.path().to_path_buf()),
             journal_key,
             Arc::new(Registry::new()),
+            None,
         );
         let session = session_with_id("batched-session");
         // First job blocks in publish (Phase B), so the next ten
@@ -4106,6 +4272,210 @@ mod tests {
         );
         bus.release.store(true, Ordering::Release);
         stalled_wait.await.unwrap().unwrap();
+    }
+
+    fn read_redaction_test_record(spool: &std::path::Path, session: &Session) -> ActiveJournalRecord {
+        let digest = av_core::digest::sha256_hex(session.id.as_bytes());
+        let stem = digest.get(..32).unwrap();
+        let contents = std::fs::read_to_string(spool.join(format!("{stem}.events.ndjson"))).unwrap();
+        assert_eq!(contents.lines().count(), 1, "exactly one event must be journaled");
+        crate::journal::open(
+            &[0; 32],
+            &format!("{}:active", session.id),
+            0,
+            contents.trim().as_bytes(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn redaction_engine_strips_sensitive_payload_on_spool() {
+        let spool = tempfile::tempdir().unwrap();
+        let bus = Arc::new(RecordingBus::default());
+        let engine = av_redact::RedactionEngine::new(av_redact::RedactionConfig {
+            include_builtin_patterns: true,
+            ..av_redact::RedactionConfig::default()
+        })
+        .unwrap();
+        let worker = spawn_worker_with_spool_authenticated(
+            4,
+            Arc::clone(&bus) as Arc<dyn EventBus>,
+            Arc::new(HashEmbedder::default()),
+            Arc::new(NoopVectorSink),
+            Some(spool.path().to_owned()),
+            [0; 32],
+            Arc::new(Registry::new()),
+            Some(Arc::new(engine)),
+        );
+        let sess = session(Workflow::Unsigned);
+        let mut j = job(Arc::clone(&sess));
+        j.payload = serde_json::json!({
+            "kind": "tool_response",
+            "api_key": "sk-BBBBBBBBBBBBBBBBBBBBBB"
+        });
+        worker.submit_and_wait(j).await.unwrap();
+        let record = read_redaction_test_record(spool.path(), &sess);
+        assert_eq!(record.event["payload"]["api_key"], "[REDACTED]");
+        assert_eq!(record.event["payload"]["kind"], "tool_response");
+    }
+
+    #[tokio::test]
+    async fn redaction_engine_strips_sensitive_payload_on_bus() {
+        let bus = Arc::new(RecordingBus::default());
+        let engine = av_redact::RedactionEngine::new(av_redact::RedactionConfig {
+            include_builtin_patterns: true,
+            ..av_redact::RedactionConfig::default()
+        })
+        .unwrap();
+        let worker = spawn_worker_with_spool_authenticated(
+            4,
+            Arc::clone(&bus) as Arc<dyn EventBus>,
+            Arc::new(HashEmbedder::default()),
+            Arc::new(NoopVectorSink),
+            None,
+            [0; 32],
+            Arc::new(Registry::new()),
+            Some(Arc::new(engine)),
+        );
+        let sess = session(Workflow::Unsigned);
+        let mut j = job(Arc::clone(&sess));
+        j.payload = serde_json::json!({
+            "kind": "tool_response",
+            "api_key": "sk-AAAAAAAAAAAAAAAAAAAAAA"
+        });
+        worker.submit_and_wait(j).await.unwrap();
+        let events = bus.events.lock();
+        let published = events
+            .iter()
+            .find(|(_, _, v)| v.pointer("/payload").is_some())
+            .expect("at least one event with a payload must reach the bus");
+        let payload = &published.2["payload"];
+        assert_eq!(payload["api_key"], "[REDACTED]");
+    }
+
+    #[tokio::test]
+    async fn redaction_engine_strips_sensitive_atif_step_fields() {
+        let spool = tempfile::tempdir().unwrap();
+        let bus = Arc::new(RecordingBus::default());
+        let engine = av_redact::RedactionEngine::new(av_redact::RedactionConfig {
+            include_builtin_patterns: true,
+            ..av_redact::RedactionConfig::default()
+        })
+        .unwrap();
+        let worker = spawn_worker_with_spool_authenticated(
+            4,
+            Arc::clone(&bus) as Arc<dyn EventBus>,
+            Arc::new(HashEmbedder::default()),
+            Arc::new(NoopVectorSink),
+            Some(spool.path().to_owned()),
+            [0; 32],
+            Arc::new(Registry::new()),
+            Some(Arc::new(engine)),
+        );
+        let sess = session(Workflow::Unsigned);
+        let mut j = job(Arc::clone(&sess));
+        j.atif = Some(AtifCapture {
+            source: av_atif::Source::Agent,
+            message: serde_json::json!("The API key is sk-CCCCCCCCCCCCCCCCCCCCCC"),
+            reasoning_content: Some("User leaked sk-DDDDDDDDDDDDDDDDDDDDDD in context".into()),
+            model_name: None,
+            tool_calls: Some(vec![av_atif::ToolCall {
+                tool_call_id: "call-1".into(),
+                function_name: "send".into(),
+                arguments: serde_json::json!({
+                    "key": "sk-proj-AbCdEf0123456789_-",
+                    "card": 4_111_111_111_111_111_u64,
+                    "share_with": { "alice@example.com": "editor" }
+                }),
+                extra: None,
+            }]),
+            observation: Some(av_atif::Observation {
+                results: vec![av_atif::ObservationResult {
+                    source_call_id: Some("call-1".into()),
+                    content: Some(serde_json::json!("result: sk-EEEEEEEEEEEEEEEEEEEEEE")),
+                    subagent_trajectory_ref: None,
+                    extra: None,
+                }],
+            }),
+            llm_call_count: Some(1),
+        });
+        worker.submit_and_wait(j).await.unwrap();
+        let record = read_redaction_test_record(spool.path(), &sess);
+        let step = record.atif_step.unwrap();
+        assert_eq!(step.message, "The API key is [REDACTED]");
+        assert_eq!(
+            step.reasoning_content.as_deref(),
+            Some("User leaked [REDACTED] in context")
+        );
+        assert_eq!(
+            step.observation.unwrap().results[0].content,
+            Some(serde_json::json!("result: [REDACTED]"))
+        );
+        assert_eq!(
+            step.tool_calls.unwrap()[0].arguments,
+            serde_json::json!({
+                "key": "[REDACTED]",
+                "card": "[REDACTED]",
+                "share_with": { "[REDACTED]": "editor" }
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn redaction_engine_removes_paths_from_serialized_tool_payload_copies() {
+        let spool = tempfile::tempdir().unwrap();
+        let bus = Arc::new(RecordingBus::default());
+        let engine = av_redact::RedactionEngine::new(av_redact::RedactionConfig {
+            pointer_paths: vec!["/reason".into()],
+            include_builtin_patterns: false,
+            ..av_redact::RedactionConfig::default()
+        })
+        .unwrap();
+        let worker = spawn_worker_with_spool_authenticated(
+            4,
+            Arc::clone(&bus) as Arc<dyn EventBus>,
+            Arc::new(HashEmbedder::default()),
+            Arc::new(NoopVectorSink),
+            Some(spool.path().to_owned()),
+            [0; 32],
+            Arc::new(Registry::new()),
+            Some(Arc::new(engine)),
+        );
+        let sess = session(Workflow::Unsigned);
+        let mut j = job(Arc::clone(&sess));
+        j.class = EventClass::ToolCall;
+        j.analyze_loop = false;
+        j.status = StatusId::Failure;
+        j.payload =
+            serde_json::json!({"tool": "transfer", "allowed": false, "reason": "private denial detail"});
+        j.atif.as_mut().unwrap().observation = Some(av_atif::Observation {
+            results: vec![
+                av_atif::ObservationResult {
+                    source_call_id: Some("call-1".into()),
+                    content: Some(Value::String(j.payload.to_string())),
+                    subagent_trajectory_ref: None,
+                    extra: None,
+                },
+                av_atif::ObservationResult {
+                    source_call_id: Some("unrelated".into()),
+                    content: Some(Value::String(r#"{"reason":"unrelated tool data"}"#.into())),
+                    subagent_trajectory_ref: None,
+                    extra: None,
+                },
+            ],
+        });
+        worker.submit_and_wait(j).await.unwrap();
+        let record = read_redaction_test_record(spool.path(), &sess);
+        assert_eq!(record.event["payload"]["reason"], "[REDACTED]");
+        let results = record.atif_step.unwrap().observation.unwrap().results;
+        let copied_payload: Value =
+            serde_json::from_str(results[0].content.as_ref().unwrap().as_str().unwrap()).unwrap();
+        assert_eq!(copied_payload, record.event["payload"]);
+        assert_eq!(
+            results[1].content,
+            Some(Value::String(r#"{"reason":"unrelated tool data"}"#.into()))
+        );
+        assert_eq!(bus.events.lock()[0].2["payload"], copied_payload);
     }
 
     /// Per-session ordering survives the dispatcher: two jobs for one

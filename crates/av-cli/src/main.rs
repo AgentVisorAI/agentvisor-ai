@@ -1,6 +1,7 @@
 //! `avctl` operations for keys, receipts, ATIF, Bridge, sessions, and load.
 
 mod console_sync;
+mod operator_revocation;
 mod setup;
 
 use anyhow::{Context, Result};
@@ -165,6 +166,25 @@ enum Command {
         #[arg(long)]
         bearer_token_file: Option<PathBuf>,
     },
+    /// Revoke one token using a separate operator credential.
+    TokenRevoke {
+        /// Identifier from the token's jti claim.
+        #[arg(long)]
+        jti: String,
+        /// Token namespace: upstream NHI or harness-issued exchange.
+        #[arg(long, value_enum, default_value_t = operator_revocation::TokenKind::Nhi)]
+        token_kind: operator_revocation::TokenKind,
+        #[command(flatten)]
+        options: operator_revocation::Options,
+    },
+    /// Revoke all currently issued tokens for an agent instance.
+    InstanceRevoke {
+        /// Identifier from the agent's instance_uid claim.
+        #[arg(long)]
+        instance_uid: String,
+        #[command(flatten)]
+        options: operator_revocation::Options,
+    },
     /// Validate a harness TOML configuration.
     ConfigValidate {
         /// Configuration file.
@@ -300,6 +320,24 @@ async fn run(cli: Cli) -> Result<()> {
             id,
             bearer_token_file,
         } => session_promote(&url, &id, bearer_token_file.as_deref()).await,
+        Command::TokenRevoke {
+            jti,
+            token_kind,
+            options,
+        } => {
+            operator_revocation::run(
+                &options,
+                operator_revocation::Target::Token {
+                    jti: &jti,
+                    kind: token_kind,
+                },
+            )
+            .await
+        }
+        Command::InstanceRevoke {
+            instance_uid,
+            options,
+        } => operator_revocation::run(&options, operator_revocation::Target::Instance(&instance_uid)).await,
         Command::ConfigValidate {
             path,
             structural_only,

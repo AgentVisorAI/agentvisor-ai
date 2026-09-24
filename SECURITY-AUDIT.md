@@ -91,11 +91,17 @@ attacker cannot substitute a hostile model.
 
 ### Informational (no CVE)
 
-- `paste`, `number_prefix`, `rustls-pemfile`, `filetime` — unmaintained
-  warnings only. No security impact for our usage.
-  *Resolved after this audit:* `rustls-pemfile` left the dependency tree
-  entirely on 2026-08-16 (rskafka 0.6 / rustls 0.23 migration; CA parsing
-  now via `rustls-pki-types`).
+- The 2026-09-24 all-feature audit reports maintenance warnings for `paste`
+  1.0.15 and `rustls-pemfile` 2.2.0. Neither advisory identifies a vulnerability;
+  an archived dependency still requires maintenance tracking.
+- `rustls-pemfile` left the dependency tree on 2026-08-16 after the Kafka TLS
+  migration, but returned on 2026-09-24 when certificate-verified Redis TLS was
+  enabled. Redis 0.27.6 depends on it directly and through
+  `rustls-native-certs` 0.7.3. Version 2.2.0 delegates PEM parsing to
+  `rustls-pki-types`; removing the archived wrapper requires updating the Redis
+  dependency chain. The warning remains visible in the audit and is not
+  suppressed. Live TLS tests cover trusted certificates, an untrusted CA,
+  hostname mismatch, incorrect credentials, and refusal of insecure URLs.
 
 ## Adversarial regressions added this session
 

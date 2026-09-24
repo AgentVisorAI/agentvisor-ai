@@ -22,13 +22,20 @@ tracing = { workspace = true }
 [features]
 default = []
 # Redis Cluster backend (brief §8); requires a live server, contract tests gated on AV_REDIS_URL.
-redis = ["dep:redis", "dep:r2d2"]
+redis = ["dep:redis", "dep:r2d2", "dep:rustls-tls"]
 
 [dependencies.redis]
 version = "0.27"
 optional = true
 default-features = false
-features = ["script", "r2d2", "cluster"]
+features = ["script", "r2d2", "cluster", "tls-rustls"]
+
+[dependencies.rustls-tls]
+package = "rustls"
+version = "0.23"
+optional = true
+default-features = false
+features = ["ring", "std", "tls12"]
 
 [dependencies.r2d2]
 workspace = true

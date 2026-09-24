@@ -13,18 +13,15 @@
  *     is per-config: wantResponseSigned + wantAssertionsSigned.)
  *   • NotBefore / NotOnOrAfter windows checked with a 5-minute clock
  *     skew tolerance (industry norm).
- *   • Replay protection: every consumed Response ID is stored in the
+ *   • Replay protection: every consumed, verified Assertion ID is stored in the
  *     saml_replay_records table until its NotOnOrAfter expires.
  *   • Audience restriction is our exact SP Entity ID.
  *   • Encrypted assertions are decrypted with our SP private key when
  *     the config allows it.
  *
- * Testing story:
- *   • The class is deterministic given a fixed clock — the ACS consumer
- *     accepts a `now` argument so unit tests can pin time.
- *   • The mock IdP in test/saml-fixtures.ts issues real, correctly-
- *     signed responses so we integration-test the full parse/verify
- *     path without touching the network.
+ * scripts/saml-shared-drill.mjs signs real fixture assertions and checks
+ * replicas, restarts, concurrent consumption, browser/tenant binding, and
+ * database failures without contacting an external identity provider.
  */
 
 import { SAML, ValidateInResponseTo } from "@node-saml/node-saml";
@@ -57,8 +54,9 @@ export type SamlResult = SamlSuccess | SamlFailure;
 
 /**
  * Return the caller-facing SP URLs for a given config. These are the
- * URLs the IdP admin pastes into their IdP: Entity ID (audience), ACS
- * (where the IdP posts SAMLResponse), and SLO (single logout).
+ * Entity ID and ACS are identity-provider settings. The `sloUrl` is only
+ * the application's cookie-protected local logout endpoint; it is not a
+ * SAML Single Logout service and is not advertised in SP metadata.
  */
 export function spUrls(cfg: SamlConfig): {
   entityId: string;
@@ -177,103 +175,99 @@ export function isSha1Legacy(cfg: SamlConfig): boolean {
   return cfg.signatureAlgorithm === "sha1" || cfg.digestAlgorithm === "sha1";
 }
 
-/** Construct the @node-saml/node-saml adapter from our stored config. */
-/// AuthnRequest-ID cache shared by EVERY adapter instance (buildAdapter
-/// constructs a fresh SAML object per request, so an instance-local
-/// cache would forget the request id between /login and the ACS POST).
-/// node-saml saves the id on getAuthorizeUrlAsync, checks + consumes it
-/// on validatePostResponseAsync. TTL covers the 5-minute clock-skew
-/// window plus ceremony time; the sweep runs inline on every save so no
-/// timer is needed.
+// Request and browser state must be shared by every replica. node-saml 5.1.0
+// performs separate getAsync calls and ignores removeAsync's return value;
+// a shared cache alone therefore does not guarantee single consumption.
 const REQUEST_ID_TTL_MS = 10 * 60_000;
-// Small tolerance — 5 minutes matches the SAML errata guidance for
-// clock skew between SP and IdP. Shared by the adapter's validation
-// window and the replay-record lifetime padding.
 const ACCEPTED_CLOCK_SKEW_MS = 5 * 60_000;
-const requestIdStore = new Map<string, { value: string; createdAt: number }>();
-function sweepRequestIds(): void {
-  const cutoff = Date.now() - REQUEST_ID_TTL_MS;
-  for (const [key, item] of requestIdStore) {
-    if (item.createdAt < cutoff) requestIdStore.delete(key);
-  }
-}
-const sharedRequestIdCache = {
-  async saveAsync(key: string, value: string): Promise<{ value: string; createdAt: number } | null> {
-    sweepRequestIds();
-    if (requestIdStore.has(key)) return null;
-    const item = { value, createdAt: Date.now() };
-    requestIdStore.set(key, item);
-    return item;
-  },
-  async getAsync(key: string): Promise<string | null> {
-    const item = requestIdStore.get(key);
-    if (!item) return null;
-    if (item.createdAt < Date.now() - REQUEST_ID_TTL_MS) {
-      requestIdStore.delete(key);
-      return null;
-    }
-    return item.value;
-  },
-  async removeAsync(key: string | null): Promise<string | null> {
-    if (key === null) return null;
-    return requestIdStore.delete(key) ? key : null;
-  },
-};
+const EXPIRED_REQUEST_BATCH = 1000;
 
-/**
- * Browser-binding nonces for SP-initiated logins.
- *
- * `validateInResponseTo: always` proves the Response answers an
- * AuthnRequest WE issued — but not that it came back through the SAME
- * BROWSER that started the login. An attacker could start a login
- * themselves, intercept their own (valid, unconsumed) SAMLResponse,
- * and deliver it through the victim's browser: the request id exists
- * in the shared store, so the victim silently receives the attacker's
- * session (login CSRF → workspace of the attacker's choosing).
- *
- * /login now mints a random nonce per AuthnRequest, stores it here
- * keyed by the request id, and sets it as a signed, SameSite=None
- * cookie scoped to the SAML routes. The ACS requires the consumed
- * Response's InResponseTo to map to the SAME nonce the posting
- * browser presents — the attacker's relayed Response carries THEIR
- * request id, which never matches a nonce minted into the victim's
- * browser. One-use: the mapping is deleted on first consumption.
- *
- * In-memory like the request-id store above: same single-process
- * posture; multi-instance deploys need sticky routing on /auth/saml/*.
- */
-const txnNonceByRequestId = new Map<string, { nonce: string; createdAt: number }>();
-function sweepTxnNonces(): void {
-  const cutoff = Date.now() - REQUEST_ID_TTL_MS;
-  for (const [key, item] of txnNonceByRequestId) {
-    if (item.createdAt < cutoff) txnNonceByRequestId.delete(key);
+class SamlRequestStoreError extends Error {
+  constructor(cause: unknown) {
+    super("SAML request state is unavailable", { cause });
   }
 }
 
-/** Capture slot: records which request id the adapter saved/consumed. */
 interface RequestIdSlot {
   saved?: string;
-  consumed?: string;
+  observed?: string;
+  nonceHash?: string;
 }
 
-function slottedRequestIdCache(slot: RequestIdSlot): typeof sharedRequestIdCache {
+function browserNonceHash(nonce: string | null): string | null {
+  if (!nonce || !/^[a-f0-9]{32}$/.test(nonce)) return null;
+  return crypto.createHash("sha256").update(nonce).digest("hex");
+}
+
+async function requestStore<T>(operation: () => Promise<T>): Promise<T> {
+  try { return await operation(); }
+  catch (error) { throw new SamlRequestStoreError(error); }
+}
+
+async function sweepExpiredRequests(now: Date): Promise<void> {
+  // Indexed, bounded work per new ceremony. Recheck expiry on DELETE so a
+  // concurrent cleanup cannot make the selected IDs authorize a wider delete.
+  const expired = await db.samlAuthnRequest.findMany({
+    where: { expiresAt: { lte: now } }, orderBy: [{ expiresAt: "asc" }, { id: "asc" }],
+    take: EXPIRED_REQUEST_BATCH, select: { id: true },
+  });
+  if (expired.length) await db.samlAuthnRequest.deleteMany({
+    where: { id: { in: expired.map((row) => row.id) }, expiresAt: { lte: now } },
+  });
+}
+
+function requestIdCache(cfg: SamlConfig, slot: RequestIdSlot) {
   return {
-    async saveAsync(key: string, value: string) {
-      slot.saved = key;
-      return sharedRequestIdCache.saveAsync(key, value);
+    async saveAsync(key: string, value: string): Promise<{ value: string; createdAt: number } | null> {
+      if (!slot.nonceHash) throw new SamlRequestStoreError(new Error("missing browser binding"));
+      return requestStore(async () => {
+        const now = new Date();
+        await sweepExpiredRequests(now);
+        try {
+          const row = await db.samlAuthnRequest.create({ data: {
+            id: key, configId: cfg.id, orgId: cfg.orgId, requestTimestamp: value,
+            nonceHash: slot.nonceHash!, expiresAt: new Date(now.getTime() + REQUEST_ID_TTL_MS),
+          } });
+          slot.saved = key;
+          return { value: row.requestTimestamp, createdAt: row.createdAt.getTime() };
+        } catch (error) {
+          if (typeof error === "object" && error !== null && (error as { code?: string }).code === "P2002") return null;
+          throw error;
+        }
+      });
     },
-    async getAsync(key: string) {
-      return sharedRequestIdCache.getAsync(key);
+    async getAsync(key: string): Promise<string | null> {
+      slot.observed ??= key;
+      if (key.length > 256) return null;
+      return requestStore(async () => {
+        const row = await db.samlAuthnRequest.findFirst({ where: {
+          id: key, configId: cfg.id, orgId: cfg.orgId, expiresAt: { gt: new Date() },
+        }, select: { requestTimestamp: true } });
+        return row?.requestTimestamp ?? null;
+      });
     },
-    async removeAsync(key: string | null) {
-      const removed = await sharedRequestIdCache.removeAsync(key);
-      if (removed !== null) slot.consumed = removed;
-      return removed;
+    async removeAsync(_key: string | null): Promise<string | null> {
+      // The library calls this before all signature/condition checks finish
+      // and does not verify that removal won a race. Defer the actual DELETE
+      // to our mandatory browser-bound compare-and-delete below. A callback
+      // never gains authority from this method's result.
+      return null;
     },
   };
 }
 
-function buildAdapter(cfg: SamlConfig, slot?: RequestIdSlot): SAML {
+async function consumeRequest(cfg: SamlConfig, key: string | undefined, nonce: string | null): Promise<boolean> {
+  const nonceHash = browserNonceHash(nonce);
+  if (!key || key.length > 256 || !nonceHash) return false;
+  return requestStore(async () => {
+    const result = await db.samlAuthnRequest.deleteMany({ where: {
+      id: key, configId: cfg.id, orgId: cfg.orgId, nonceHash, expiresAt: { gt: new Date() },
+    } });
+    return result.count === 1;
+  });
+}
+
+function buildAdapter(cfg: SamlConfig, slot: RequestIdSlot = {}): SAML {
   const urls = spUrls(cfg);
   // R88 F5: reject pre-R88 rows still storing "sha1" — the
   // schema enum was tightened to {sha256, sha512} in R88, but
@@ -306,12 +300,11 @@ function buildAdapter(cfg: SamlConfig, slot?: RequestIdSlot): SAML {
     // consumed once at validation). Without this an attacker could
     // push a victim's browser through the ATTACKER's IdP and log the
     // victim into the attacker's workspace (session fixation), and
-    // IdP-initiated responses from anywhere were accepted. In-memory
-    // cache: same single-process posture as the rate-limit buckets;
-    // multi-instance deploys need sticky routing on /auth/saml/*.
+    // IdP-initiated responses from anywhere were accepted. PostgreSQL
+    // stores the request and browser binding across replicas and restarts.
     validateInResponseTo: ValidateInResponseTo.always,
     requestIdExpirationPeriodMs: REQUEST_ID_TTL_MS,
-    cacheProvider: slot ? slottedRequestIdCache(slot) : sharedRequestIdCache,
+    cacheProvider: requestIdCache(cfg, slot),
     // IdP-side crypto.
     idpCert: cfg.x509Cert,
     // Pin the Issuer: without it, ANY assertion signed by the
@@ -347,25 +340,24 @@ function buildAdapter(cfg: SamlConfig, slot?: RequestIdSlot): SAML {
  * restore the caller's deep-link on the ACS.
  *
  * Also mints the browser-binding transaction nonce for this
- * AuthnRequest (see `txnNonceByRequestId`); the route sets it as a
- * signed cookie and the ACS requires it back.
+ * AuthnRequest; its hash is persisted with the request before redirecting.
+ * The route sets the nonce as a signed cookie and the ACS requires it back.
  */
 export async function buildLoginUrl(
   cfg: SamlConfig,
   relayState: string | null,
 ): Promise<{ url: string; txnNonce: string }> {
-  const slot: RequestIdSlot = {};
+  const txnNonce = crypto.randomBytes(16).toString("hex");
+  const slot: RequestIdSlot = { nonceHash: browserNonceHash(txnNonce)! };
   const adapter = buildAdapter(cfg, slot);
   const url = await adapter.getAuthorizeUrlAsync(
     relayState ?? "",
     undefined /* host */,
     {} /* options */,
   );
-  const txnNonce = crypto.randomBytes(16).toString("hex");
-  sweepTxnNonces();
-  if (slot.saved) {
-    txnNonceByRequestId.set(slot.saved, { nonce: txnNonce, createdAt: Date.now() });
-  }
+  // node-saml ignores saveAsync's null result on an ID collision. Never
+  // redirect or issue a cookie unless this ceremony was actually persisted.
+  if (!slot.saved) throw new SamlRequestStoreError(new Error("request ID was not persisted"));
   return { url, txnNonce };
 }
 
@@ -384,7 +376,7 @@ export async function consumeSamlResponse(
   /**
    * The browser-binding nonce presented by the posting browser (the
    * unsigned value of the av_saml_txn cookie), or null when absent.
-   * See `txnNonceByRequestId`.
+   * Only its hash is stored in the shared request table.
    */
   presentedTxnNonce: string | null = null,
 ): Promise<SamlResult> {
@@ -400,6 +392,12 @@ export async function consumeSamlResponse(
     });
     profile = (result.profile ?? null) as Record<string, unknown> | null;
   } catch (err) {
+    if (err instanceof SamlRequestStoreError) return { ok: false, error: "request_state_unavailable" };
+    // Refuse the response and burn only the ceremony belonging to this
+    // browser. An untrusted request ID alone cannot erase another browser's
+    // pending login. A failed database write remains a refusal, never a mint.
+    try { await consumeRequest(cfg, slot.observed, presentedTxnNonce); }
+    catch { return { ok: false, error: "request_state_unavailable" }; }
     return {
       ok: false,
       error: "signature_or_conditions_failed",
@@ -408,45 +406,18 @@ export async function consumeSamlResponse(
   }
   if (!profile) return { ok: false, error: "no_profile" };
 
-  // Browser binding: the consumed InResponseTo must map to the SAME
-  // nonce this browser was handed at /login. Without this, an attacker
-  // who completes a login against the org's IdP THEMSELVES and
-  // intercepts their own unconsumed SAMLResponse can deliver it
-  // through a victim's browser: InResponseTo matches a stored request
-  // id, so the victim silently receives the attacker's session (login
-  // CSRF). The relayed Response's request id maps to a nonce minted
-  // into the ATTACKER's browser, never the victim's. One-use: the
-  // mapping dies on first consumption whatever the outcome.
-  //
-  // node-saml consumes (removeAsync) the request id on MOST paths, but
-  // an assertion whose bearer SubjectConfirmationData is present with
-  // the InResponseTo ATTRIBUTE absent validates without any cache
-  // consumption (saml.js processValidlySignedAssertionAsync — the
-  // Response-level InResponseTo was get-checked only). The SAML Web
-  // SSO profile mandates the attribute, but a nonconformant IdP that
-  // logged in fine before this binding existed must not become
-  // permanently txn_mismatch-locked: fall back to the VALIDATED
-  // Response's InResponseTo (profile.inResponseTo) and burn it from
-  // the store ourselves, preserving one-use semantics either way.
-  let consumedRequestId = slot.consumed;
-  if (consumedRequestId === undefined) {
-    const responseInResponseTo = profile["inResponseTo"];
-    if (typeof responseInResponseTo === "string" && requestIdStore.has(responseInResponseTo)) {
-      requestIdStore.delete(responseInResponseTo);
-      consumedRequestId = responseInResponseTo;
+  // The library has verified the assertion and InResponseTo relationship,
+  // including its compatibility path where SubjectConfirmation omits that
+  // attribute. Its separate cache reads do not elect a winner. This DELETE
+  // is the mandatory authority check: exactly one replica may consume the
+  // matching request, config, tenant, browser hash, and unexpired lifetime.
+  const responseInResponseTo = profile["inResponseTo"];
+  try {
+    if (typeof responseInResponseTo !== "string" ||
+        !await consumeRequest(cfg, responseInResponseTo, presentedTxnNonce)) {
+      return { ok: false, error: "txn_mismatch" };
     }
-  }
-  const expectedTxn = consumedRequestId ? txnNonceByRequestId.get(consumedRequestId) : undefined;
-  if (consumedRequestId) txnNonceByRequestId.delete(consumedRequestId);
-  const presentedBuf = Buffer.from(presentedTxnNonce ?? "", "utf8");
-  const expectedBuf = Buffer.from(expectedTxn?.nonce ?? "", "utf8");
-  if (
-    !expectedTxn ||
-    presentedBuf.length !== expectedBuf.length ||
-    !crypto.timingSafeEqual(presentedBuf, expectedBuf)
-  ) {
-    return { ok: false, error: "txn_mismatch" };
-  }
+  } catch { return { ok: false, error: "request_state_unavailable" }; }
 
   // Enforce the Issuer pin on the LOGIN path. node-saml's `idpIssuer`
   // option (buildAdapter pins it to cfg.entityIdIdp) is only checked by

@@ -78,6 +78,19 @@ async fn run_once(config: &ResolvedSyncConfig, dry_run: bool) -> Result<SyncSumm
         Some(bridge_dir) => scan_bridge_candidates(bridge_dir, &state, &atif_session_ids),
         None => BridgeScan::default(),
     };
+    let quarantined_sessions: BTreeSet<_> = bridge_candidates
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.session.status == SessionStatus::Quarantined)
+        .map(|candidate| candidate.session.external_id.clone())
+        .chain(
+            state
+                .sessions
+                .iter()
+                .filter(|(_, session)| session.quarantined)
+                .map(|(id, _)| id.clone()),
+        )
+        .collect();
 
     if dry_run {
         let event_count: usize = trajectories.iter().map(|candidate| candidate.events.len()).sum();
@@ -170,7 +183,10 @@ async fn run_once(config: &ResolvedSyncConfig, dry_run: bool) -> Result<SyncSumm
         }
     }
 
-    for candidate in trajectories {
+    for mut candidate in trajectories {
+        if quarantined_sessions.contains(&candidate.session.external_id) {
+            candidate.session.status = SessionStatus::Quarantined;
+        }
         summary.attempted += 1;
         let session_id = candidate.session.external_id.clone();
         match sync_trajectory(&client, &mut state, candidate).await {
@@ -237,6 +253,15 @@ async fn run_once(config: &ResolvedSyncConfig, dry_run: bool) -> Result<SyncSumm
     }
 
     for candidate in receipts {
+        if state
+            .sessions
+            .get(&candidate.session_external_id)
+            .is_some_and(|session| session.quarantined)
+            || quarantined_sessions.contains(&candidate.session_external_id)
+        {
+            summary.receipts_skipped += 1;
+            continue;
+        }
         if state
             .sessions
             .get(&candidate.session_external_id)
@@ -374,6 +399,9 @@ async fn sync_trajectory(
         .sessions
         .entry(candidate.session.external_id.clone())
         .or_default();
+    let newly_quarantined =
+        !session_state.quarantined && candidate.session.status == SessionStatus::Quarantined;
+    session_state.quarantined |= candidate.session.status == SessionStatus::Quarantined;
     let newly_marked_atif = !session_state.atif_synced;
     session_state.atif_synced = true;
     let last_synced = session_state.last_synced_seq;
@@ -389,10 +417,10 @@ async fn sync_trajectory(
     events.sort_by_key(|event| event.seq);
     events.dedup_by_key(|event| event.seq);
     if events.is_empty() {
-        return Ok(newly_marked_atif);
+        return Ok(newly_marked_atif || newly_quarantined);
     }
 
-    let mut changed = newly_marked_atif;
+    let mut changed = newly_marked_atif || newly_quarantined;
     for batch in event_batches(&events) {
         let response: EventBatchResponse = client.post_json("events", &batch).await?;
         if response
@@ -490,7 +518,7 @@ async fn sync_receipt(
 async fn sync_bridge_candidate(
     client: &ConsoleClient,
     state: &mut SyncState,
-    candidate: BridgeSessionCandidate,
+    mut candidate: BridgeSessionCandidate,
 ) -> Result<BridgeSyncOutcome> {
     // Console-side seal is terminal — mirror the ATIF path's skip so a
     // post-seal bridge record can't make this session churn (and, via
@@ -506,7 +534,21 @@ async fn sync_bridge_candidate(
             fully_acked: true,
         });
     }
+    if state
+        .sessions
+        .get(&candidate.session.external_id)
+        .is_some_and(|session| session.quarantined)
+    {
+        candidate.session.status = SessionStatus::Quarantined;
+    }
     let _: serde_json::Value = client.post_json("sessions", &candidate.session).await?;
+    let session_state = state
+        .sessions
+        .entry(candidate.session.external_id.clone())
+        .or_default();
+    let newly_quarantined =
+        !session_state.quarantined && candidate.session.status == SessionStatus::Quarantined;
+    session_state.quarantined |= candidate.session.status == SessionStatus::Quarantined;
     let mut events: Vec<IngestEvent> = candidate.events;
     // NO seq-watermark filter here, unlike the ATIF path: bridge seqs
     // are offset-derived (see `bridge_seq`) — NOT chronological across
@@ -521,12 +563,12 @@ async fn sync_bridge_candidate(
     events.dedup_by_key(|event| event.seq);
     if events.is_empty() {
         return Ok(BridgeSyncOutcome {
-            changed: false,
+            changed: newly_quarantined,
             fully_acked: true,
         });
     }
 
-    let mut changed = false;
+    let mut changed = newly_quarantined;
     for batch in event_batches(&events) {
         let response: EventBatchResponse = client.post_json("events", &batch).await?;
         if response
@@ -668,6 +710,8 @@ struct SyncState {
 struct SessionSyncState {
     last_synced_seq: u64,
     receipt_synced: bool,
+    /// Incomplete capture is terminal and must never be sealed by a receipt.
+    quarantined: bool,
     /// Distinguishes "never acknowledged anything" from "acknowledged
     /// up to seq 0": the generated `open` event carries seq 0, and the
     /// `seq > last_synced_seq` filter with the default watermark of 0
@@ -796,11 +840,9 @@ impl ResolvedSyncConfig {
                     "missing console ingest token; pass --token-file, set AV_CONSOLE_TOKEN, or add [console].token_file"
                 );
             }
-            let url = reqwest::Url::parse(&console_url).context("parse console URL")?;
-            match url.scheme() {
-                "http" | "https" => {}
-                scheme => anyhow::bail!("console URL must use http or https, got {scheme:?}"),
-            }
+        }
+        if !console_url.is_empty() {
+            validate_console_url(&console_url)?;
         }
         let state_file = args
             .state_file
@@ -815,6 +857,21 @@ impl ResolvedSyncConfig {
             token,
         })
     }
+}
+
+fn validate_console_url(value: &str) -> Result<()> {
+    let url = reqwest::Url::parse(value).context("parse console URL")?;
+    match url.scheme() {
+        "http" | "https" => {}
+        scheme => anyhow::bail!("console URL must use http or https, got {scheme:?}"),
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        anyhow::bail!("console URL must not contain credentials; use an ingest token file");
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        anyhow::bail!("console URL must not contain a query or fragment");
+    }
+    Ok(())
 }
 
 #[derive(Default)]
@@ -911,6 +968,7 @@ struct ConsoleClient {
 
 impl ConsoleClient {
     fn new(config: &ResolvedSyncConfig) -> Result<Self> {
+        validate_console_url(&config.console_url)?;
         let mut base = config.console_url.trim_end_matches('/').to_owned();
         if !base.ends_with(INGEST_PREFIX) {
             base.push_str(INGEST_PREFIX);
@@ -922,6 +980,10 @@ impl ConsoleClient {
             // (Ctrl-C only ran between passes) and blocked the
             // end-of-pass state save.
             client: reqwest::Client::builder()
+                // An ingest body contains captured evidence. Never replay
+                // it to a redirect target, even when the HTTP library
+                // would strip Authorization on a host change.
+                .redirect(reqwest::redirect::Policy::none())
                 .connect_timeout(Duration::from_secs(10))
                 .timeout(Duration::from_secs(120))
                 .build()
@@ -1053,6 +1115,7 @@ struct BridgeSessionAccumulator {
     external_id: String,
     agent: String,
     workflow: Workflow,
+    quarantined: bool,
     opened_at: Option<String>,
     closed_at: Option<String>,
     first_at: Option<String>,
@@ -1064,6 +1127,7 @@ struct BridgeMappedEvent {
     session_external_id: String,
     agent: String,
     workflow: Option<Workflow>,
+    quarantined: bool,
     opened_at: Option<String>,
     closed_at: Option<String>,
     event: IngestEvent,
@@ -1124,6 +1188,58 @@ fn scan_bridge_candidates(
                     break;
                 }
                 for stored in &page {
+                    let session_id = bridge_session_id(&stored.value);
+                    // Keep a session's existing event mapping stable, even
+                    // when this record only supplies terminal status.
+                    let seq_scheme = session_id
+                        .as_ref()
+                        .and_then(|id| state.sessions.get(id))
+                        .map(|session| session.bridge_seq_scheme.unwrap_or(u8::from(!session.synced_any)))
+                        .unwrap_or(1);
+                    // Quarantine is a terminal safety decision, independent
+                    // of whether its display event fits the console's seq or
+                    // timestamp limits. Observe it even behind a frozen
+                    // cursor, without banking that cursor or uploading any
+                    // withheld event. Otherwise a skipped event could leave
+                    // incomplete evidence eligible for a receipt forever.
+                    if *topic == "agent.session" && is_quarantine_record(&stored.value) {
+                        if let Some(id) = session_id.as_ref() {
+                            let occurred_at = bridge_occurred_at(&stored.value, stored.stored_at)
+                                .filter(|(ms, _)| {
+                                    *ms >= INGEST_MIN_OCCURRED_AT_MS
+                                        && *ms <= now_ms.saturating_add(INGEST_FUTURE_SKEW_MS)
+                                })
+                                .map(|(ms, _)| av_core::time::iso8601_ms(ms));
+                            let entry =
+                                sessions
+                                    .entry(id.clone())
+                                    .or_insert_with(|| BridgeSessionAccumulator {
+                                        external_id: id.clone(),
+                                        agent: bounded_nonempty(
+                                            stored
+                                                .value
+                                                .pointer("/ai_agent/charter/name")
+                                                .and_then(serde_json::Value::as_str)
+                                                .unwrap_or("agent"),
+                                            MAX_AGENT_UNITS,
+                                            "agent",
+                                        ),
+                                        workflow: stored
+                                            .value
+                                            .pointer("/payload/workflow")
+                                            .and_then(serde_json::Value::as_str)
+                                            .and_then(workflow_from_str)
+                                            .unwrap_or(Workflow::Signed),
+                                        quarantined: true,
+                                        opened_at: None,
+                                        closed_at: occurred_at.clone(),
+                                        first_at: occurred_at,
+                                        events: Vec::new(),
+                                        seq_scheme,
+                                    });
+                            entry.quarantined = true;
+                        }
+                    }
                     // Offset banking is deferred until we know the record
                     // is consumable: for clock-skewed records (see the
                     // OutsideWindow arm) the cursor must FREEZE before
@@ -1154,29 +1270,20 @@ fn scan_bridge_candidates(
                         bank(stored.offset);
                         continue;
                     }
-                    let Some(session_id) = bridge_session_id(&stored.value) else {
+                    let Some(session_id) = session_id else {
                         bank(stored.offset);
                         continue;
                     };
-                    if atif_session_ids.contains(&session_id)
-                        || state
-                            .sessions
-                            .get(&session_id)
-                            .is_some_and(|session| session.atif_synced)
+                    if !is_quarantine_record(&stored.value)
+                        && (atif_session_ids.contains(&session_id)
+                            || state
+                                .sessions
+                                .get(&session_id)
+                                .is_some_and(|session| session.atif_synced))
                     {
                         bank(stored.offset);
                         continue;
                     }
-                    // Seq-mapping scheme is FIXED per session (the server
-                    // dedups on (sessionId, seq)): an explicit stored
-                    // scheme wins; otherwise legacy iff the session
-                    // already synced events under the legacy mapping;
-                    // fresh sessions get the collision-free scheme 1.
-                    let seq_scheme = state
-                        .sessions
-                        .get(&session_id)
-                        .map(|session| session.bridge_seq_scheme.unwrap_or(u8::from(!session.synced_any)))
-                        .unwrap_or(1);
                     match bridge_record_to_event(topic_idx, seq_scheme, topic, stored, now_ms) {
                         BridgeRecordMapping::Mapped(mapped) => {
                             bank(stored.offset);
@@ -1187,6 +1294,7 @@ fn scan_bridge_candidates(
                                         external_id: mapped.session_external_id.clone(),
                                         agent: mapped.agent.clone(),
                                         workflow: mapped.workflow.unwrap_or(Workflow::Signed),
+                                        quarantined: false,
                                         opened_at: None,
                                         closed_at: None,
                                         first_at: None,
@@ -1194,6 +1302,7 @@ fn scan_bridge_candidates(
                                         seq_scheme,
                                     });
                             entry.agent = mapped.agent;
+                            entry.quarantined |= mapped.quarantined;
                             if let Some(workflow) = mapped.workflow {
                                 entry.workflow = workflow;
                             }
@@ -1290,7 +1399,7 @@ fn scan_bridge_candidates(
         .filter_map(|mut session| {
             session.events.sort_by_key(|event| event.seq);
             session.events.dedup_by_key(|event| event.seq);
-            if session.events.is_empty() {
+            if session.events.is_empty() && !session.quarantined {
                 return None;
             }
             let opened_at = session
@@ -1303,7 +1412,11 @@ fn scan_bridge_candidates(
                     external_id: session.external_id,
                     agent: bounded_nonempty(&session.agent, MAX_AGENT_UNITS, "agent"),
                     workflow: session.workflow,
-                    status: SessionStatus::Live,
+                    status: if session.quarantined {
+                        SessionStatus::Quarantined
+                    } else {
+                        SessionStatus::Live
+                    },
                     policy_version: 1,
                     opened_at,
                     closed_at: session.closed_at,
@@ -1409,7 +1522,7 @@ fn bridge_record_to_event(
                 .unwrap_or("session");
             if action == "opened" {
                 opened_at = Some(occurred_at.clone());
-            } else if action == "closed" {
+            } else if action == "closed" || action == "quarantined" {
                 closed_at = Some(occurred_at.clone());
             }
             if workflow.is_none() && action == "closed" {
@@ -1421,6 +1534,8 @@ fn bridge_record_to_event(
                 EventKind::Sys,
                 if action == "opened" {
                     "open"
+                } else if action == "quarantined" {
+                    "quarantined"
                 } else if action == "closed" {
                     "close"
                 } else {
@@ -1508,10 +1623,22 @@ fn bridge_record_to_event(
         session_external_id,
         agent,
         workflow,
+        quarantined: is_quarantine_record(value),
         opened_at,
         closed_at,
         event,
     }))
+}
+
+fn is_quarantine_record(value: &serde_json::Value) -> bool {
+    value
+        .pointer("/payload/action")
+        .and_then(serde_json::Value::as_str)
+        == Some("quarantined")
+        && value
+            .pointer("/payload/evidence_complete")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false)
 }
 
 fn bridge_ingest_event(
@@ -2148,10 +2275,12 @@ enum Workflow {
     Unsigned,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum SessionStatus {
     Live,
+    #[serde(rename = "quarantined_crash_evidence")]
+    Quarantined,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2435,6 +2564,129 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tokio::sync::oneshot;
 
+    #[test]
+    fn console_urls_refuse_embedded_credentials_query_and_fragment() {
+        for url in [
+            "https://user:secret@console.example",
+            "https://user@console.example",
+            "https://:secret@console.example",
+            "https://console.example?token=secret",
+            "https://console.example?",
+            "https://console.example#token=secret",
+            "https://console.example#",
+            "ftp://console.example",
+        ] {
+            let error = validate_console_url(url).unwrap_err().to_string();
+            assert!(
+                !error.contains("secret"),
+                "URL secrets must not enter diagnostics"
+            );
+        }
+        for url in [
+            "https://console.example",
+            "https://console.example/proxy/api/v1/ingest/",
+            "http://127.0.0.1:8985",
+            "http://[::1]:8985",
+        ] {
+            validate_console_url(url).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn console_redirects_never_replay_evidence_or_credentials() {
+        use axum::http::header::LOCATION;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Test both same-origin and cross-origin redirects. A same-origin
+        // redirect normally retains the bearer; a cross-origin 307 still
+        // replays the body even if Authorization is stripped.
+        for cross_origin in [false, true] {
+            let captured = Arc::new(AtomicUsize::new(0));
+            let target_count = Arc::clone(&captured);
+            let target = Router::new().fallback(move || {
+                let count = Arc::clone(&target_count);
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({"inserted": 1}))
+                }
+            });
+            let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let target_address = target_listener.local_addr().unwrap();
+            let target_task =
+                tokio::spawn(async move { axum::serve(target_listener, target).await.unwrap() });
+
+            let source_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let source_address = source_listener.local_addr().unwrap();
+            let location = if cross_origin {
+                format!("http://{target_address}/capture")
+            } else {
+                format!("http://{source_address}/capture")
+            };
+            let original_requests = Arc::new(AtomicUsize::new(0));
+            let originals = Arc::clone(&original_requests);
+            let same_origin_count = Arc::clone(&captured);
+            let source = Router::new()
+                .route(
+                    "/api/v1/ingest/events",
+                    post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                        let location = location.clone();
+                        let originals = Arc::clone(&originals);
+                        async move {
+                            assert_eq!(
+                                headers.get("authorization").unwrap(),
+                                "Bearer private-ingest-token"
+                            );
+                            assert_eq!(headers.get("x-av-deployment").unwrap(), "private-deployment");
+                            assert_eq!(body["evidence"], "private captured content");
+                            originals.fetch_add(1, Ordering::SeqCst);
+                            (
+                                AxumStatusCode::TEMPORARY_REDIRECT,
+                                [(LOCATION, location)],
+                                Json(json!({"redirect": true})),
+                            )
+                        }
+                    }),
+                )
+                .route(
+                    "/capture",
+                    post(move || {
+                        let count = Arc::clone(&same_origin_count);
+                        async move {
+                            count.fetch_add(1, Ordering::SeqCst);
+                            Json(json!({"inserted": 1}))
+                        }
+                    }),
+                );
+            let source_task =
+                tokio::spawn(async move { axum::serve(source_listener, source).await.unwrap() });
+            let config = ResolvedSyncConfig {
+                spool_dir: PathBuf::new(),
+                bridge_dir: None,
+                state_file: PathBuf::new(),
+                console_url: format!("http://{source_address}"),
+                deployment: "private-deployment".to_owned(),
+                token: "private-ingest-token".to_owned(),
+            };
+            let result = ConsoleClient::new(&config)
+                .unwrap()
+                .post_json::<_, Value>("events", &json!({"evidence": "private captured content"}))
+                .await;
+            assert!(result.unwrap_err().to_string().contains("307"));
+            assert_eq!(
+                original_requests.load(Ordering::SeqCst),
+                1,
+                "the authorized endpoint must receive the real request"
+            );
+            assert_eq!(
+                captured.load(Ordering::SeqCst),
+                0,
+                "redirect targets must receive no request or body"
+            );
+            source_task.abort();
+            target_task.abort();
+        }
+    }
+
     /// Round-22 mutation finding: sanitize_for_terminal — the defense
     /// that keeps hostile spool/bridge strings (session ids, warnings
     /// echoed by console-sync and the crash drill) from injecting
@@ -2615,6 +2867,7 @@ mod tests {
             SessionSyncState {
                 last_synced_seq: 42,
                 receipt_synced: true,
+                quarantined: false,
                 synced_any: true,
                 atif_synced: true,
                 bridge_seq_scheme: Some(1),
@@ -2743,6 +2996,50 @@ mod tests {
     }
 
     #[test]
+    fn quarantine_event_overrides_atif_dedup_and_maps_to_terminal_status() {
+        let dir = test_tempdir("quarantine-status");
+        write_bridge_manifest(dir.path());
+        let now = av_core::time::now_ms();
+        append_bridge_event(
+            dir.path(),
+            "agent.session",
+            stored_bridge_event(
+                "agent.session",
+                0,
+                json!({
+                    "metadata": {"uid": "quarantine-event", "sequence": 4},
+                    "class_name": "agent.session", "time": now,
+                    "time_iso": av_core::time::now_iso8601(),
+                    "session_uid": "partial-session",
+                    "ai_agent": {"charter": {"name": "agent"}},
+                    "payload": {"action": "quarantined", "workflow": "unsigned",
+                        "reason": "incomplete_capture", "evidence_complete": false}
+                }),
+            ),
+        );
+        let mut state = SyncState::default();
+        state
+            .sessions
+            .entry("partial-session".into())
+            .or_default()
+            .atif_synced = true;
+        let scan = scan_bridge_candidates(dir.path(), &state, &BTreeSet::from(["partial-session".into()]));
+        assert_eq!(scan.candidates.len(), 1);
+        let candidate = scan.candidates.first().unwrap();
+        assert_eq!(candidate.session.status, SessionStatus::Quarantined);
+        assert_eq!(candidate.session.workflow, Workflow::Unsigned);
+        assert_eq!(candidate.events.first().unwrap().tag, "quarantined");
+        assert!(candidate.session.closed_at.is_some());
+        assert_eq!(
+            serde_json::to_value(&candidate.session)
+                .unwrap()
+                .get("status")
+                .unwrap(),
+            "quarantined_crash_evidence"
+        );
+    }
+
+    #[test]
     fn bridge_scan_skips_atif_synced_sessions_and_tracks_offsets() {
         let dir = test_tempdir("bridge-dedupe");
         write_bridge_manifest(dir.path());
@@ -2819,6 +3116,7 @@ mod tests {
             SessionSyncState {
                 last_synced_seq: 0,
                 receipt_synced: false,
+                quarantined: false,
                 synced_any: true,
                 atif_synced: true,
                 bridge_seq_scheme: None,
@@ -2929,6 +3227,154 @@ mod tests {
             mapped.event.policy_name, None,
             "empty-after-strip must not attribute"
         );
+    }
+
+    #[tokio::test]
+    async fn quarantine_survives_sync_restart_and_prevents_receipt_upload() {
+        let dir = test_tempdir("quarantine-sync");
+        let spool = dir.path().join("spool");
+        let bridge = dir.path().join("bridge");
+        std::fs::create_dir_all(spool.join("receipts")).unwrap();
+        std::fs::create_dir_all(&bridge).unwrap();
+        write_test_trajectory(&spool.join("session.json"));
+        write_test_receipt(&spool.join("receipts/session.json"));
+        write_bridge_manifest(&bridge);
+        let now = av_core::time::now_ms();
+        append_bridge_event(
+            &bridge,
+            "agent.session",
+            stored_bridge_event(
+                "agent.session",
+                0,
+                json!({
+                    "metadata": {"uid": "quarantine-1", "sequence": 3},
+                    "class_name": "agent.session", "time": now,
+                    "time_iso": av_core::time::iso8601_ms(now), "status_id": 1,
+                    "session_uid": "session-1",
+                    "ai_agent": {"version": "1", "charter": {"name": "test-agent", "type_id": 1}, "instance_uid": "instance-1"},
+                    "payload": {"action": "quarantined", "workflow": "signed", "evidence_complete": false}
+                }),
+            ),
+        );
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (base_url, shutdown) = start_mock_console(Arc::clone(&seen)).await;
+        let token_path = dir.path().join("token");
+        std::fs::write(&token_path, b"secret\n").unwrap();
+        let config = ResolvedSyncConfig::resolve(&ConsoleSyncArgs {
+            spool_dir: spool,
+            console_url: Some(base_url),
+            deployment: Some("dep-1".to_owned()),
+            token_file: Some(token_path),
+            bridge_dir: Some(bridge),
+            watch: false,
+            interval: 30,
+            state_file: Some(dir.path().join("state.json")),
+            dry_run: false,
+        })
+        .unwrap();
+        assert_eq!(run_once(&config, false).await.unwrap().failed, 0);
+        let state = SyncState::load(&config.state_file).unwrap();
+        assert!(state.sessions.get("session-1").unwrap().quarantined);
+        assert_eq!(run_once(&config, false).await.unwrap().failed, 0);
+        assert!(
+            !seen.lock().unwrap().iter().any(|entry| entry == "receipts"),
+            "a receipt file must never attest a quarantined session, including after cursor advancement"
+        );
+        let _ = shutdown.send(());
+    }
+
+    async fn assert_status_only_quarantine_survives_restart(offset: u64, time: u64) {
+        let dir = test_tempdir("quarantine-status-only");
+        let spool = dir.path().join("spool");
+        let bridge = dir.path().join("bridge");
+        std::fs::create_dir_all(spool.join("receipts")).unwrap();
+        std::fs::create_dir_all(&bridge).unwrap();
+        write_test_receipt(&spool.join("receipts/session.json"));
+        write_bridge_manifest(&bridge);
+        append_bridge_event(
+            &bridge,
+            "agent.session",
+            stored_bridge_event(
+                "agent.session",
+                offset,
+                json!({
+                    "metadata": {"uid": "quarantine-unrepresentable", "sequence": 3},
+                    "class_name": "agent.session", "time": time,
+                    "time_iso": av_core::time::iso8601_ms(time),
+                    "session_uid": "session-1",
+                    "ai_agent": {"charter": {"name": "test-agent"}},
+                    "payload": {"action": "quarantined", "workflow": "signed", "evidence_complete": false}
+                }),
+            ),
+        );
+        let scan = scan_bridge_candidates(&bridge, &SyncState::default(), &BTreeSet::new());
+        assert_eq!(scan.events_outside_window, 1);
+        assert_eq!(scan.candidates.len(), 1);
+        let candidate = scan.candidates.first().unwrap();
+        assert_eq!(candidate.session.status, SessionStatus::Quarantined);
+        assert!(
+            candidate.events.is_empty(),
+            "unrepresentable evidence must not be fabricated"
+        );
+        assert_eq!(scan.max_seen_offsets.get("agent.session/p0"), Some(&offset));
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (base_url, shutdown) = start_mock_console(Arc::clone(&seen)).await;
+        let config = ResolvedSyncConfig {
+            spool_dir: spool,
+            bridge_dir: Some(bridge),
+            state_file: dir.path().join("state.json"),
+            console_url: base_url,
+            deployment: "dep-1".into(),
+            token: "secret".into(),
+        };
+        let first = run_once(&config, false).await.unwrap();
+        assert_eq!(first.failed, 0);
+        assert_eq!(first.receipts_skipped, 1);
+        let state = SyncState::load(&config.state_file).unwrap();
+        assert!(state.sessions.get("session-1").unwrap().quarantined);
+        assert_eq!(state.bridge_topic_offsets.get("agent.session/p0"), Some(&offset));
+        let second = run_once(&config, false).await.unwrap();
+        assert_eq!(second.failed, 0);
+        assert_eq!(second.receipts_skipped, 1);
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            ["sessions"],
+            "status must upload once; neither display events nor receipts may upload after restart"
+        );
+
+        // A previously acknowledged seal still wins. The terminal
+        // quarantine candidate must not send a downgrade request.
+        let mut sealed_state = SyncState::default();
+        sealed_state
+            .sessions
+            .entry("session-1".into())
+            .or_default()
+            .receipt_synced = true;
+        let client = ConsoleClient::new(&config).unwrap();
+        let outcome = sync_bridge_candidate(
+            &client,
+            &mut sealed_state,
+            scan.candidates.into_iter().next().unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(!outcome.changed);
+        assert!(outcome.fully_acked);
+        assert!(!sealed_state.sessions.get("session-1").unwrap().quarantined);
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn quarantine_status_survives_event_sequence_overflow() {
+        let offset = MAX_SEQ / u64::try_from(BRIDGE_TOPICS.len()).unwrap() + 1;
+        assert_status_only_quarantine_survives_restart(offset, av_core::time::now_ms()).await;
+    }
+
+    #[tokio::test]
+    async fn quarantine_status_survives_ancient_event_timestamp() {
+        assert_status_only_quarantine_survives_restart(0, INGEST_MIN_OCCURRED_AT_MS - 1).await;
     }
 
     #[tokio::test]
@@ -3106,6 +3552,13 @@ mod tests {
             "agent.session",
             session_record(2, "session-b", "evt-b", 1_767_225_700_000),
         );
+        // A terminal status behind the freeze must still be observed,
+        // while its display event and cursor remain withheld.
+        let mut quarantine = session_record(3, "session-c", "evt-c", 1_767_225_700_000);
+        quarantine.value["payload"] = json!({
+            "action": "quarantined", "workflow": "signed", "evidence_complete": false
+        });
+        append_bridge_event(dir.path(), "agent.session", quarantine);
 
         let state = SyncState::default();
         let scan = scan_bridge_candidates(dir.path(), &state, &BTreeSet::new());
@@ -3124,6 +3577,14 @@ mod tests {
                 .any(|c| c.session.external_id == "session-b"),
             "records behind the freeze must not become pending events"
         );
+        let quarantine = scan
+            .candidates
+            .iter()
+            .find(|candidate| candidate.session.external_id == "session-c")
+            .expect("terminal quarantine must survive the cursor freeze");
+        assert_eq!(quarantine.session.status, SessionStatus::Quarantined);
+        assert!(quarantine.events.is_empty());
+        assert!(scan.frozen_sessions.contains("session-c"));
         assert_eq!(
             scan.max_seen_offsets.get("agent.session/p0"),
             Some(&0),

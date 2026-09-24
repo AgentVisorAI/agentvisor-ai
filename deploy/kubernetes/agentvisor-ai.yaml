@@ -1,4 +1,6 @@
-# AgentVisor AI on Kubernetes — single-replica starter manifest.
+# AgentVisor AI on Kubernetes — authenticated single-replica template.
+# Configure the issuer and create all required Secrets before applying.
+# See deploy/kubernetes/README.md for setup and validation limits.
 #
 #   kubectl create namespace agentvisor-ai
 #   kubectl -n agentvisor-ai create secret generic agentvisor-ai-upstream \
@@ -10,13 +12,23 @@
 #   kubectl -n agentvisor-ai create secret generic agentvisor-ai-signing-seed \
 #       --from-file=signing.seed=/tmp/signing.seed
 #   shred -u /tmp/signing.seed
+#   # Supply the HMAC secret used by your trusted identity issuer.
+#   kubectl -n agentvisor-ai create secret generic agentvisor-ai-identity \
+#       --from-file=identity.hmac=/secure/path/identity.hmac
+#   # redis-url must contain the protected, persistent Redis connection URI.
+#   kubectl -n agentvisor-ai create secret generic agentvisor-ai-state \
+#       --from-file=redis-url=/secure/path/redis-url
+#   # Include private CAs and any required public roots in the bundle.
+#   kubectl -n agentvisor-ai create secret generic agentvisor-ai-trust \
+#       --from-file=ca-bundle.crt=/secure/path/complete-ca-bundle.crt
+#   # Replace identity.example.invalid in the ConfigMap below.
 #   kubectl -n agentvisor-ai apply -f agentvisor-ai.yaml
 #
 # Notes:
 # - The embedded event bridge stores receipts/events on the PVC, which pins
 #   the Deployment to one replica. For horizontal scale switch
-#   bridge_backend to kafka/nats and state_backend to redis (see
-#   config/harness.docker.toml in the repository) — then replicas can grow.
+#   bridge_backend to kafka/nats and provision shared durable storage for
+#   session evidence. Redis state is already required by this template.
 # - Replace the image with your registry copy; build it from docker/Dockerfile.
 # - Retaining the signing-seed Secret is essential: losing it means every
 #   existing receipt fails verification against the operator's published
@@ -52,22 +64,16 @@ data:
     # The API key is mounted as an env var from the Secret below.
     upstream_api_key_env = "AV_UPSTREAM_API_KEY"
 
-    # Dev posture. In production configure identity_jwks_url and set
-    # require_identity = true.
-    require_identity = false
-    # The operator dashboard is UNAUTHENTICATED (see SECURITY.md) and
-    # this pod listens on 0.0.0.0 for the whole cluster network — any
-    # workload that can reach the Service could enumerate sessions,
-    # costs, and receipts. Off in the starter; enable only behind an
-    # authenticating ingress (same posture as harness.example.toml).
+    # The gateway refuses unauthenticated callers. Replace this reserved
+    # issuer with your identity provider and provision its HMAC secret.
+    # For asymmetric identity, use identity_jwks_url instead of the HMAC
+    # file and remove the corresponding identity Secret mounts/copy.
+    require_identity = true
+    enforce_identity_scopes = true
+    identity_hmac_secret_file = "/etc/agentvisor-ai/identity.hmac"
+    identity_allowed_issuers = ["https://identity.example.invalid"]
+    audience = "agentvisor-ai"
     dashboard_enabled = false
-    # Required alongside require_identity = false + the 0.0.0.0 bind:
-    # config validation refuses that combination without this explicit
-    # opt-in (the daemon would CrashLoopBackOff at startup). Safe here
-    # because the pod network is the outer layer — only the Service
-    # below routes to containerPort 8484. Same posture as
-    # config/harness.container.toml.
-    allow_wildcard_bind = true
 
     atif_spool_dir = "/app/spool/atif"
     # "signed" is the product's core promise (every session close mints
@@ -98,7 +104,10 @@ data:
     bridge_manifest_path = "/app/manifests/bridge.example.yaml"
     tool_schema_dir = "/app/config/tool-schemas"
     wasm_policy_paths = ["/app/config/policies/payload_limit.wat"]
-    state_backend = "memory"
+    # The required Secret's AV_STATE_ENDPOINT replaces this reserved hostname.
+    # Redis persistence is required so revocations survive process restarts.
+    state_backend = "redis"
+    state_endpoint = "rediss://redis.example.invalid:6379"
     embedder_backend = "hash"
     vector_backend = "memory"
 
@@ -150,9 +159,9 @@ spec:
         app: agentvisor-ai
     spec:
       # Sum of the harness's four shutdown phases: HTTP drain
-      # (max(30, upstream_read_timeout_s + 5) — this ConfigMap does
-      # not set upstream_read_timeout_s so it defaults to 60 s and
-      # drain caps at 65 s) + worker wait_idle (30 s) +
+      # (max(30, max(upstream_read_timeout_s, mcp_request_timeout_s) + 5)
+      # — both network timeouts default to 60 s in this ConfigMap,
+      # so the drain caps at 65 s) + worker wait_idle (30 s) +
       # finalize_sessions (30 s) + telemetry flush (5 s when the
       # `otel` feature is enabled, which it is in the default
       # `--features full` build). Total budget 130 s worst case;
@@ -180,48 +189,34 @@ spec:
         runAsNonRoot: true
         runAsUser: 65532
         fsGroup: 65532
-      # Round-17 F1: kubelet projects a Secret with defaultMode: 0400
-      # as `root:65532` -r-------- inside the pod's mount namespace.
-      # The main container runs as uid 65532 (non-root) so open() on
-      # the projected file returns EACCES — the round-15 F8 fix as
-      # written blocks the pod from booting. Fix: copy the seed via
-      # an initContainer running as uid 0 into an in-memory
-      # emptyDir, chown to 65532, chmod 0600 (which the round-14
-      # require_owner_only_mode gate accepts). The Secret still
-      # requires explicit RBAC to read; the on-disk file inside the
-      # pod is unreadable to any other uid because emptyDir mode 0700.
+      # Projected Secrets belong to root and cannot satisfy the daemon's
+      # owner-only file checks directly. Copy them into private memory-backed
+      # storage owned by the daemon; source Secrets remain authoritative.
       initContainers:
         - name: install-signing-seed
-          # OPERATOR ACTION REQUIRED: pin to a content digest before
-          # deploying. Every other third-party dependency in this repo
-          # is SHA-pinned (GitHub Actions in .github/workflows/,
-          # cargo dependencies via Cargo.lock). This initContainer runs
-          # as UID 0 with CAP_CHOWN + CAP_FOWNER and directly handles
-          # the receipt trust anchor — a tag-rewrite attack against
-          # `busybox:1.36` (Docker Hub tag republish or namespace
-          # takeover) would land arbitrary code in that exact seam.
-          # Change the line below to
-          # `image: busybox@sha256:<digest> # 1.36`
-          # after `docker pull busybox:1.36 && docker inspect busybox:1.36`.
-          # Renovate/Dependabot can then track the trailing tag comment.
-          image: busybox:1.36
+          image: alpine@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
           command:
             - sh
-            - -c
+            - -ec
             - |
-              set -eu
-              install -m 0600 -o 65532 -g 65532 \
-                /var/run/agentvisor-ai/signing-seed-source/signing.seed \
-                /etc/agentvisor-ai/signing.seed
-              # The spool is mounted via `subPath: spool` below. When
-              # the subdirectory is missing (first boot on a fresh
-              # PVC), the kubelet creates it as root:root — fsGroup is
-              # applied to the volume BEFORE subPath directories are
-              # materialized (kubernetes#66803), so the harness (uid
-              # 65532, no CAP_DAC_OVERRIDE) cannot create
-              # /app/spool/atif and boot fails. Pre-create + chown it
-              # here; idempotent on every subsequent boot and repairs
-              # PVCs that already carry a root-owned spool dir.
+              umask 077
+              # Reclaim the destination while init runs so retries can replace
+              # previously installed owner-only files without DAC_OVERRIDE.
+              chown 0:0 /etc/agentvisor-ai
+              chmod 0700 /etc/agentvisor-ai
+              for name in signing.seed identity.hmac; do
+                source="/var/run/agentvisor-ai/secret-source/$name"
+                [ -s "$source" ] || { echo "Required secret $name is empty." >&2; exit 1; }
+                temporary="/etc/agentvisor-ai/.$name.tmp"
+                rm -f "$temporary"
+                cp "$source" "$temporary"
+                chown 65532:65532 "$temporary"
+                chmod 0600 "$temporary"
+                mv -f "$temporary" "/etc/agentvisor-ai/$name"
+              done
+              chown 65532:65532 /etc/agentvisor-ai
+              chmod 0700 /etc/agentvisor-ai
+              # Prepare the PVC subPath before kubelet mounts it for UID 65532.
               mkdir -p /var/run/agentvisor-ai/data/spool
               chown 65532:65532 /var/run/agentvisor-ai/data/spool
           securityContext:
@@ -244,7 +239,12 @@ spec:
               drop: ["ALL"]
           volumeMounts:
             - name: signing-seed-source
-              mountPath: /var/run/agentvisor-ai/signing-seed-source
+              mountPath: /var/run/agentvisor-ai/secret-source/signing.seed
+              subPath: signing.seed
+              readOnly: true
+            - name: identity-source
+              mountPath: /var/run/agentvisor-ai/secret-source/identity.hmac
+              subPath: identity.hmac
               readOnly: true
             - name: signing-seed
               mountPath: /etc/agentvisor-ai
@@ -275,6 +275,13 @@ spec:
                 secretKeyRef:
                   name: agentvisor-ai-upstream
                   key: api-key
+            - name: AV_STATE_ENDPOINT
+              valueFrom:
+                secretKeyRef:
+                  name: agentvisor-ai-state
+                  key: redis-url
+            - name: SSL_CERT_FILE
+              value: /etc/agentvisor-ai/ca-bundle.crt
           volumeMounts:
             - name: config
               mountPath: /etc/agentvisor-ai/agentvisor.toml
@@ -283,6 +290,14 @@ spec:
             - name: signing-seed
               mountPath: /etc/agentvisor-ai/signing.seed
               subPath: signing.seed
+              readOnly: true
+            - name: signing-seed
+              mountPath: /etc/agentvisor-ai/identity.hmac
+              subPath: identity.hmac
+              readOnly: true
+            - name: trust
+              mountPath: /etc/agentvisor-ai/ca-bundle.crt
+              subPath: ca-bundle.crt
               readOnly: true
             - name: data
               mountPath: /app/data
@@ -298,6 +313,8 @@ spec:
             - name: data
               mountPath: /app/spool
               subPath: spool
+            - name: temporary
+              mountPath: /tmp
           # Cold-start budget: schema compilation, ONNX weights when the
           # embedder backend is `onnx`, and embedded-bridge recovery from
           # the mounted PVC can trivially exceed 5 s. A startupProbe with
@@ -351,15 +368,28 @@ spec:
               ephemeral-storage: 2Gi
           securityContext:
             allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: false # /app/data and /app/spool are writable mounts
+            readOnlyRootFilesystem: true # writable data, spool, and /tmp have explicit mounts
             seccompProfile:
               type: RuntimeDefault
             capabilities:
               drop: ["ALL"]
       volumes:
+        - name: temporary
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
         - name: config
           configMap:
             name: agentvisor-ai-config
+        # This bundle affects native-root TLS clients, including Redis.
+        # Retain public roots needed by other configured TLS destinations.
+        - name: trust
+          secret:
+            secretName: agentvisor-ai-trust
+            defaultMode: 0444
+            items:
+              - key: ca-bundle.crt
+                path: ca-bundle.crt
         # Round-17 F1: source-of-truth for the signing seed. Mounted
         # only in the install-signing-seed initContainer, which
         # copies the file to the `signing-seed` in-pod emptyDir with
@@ -372,7 +402,14 @@ spec:
             items:
               - key: signing.seed
                 path: signing.seed
-        # In-pod, in-memory home for the copied seed. Emptied on
+        - name: identity-source
+          secret:
+            secretName: agentvisor-ai-identity
+            defaultMode: 0400
+            items:
+              - key: identity.hmac
+                path: identity.hmac
+        # In-pod, in-memory home for the copied identity and signing secrets. Emptied on
         # every pod restart (the initContainer refills it before the
         # main container starts). `emptyDir { medium: Memory }`
         # keeps it off disk entirely.

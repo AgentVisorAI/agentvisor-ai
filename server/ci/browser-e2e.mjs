@@ -24,9 +24,11 @@ const browser = await chromium.launch();
 const ctx = await browser.newContext();
 const page = await ctx.newPage();
 const consoleErrors = [];
+let testingOutage = false;
 page.on("console", (m) => {
   if (m.type() !== "error") return;
   const t = m.text();
+  if (testingOutage && t.includes("status of 503")) return;
   // Expected noise: the boot-time /auth/me 401 probe (not signed in
   // yet), the DELIBERATE duplicate-name 409 this test triggers, and
   // the signup 429 while waiting out CI's shared rate-limit budget.
@@ -122,9 +124,43 @@ const audit = ((await page.textContent("body")) || "").replace(/\s+/g, " ");
 for (const slug of ["org.created", "deployment.create", "apikey.create"])
   ok("audit shows " + slug, audit.includes(slug));
 
-// 6. Sign out (confirm modal) and back in.
+// Existing security configuration must never be presented as empty
+// when the API is unavailable. Exercise the adapter and rendered error
+// state together; a mocked datasource would miss swallowed exceptions.
+for (const [endpoint, route, message, empty] of [
+  ["keys", "keys", "Could not load keys", "No API keys yet"],
+  ["webhooks", "webhooks", "Could not load webhooks", "No webhooks yet"],
+]) {
+  testingOutage = true;
+  const url = API + "/api/v1/" + endpoint;
+  await page.route(url, (r) => r.fulfill({ status: 503, contentType: "application/problem+json", body: JSON.stringify({ detail: "The service is temporarily unavailable." }) }));
+  await page.goto(SPA + "/#/settings/" + route, { waitUntil: "networkidle" });
+  await page.getByText(message, { exact: true }).waitFor();
+  const rendered = await page.locator("#view").innerText();
+  ok(endpoint + " outage is visible, without an empty-state claim", rendered.includes(message) && !rendered.includes(empty));
+  await page.unroute(url);
+  testingOutage = false;
+}
+
+// A failed revocation must be visible and leave both the session and its
+// live updates usable, so the user can retry the same logout operation.
+testingOutage = true;
+const logoutUrl = API + "/api/v1/auth/logout";
+await page.route(logoutUrl, (r) => r.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ error: "session_revocation_unavailable" }) }));
 await page.click('.app-shell button:has-text("' + email + '")');
-await page.click("text=Sign out");
+await page.click('[data-act="signout"]');
+const renewedStream = page.waitForRequest((request) => request.url() === API + "/api/v1/stream", { timeout: 10000 });
+await page.click('.modal button:has-text("Sign out")');
+await page.getByText("Could not sign out. Your session is still active. Please try again.", { exact: true }).waitFor();
+ok("failed logout is visible and keeps the signed-in shell", await page.locator(".app-shell").isVisible());
+await renewedStream;
+ok("failed logout resumes live updates", true);
+await page.unroute(logoutUrl);
+testingOutage = false;
+
+// 6. Retry sign out (confirm modal) and back in.
+await page.click('.app-shell button:has-text("' + email + '")');
+await page.click('[data-act="signout"]');
 await page.waitForTimeout(500);
 await page.click('.modal button:has-text("Sign out")');
 await page.waitForSelector("#email", { timeout: 10000 });

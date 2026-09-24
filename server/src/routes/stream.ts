@@ -1,4 +1,5 @@
 import type { FastifyInstance } from "fastify";
+import type { ServerResponse } from "node:http";
 import { requireSession } from "../lib/session-middleware.js";
 import { ipMatchesAny } from "../lib/cidr.js";
 import { bus, type EventPayload } from "../lib/bus.js";
@@ -6,6 +7,13 @@ import { db } from "../db.js";
 import { env } from "../env.js";
 
 export async function streamRoutes(app: FastifyInstance): Promise<void> {
+  const responses = new Set<ServerResponse>();
+  app.addHook("preClose", async () => {
+    // Long-lived SSE responses otherwise keep server.close() pending.
+    // Destroy their sockets even when a peer stopped reading; clients
+    // reconnect elsewhere and fetch the authoritative database state.
+    for (const response of responses) response.destroy();
+  });
   // Server-Sent Events endpoint. Console tabs open a long-lived connection
   // and receive tenant-scoped events as they happen. One line of HTTP kept
   // open per open tab; server memory scales linearly.
@@ -59,6 +67,7 @@ export async function streamRoutes(app: FastifyInstance): Promise<void> {
     reply.raw.setHeader("Connection", "keep-alive");
     reply.raw.setHeader("X-Accel-Buffering", "no");
     reply.raw.flushHeaders();
+    responses.add(reply.raw);
 
     // R83 F3: SSE backpressure protection. Prior shape discarded
     // the return value of `reply.raw.write(...)` in every write
@@ -309,7 +318,17 @@ export async function streamRoutes(app: FastifyInstance): Promise<void> {
       if (keepalive !== undefined) clearInterval(keepalive);
       clearBackpressureTimer();
       unsub();
+      unsubReset();
     };
+    const unsubReset = bus.subscribeReset(() => {
+      if (closed) return;
+      rawWrite(`event: stream_reset\ndata: ${JSON.stringify({ reason: "bridge_recovered_refetch_state" })}\n\n`);
+      teardown();
+      // Backpressure means end() could leave this response buffered
+      // indefinitely after its timer was cleared by teardown().
+      if (paused) reply.raw.destroy();
+      else reply.raw.end();
+    });
     keepalive = setInterval(async () => {
       if (closed || revalidateInFlight) return;
       revalidateInFlight = true;
@@ -340,5 +359,9 @@ export async function streamRoutes(app: FastifyInstance): Promise<void> {
     }, 15_000);
 
     req.raw.on("close", teardown);
+    reply.raw.once("close", () => {
+      responses.delete(reply.raw);
+      teardown();
+    });
   });
 }

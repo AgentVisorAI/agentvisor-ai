@@ -198,6 +198,10 @@ pub enum FinalizeError {
     /// One or more upstream actions were not captured.
     #[error("session capture is incomplete; refusing final artifact")]
     CaptureIncomplete,
+    /// Tool evidence is unresolved or temporarily unreadable. Leave the
+    /// finalization claim retryable without discarding execution evidence.
+    #[error("tool execution evidence unavailable: {0}")]
+    ToolEvidence(String),
     /// Lifecycle event could not be durably published.
     #[error("lifecycle event publication failed: {context}")]
     Bridge {
@@ -1016,6 +1020,7 @@ impl Finalizer {
         session.wait_for_streams().await;
         session.wait_for_worker_jobs().await;
         if session.capture_failed() {
+            self.emit_quarantine_event(&session).await?;
             self.metrics
                 .counter(
                     "av_incomplete_sessions_total",
@@ -1028,13 +1033,19 @@ impl Finalizer {
             session.mark_artifact_committed();
             claim.committed = true;
             self.clear_budget_state(&session.id);
-            // Move this session's tool-execution
-            // triples out of the scanned namespace — they can never
-            // resolve now, and leaving them meant every reconciler tick
-            // re-read + re-MAC-verified them forever.
+            // Archive completed triples, retaining unresolved primary intents
+            // so another startup still quarantines this external session id.
             self.quarantine_tool_executions(&session.id).await;
             return Err(FinalizeError::CaptureIncomplete);
         }
+        // RAM quarantine entries are bounded and may have been evicted. After
+        // sealing admission and draining leases/jobs, the authenticated disk
+        // evidence is the authority for whether this session may finalize.
+        // A missing audit marker can still be completed by MCP replay, so a
+        // lookup refusal drops CloseClaim without permanently poisoning it.
+        crate::routes::ensure_tool_executions_resolved(&self.spool_dir, &session.id, &self.journal_key)
+            .await
+            .map_err(FinalizeError::ToolEvidence)?;
         let started = Instant::now();
         // Observe finalize latency
         // on EVERY exit path, not only on the success terminal at
@@ -1100,6 +1111,7 @@ impl Finalizer {
                              (evidence quarantined, no per-tick retry)"
                         );
                         session.mark_capture_failed();
+                        self.emit_quarantine_event(&session).await?;
                         session.mark_artifact_committed();
                         claim.committed = true;
                         self.clear_budget_state(&session.id);
@@ -1174,6 +1186,7 @@ impl Finalizer {
                         "charter": identity.charter,
                         "instance_uid": identity.instance_uid,
                         "ttl_remaining_s": identity.ttl_remaining_s,
+                        "principal_binding": session.principal_binding(),
                     }));
                     if let Some(metrics) = trajectory.final_metrics.as_mut() {
                         metrics.total_prompt_tokens = Some(
@@ -1411,6 +1424,15 @@ impl Finalizer {
             }
             return Ok(receipt);
         }
+        if session.capture_failed() {
+            return Err(FinalizeError::CaptureIncomplete);
+        }
+        // An already-closed unsigned artifact skips close_session_locked.
+        // Check again before fresh promotion; the fully issued receipt replay
+        // branch above remains unchanged and never rewrites an accepted receipt.
+        crate::routes::ensure_tool_executions_resolved(&self.spool_dir, &session.id, &self.journal_key)
+            .await
+            .map_err(FinalizeError::ToolEvidence)?;
         let persisted_receipt = { session.receipt.lock().clone() };
         let path =
             session.atif_path.lock().clone().ok_or_else(|| {
@@ -1439,7 +1461,7 @@ impl Finalizer {
             Err(reason) => {
                 return Err(FinalizeError::atif(format!(
                     "strict validation failed (bytes-level): {reason}"
-                )))
+                )));
             }
         };
         if !issues.is_empty() {
@@ -1604,7 +1626,69 @@ impl Finalizer {
         for pass in passes {
             recovered = recovered.saturating_add(crate::recovery::run_pass(pass, &ctx).await?.recovered);
         }
+        self.ensure_unresolved_tool_metadata(sessions).await?;
+        // Recovery deliberately refuses a receipt for incomplete capture. Tell
+        // downstream observers explicitly instead of leaving partial evidence
+        // looking like an ordinary live session. The outbox keeps this retryable.
+        for session in sessions.open_sessions_including_closed() {
+            if session.capture_failed() {
+                let _lifecycle = self.acquire_lifecycle(&session.id).await;
+                if let Err(error) = self.emit_quarantine_event(&session).await {
+                    tracing::warn!(session = %session.id, %error, "quarantine notification pending; will retry");
+                }
+            }
+        }
         Ok(recovered)
+    }
+
+    /// A queued MCP authorization may not have written its first metadata
+    /// before a crash. Never admit that orphan external ID as a clean session.
+    /// Do not use the bounded quarantine cache to enumerate this check: its
+    /// FIFO may have evicted the ID. Valid metadata awaiting another bounded
+    /// recovery pass is allowed; finalization independently checks disk evidence.
+    async fn ensure_unresolved_tool_metadata(&self, sessions: &SessionRegistry) -> Result<(), FinalizeError> {
+        let unresolved = crate::routes::unresolved_tool_sessions(&self.spool_dir, &self.journal_key)
+            .await
+            .map_err(FinalizeError::atif)?;
+        for session_id in unresolved {
+            if sessions.get(&session_id).is_some() {
+                continue;
+            }
+            let digest = av_core::digest::sha256_hex(session_id.as_bytes());
+            let stem = digest
+                .get(..32)
+                .ok_or_else(|| FinalizeError::Invariant("invalid session digest".to_owned()))?;
+            let metadata_path = self.spool_dir.join(format!("{stem}.session.json"));
+            let invalid = || {
+                FinalizeError::atif(
+                    "unresolved tool execution has no recoverable authenticated session metadata".to_owned(),
+                )
+            };
+            let metadata = self
+                .read_journal_metadata(&metadata_path)
+                .await?
+                .ok_or_else(invalid)?;
+            let recognized_workflow = metadata
+                .get("workflow")
+                .and_then(serde_json::Value::as_str)
+                .and_then(Workflow::parse)
+                .is_some();
+            let identity = metadata
+                .get("identity")
+                .cloned()
+                .and_then(|value| serde_json::from_value::<av_events::AgentIdentity>(value).ok());
+            if metadata
+                .get("journal_version")
+                .and_then(serde_json::Value::as_u64)
+                != Some(2)
+                || metadata.get("session_id").and_then(serde_json::Value::as_str) != Some(session_id.as_str())
+                || !recognized_workflow
+                || identity.is_none()
+            {
+                return Err(invalid());
+            }
+        }
+        Ok(())
     }
 
     /// Strict-ATIF adoption scan (body of `AdoptStrictAtifPass`):
@@ -1819,6 +1903,16 @@ impl Finalizer {
                         "ignoring ATIF spool file whose provenance does not verify"
                     );
                 }
+                // An I/O failure (including a retry of directory fsync) is
+                // not evidence of a forged seal. Preserve the valid pair so
+                // a later recovery pass can establish durability and adopt it.
+                if matches!(
+                    &error,
+                    FinalizeError::Atif { source: Some(source), .. }
+                        if source.downcast_ref::<std::io::Error>().is_some()
+                ) {
+                    continue;
+                }
                 // Quarantine files old enough that no live close can
                 // still be repairing the sidecar (same MIN_ORPHAN_AGE
                 // guard used for sidecar-less files at the top of this
@@ -1930,7 +2024,7 @@ impl Finalizer {
                 .and_then(|value| value.get("ttl_remaining_s"))
                 .and_then(serde_json::Value::as_u64);
             let recovered_session = match sessions.try_insert_recovered(
-                Session::recover_unsigned(
+                Session::recover_unsigned_with_principal(
                     session_id.clone(),
                     av_events::AgentIdentity {
                         version: trajectory.agent.version.clone(),
@@ -1949,6 +2043,7 @@ impl Finalizer {
                     // marker branch below additionally advances past the
                     // published SESSION_CLOSE.
                     trajectory.steps.len() as u64,
+                    extra.and_then(|value| value.get("principal_binding")).and_then(serde_json::Value::as_str),
                 )
                 .map_err(FinalizeError::atif)?,
             ) {
@@ -2093,10 +2188,15 @@ impl Finalizer {
                             session = %av_core::fsutil::basename(&path),
                             "prior receipt does not attest the recovered ATIF trajectory; ignoring as prior-incarnation evidence"
                         );
-                    } else if path.with_extension("promote").exists() {
-                        recovered_session.restore_pending_receipt(receipt);
                     } else {
-                        recovered_session.restore_receipt(receipt);
+                        sync_existing_file_parent(&receipt_path)
+                            .await
+                            .map_err(FinalizeError::receipt_source)?;
+                        if path.with_extension("promote").exists() {
+                            recovered_session.restore_pending_receipt(receipt);
+                        } else {
+                            recovered_session.restore_receipt(receipt);
+                        }
                     }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound
@@ -2321,6 +2421,7 @@ impl Finalizer {
                 identity,
                 breaker.clone(),
             ));
+            session.bind_principal(metadata.get("principal_binding").and_then(serde_json::Value::as_str));
             let mut next_sequence = 0u64;
             let mut folded = crate::worker::RecoveredTotals::default();
             let mut pending_responses = std::collections::HashSet::new();
@@ -2431,6 +2532,9 @@ impl Finalizer {
                             "persisted receipt does not attest the recovered signed journal".to_owned(),
                         ));
                     }
+                    sync_existing_file_parent(&receipt_path)
+                        .await
+                        .map_err(FinalizeError::receipt_source)?;
                     *session.receipt.lock() = Some(receipt);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound
@@ -2737,6 +2841,7 @@ impl Finalizer {
                 identity.clone(),
                 breaker.clone(),
             );
+            placeholder.bind_principal(metadata.get("principal_binding").and_then(serde_json::Value::as_str));
             // Claim the close on the fresh placeholder (cannot fail)
             // rather than storing the flag directly, so the S2 shadow
             // state machine tracks the placeholder as Draining.
@@ -2919,6 +3024,7 @@ impl Finalizer {
                 "charter": latest_identity.charter,
                 "instance_uid": latest_identity.instance_uid,
                 "ttl_remaining_s": latest_identity.ttl_remaining_s,
+                "principal_binding": claimed.principal_binding(),
             }));
             if let Some(metrics) = trajectory.final_metrics.as_mut() {
                 metrics.total_prompt_tokens = Some(folded.prompt_tokens);
@@ -3358,16 +3464,11 @@ impl Finalizer {
         .map_err(FinalizeError::Task)?
     }
 
-    /// Move a capture-failed session's
-    /// tool-execution triples out of the scanned namespace. These
-    /// executions can never resolve (the session is sealed), but
-    /// leaving them at their primary names meant
-    /// `unresolved_tool_sessions` re-read and re-MAC-verified them
-    /// every reconciler tick FOREVER, and every close of any other
-    /// session paid the read+MAC cost for them too. Rename (not
-    /// delete): the outcome hex may be the only copy of what the tool
-    /// returned, so the triple is preserved as incident evidence under
-    /// a `.capturefailed-<uid>` suffix that no scan globs.
+    /// Archive completed tool triples for a capture-failed session. An
+    /// unresolved authenticated intent must keep its primary name: recovery
+    /// uses it to quarantine the session after another restart. Retain any
+    /// partial outcome with it as incident evidence; only independently
+    /// authenticated outcome + audit records may leave the active namespace.
     async fn quarantine_tool_executions(&self, session_id: &str) {
         let spool_dir = self.spool_dir.clone();
         let session_id = session_id.to_owned();
@@ -3413,6 +3514,12 @@ impl Finalizer {
                         .map(str::to_owned)
                 });
                 if intent_session_id.as_deref() != Some(session_id.as_str()) {
+                    continue;
+                }
+                if !crate::routes::tool_completion_is_authenticated(&directory, key, &control_key) {
+                    // The primary intent is the durable quarantine marker.
+                    // Moving it would let the next startup sign incomplete
+                    // evidence or reopen this execution key for another effect.
                     continue;
                 }
                 let uid = av_core::new_event_uid();
@@ -3618,6 +3725,12 @@ impl Finalizer {
                     "ATIF provenance does not match artifact bytes and session".to_owned(),
                 ));
             }
+            // A prior atomic write may have renamed this sidecar but failed
+            // its final directory sync. Authenticate first, then establish
+            // durability before callers can discard the source journals.
+            sync_existing_file_parent(&provenance_path)
+                .await
+                .map_err(FinalizeError::atif_source)?;
             return Ok(actual);
         }
         let sealed = crate::journal::seal(&self.journal_key, "atif-provenance", 0, &expected)
@@ -3720,6 +3833,52 @@ impl Finalizer {
         .map_err(FinalizeError::receipt_source)
     }
 
+    async fn has_quarantine_notice(&self, session: &Session) -> Result<bool, FinalizeError> {
+        // Completed notifications live outside the active outbox. Retaining
+        // them in that bounded scan would eventually starve pending events.
+        let notice = quarantine_notice_path(&self.spool_dir, &session.id);
+        match read_capped_async(notice, av_core::fsutil::MAX_CONTROL_BYTES).await {
+            Ok(sealed) => {
+                let recorded: LifecycleOutbox = crate::journal::open(
+                    &self.journal_key,
+                    crate::journal::LIFECYCLE_OUTBOX_DOMAIN,
+                    0,
+                    &sealed,
+                )
+                .map_err(FinalizeError::bridge)?;
+                if recorded.session_id != session.id
+                    || recorded.kind != crate::journal::SESSION_QUARANTINE_OUTBOX_KIND
+                    || recorded.ack.is_none()
+                {
+                    return Err(FinalizeError::bridge(
+                        "invalid acknowledged quarantine notification".to_owned(),
+                    ));
+                }
+                Ok(true)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(FinalizeError::bridge_source(error)),
+        }
+    }
+
+    async fn emit_quarantine_event(&self, session: &Session) -> Result<(), FinalizeError> {
+        if self.has_quarantine_notice(session).await? {
+            return Ok(());
+        }
+        self.emit_bridge_event(
+            session,
+            av_events::EventClass::Session,
+            serde_json::json!({
+                "action": "quarantined",
+                "workflow": session.workflow.as_str(),
+                "reason": "incomplete_capture",
+                "evidence_complete": false,
+            }),
+            crate::journal::SESSION_QUARANTINE_OUTBOX_KIND,
+        )
+        .await
+    }
+
     async fn emit_receipt_event(&self, session: &Session, receipt: &Receipt) -> Result<(), FinalizeError> {
         self.emit_bridge_event(
             session,
@@ -3792,11 +3951,15 @@ impl Finalizer {
             // `session_scope` too when the record carries one.
             // Legacy records (`session_scope: None`) predate the
             // field and are treated as same-incarnation.
-            let stale_incarnation = outbox.key != current_instance_uid
-                || outbox
-                    .session_scope
-                    .as_ref()
-                    .is_some_and(|scope| scope != &session.session_scope);
+            // Quarantine permanently closes this external session id. Its
+            // notification must retain its UID when recovery reconstructs a
+            // fresh in-memory Session with a new session_scope.
+            let stale_incarnation = kind != crate::journal::SESSION_QUARANTINE_OUTBOX_KIND
+                && (outbox.key != current_instance_uid
+                    || outbox
+                        .session_scope
+                        .as_ref()
+                        .is_some_and(|scope| scope != &session.session_scope));
             if stale_incarnation {
                 remove_outbox(&path).await?;
                 // Fresh emit: fall through by returning to the outer
@@ -3806,6 +3969,11 @@ impl Finalizer {
                 // the branch below take over.
                 None
             } else {
+                // Visibility is insufficient after a post-rename fsync error.
+                // Retry must establish intent durability before publication.
+                sync_existing_file_parent(&path)
+                    .await
+                    .map_err(FinalizeError::bridge_source)?;
                 // A crash between a prior successful emit and a subsequent one loses the
                 // in-memory seq advance for this outbox — recovery only restores seq from
                 // the journal length. Fast-forward past the persisted seq so a following
@@ -3829,6 +3997,14 @@ impl Finalizer {
         // Fresh-emit branch (either no existing outbox, or the
         // existing one was a recycled-id orphan we just deleted).
         if outbox.is_none() {
+            // Replay can archive the old active intent after the caller's
+            // first anchor check. Observe active-file absence BEFORE this
+            // recheck: archival persists the anchor before deleting active.
+            if kind == crate::journal::SESSION_QUARANTINE_OUTBOX_KIND
+                && self.has_quarantine_notice(session).await?
+            {
+                return Ok(());
+            }
             // Peek the seq without consuming it; a failed persist_outbox
             // below would otherwise burn a seq that recovery expects to see
             // at a later journal position, breaking the position-vs-seq
@@ -3868,6 +4044,9 @@ impl Finalizer {
             ));
         };
         if outbox.ack.is_some() {
+            if kind == crate::journal::SESSION_QUARANTINE_OUTBOX_KIND {
+                archive_quarantine_notice(&self.spool_dir, &outbox, &self.journal_key).await?;
+            }
             return Ok(());
         }
         let topic = outbox.topic.clone();
@@ -3888,6 +4067,9 @@ impl Finalizer {
         };
         outbox.ack = Some(ack);
         persist_outbox(&path, &outbox, &self.journal_key).await?;
+        if kind == crate::journal::SESSION_QUARANTINE_OUTBOX_KIND {
+            archive_quarantine_notice(&self.spool_dir, &outbox, &self.journal_key).await?;
+        }
         Ok(())
     }
 
@@ -3926,6 +4108,9 @@ impl Finalizer {
         if outbox.ack.is_some() {
             return Ok(());
         }
+        sync_existing_file_parent(&path)
+            .await
+            .map_err(FinalizeError::bridge_source)?;
         let event_uid = lifecycle_event_uid(&outbox.value)?;
         let ack = resolve_lifecycle_ack(
             bridge,
@@ -4187,6 +4372,12 @@ impl Finalizer {
                 continue;
             }
             if outbox.ack.is_some() {
+                // Keep the deduplication anchor outside the bounded active
+                // outbox scan, so old incidents cannot starve new work.
+                if outbox.kind == crate::journal::SESSION_QUARANTINE_OUTBOX_KIND {
+                    archive_quarantine_notice(&self.spool_dir, &outbox, &self.journal_key).await?;
+                    continue;
+                }
                 // Keep acked outboxes for sessions whose close has not
                 // completed: the pending-close sweep uses outbox presence to
                 // decide whether the receipt event already reached the
@@ -4624,6 +4815,9 @@ pub(crate) async fn replay_lifecycle_outboxes_in(
             // for the tick. Warn and continue; the outbox stays
             // unacked on disk and is retried next tick.
             let outcome: Result<(), FinalizeError> = async {
+                sync_existing_file_parent(&path)
+                    .await
+                    .map_err(FinalizeError::bridge_source)?;
                 let event_uid = lifecycle_event_uid(&value)?;
                 outbox.ack =
                     Some(resolve_lifecycle_ack(Arc::clone(&bridge), topic, key, value, event_uid).await?);
@@ -4641,8 +4835,41 @@ pub(crate) async fn replay_lifecycle_outboxes_in(
                 }
             }
         }
+        if outbox.ack.is_some() && outbox.kind == crate::journal::SESSION_QUARANTINE_OUTBOX_KIND {
+            if let Err(error) = archive_quarantine_notice(spool_dir, &outbox, journal_key).await {
+                tracing::warn!(%error, "quarantine notification archival pending; will retry");
+            }
+        }
     }
     Ok(replayed)
+}
+
+fn quarantine_notice_path(spool_dir: &std::path::Path, session_id: &str) -> PathBuf {
+    let session_hash = &av_core::digest::sha256_hex(session_id.as_bytes())[..32];
+    spool_dir
+        .join("quarantine-notices")
+        .join(format!("{session_hash}.json"))
+}
+
+async fn archive_quarantine_notice(
+    spool_dir: &std::path::Path,
+    outbox: &LifecycleOutbox,
+    journal_key: &[u8; 32],
+) -> Result<(), FinalizeError> {
+    // Persist and fsync the acknowledged anchor BEFORE removing the active
+    // intent. A crash at either step leaves an authenticated, retryable copy.
+    persist_outbox(
+        &quarantine_notice_path(spool_dir, &outbox.session_id),
+        outbox,
+        journal_key,
+    )
+    .await?;
+    remove_outbox(&lifecycle_outbox_path_in(
+        spool_dir,
+        &outbox.session_id,
+        &outbox.kind,
+    ))
+    .await
 }
 
 /// Free-function form of `Finalizer::lifecycle_outbox_path` so the
@@ -4666,6 +4893,38 @@ async fn persist_outbox(
         .map_err(FinalizeError::Task)?
         .map_err(FinalizeError::bridge_source)
 }
+
+/// A complete file can remain visible when atomic rename succeeded but its
+/// parent fsync failed. Re-establish directory durability before adopting that
+/// file as committed evidence or publishing an intent read from disk.
+async fn sync_existing_file_parent(path: &std::path::Path) -> std::io::Result<()> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        if PARENT_SYNC_FAILURES
+            .get()
+            .is_some_and(|failures| failures.lock().contains(&path))
+        {
+            return Err(std::io::Error::other("injected parent directory sync failure"));
+        }
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        // Confirm uncertain ancestors as well as the final entry. The
+        // existing-directory variant must not recreate a vanished recovery
+        // directory and turn a cleanup race into apparent durable evidence.
+        av_core::fsutil::sync_directory_ancestors(parent)?;
+        av_core::fsutil::sync_directory(parent)
+    })
+    .await
+    .map_err(std::io::Error::other)?
+}
+
+// Path-scoped injection avoids affecting parallel tests or unrelated outboxes.
+#[cfg(test)]
+static PARENT_SYNC_FAILURES: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashSet<PathBuf>>> =
+    std::sync::OnceLock::new();
 
 async fn persist_marker(path: &std::path::Path, bytes: &[u8]) -> Result<(), FinalizeError> {
     let path = path.to_path_buf();
@@ -5197,11 +5456,435 @@ mod tests {
         attempts: parking_lot::Mutex<Vec<(String, serde_json::Value)>>,
     }
 
-    /// The deferred-work item this refactor closes: an `io::Error`
-    /// wrapped by `FinalizeError` must keep its `ErrorKind` reachable
-    /// through `Error::source()`, so callers can branch on e.g.
-    /// `NotFound` vs `PermissionDenied` instead of parsing Display
-    /// text, and tracing subscribers receive the full chain.
+    struct ParentSyncFailure(PathBuf);
+
+    impl ParentSyncFailure {
+        fn new(path: &std::path::Path) -> Self {
+            assert!(PARENT_SYNC_FAILURES
+                .get_or_init(Default::default)
+                .lock()
+                .insert(path.to_path_buf()));
+            Self(path.to_path_buf())
+        }
+    }
+
+    impl Drop for ParentSyncFailure {
+        fn drop(&mut self) {
+            PARENT_SYNC_FAILURES.get().unwrap().lock().remove(&self.0);
+        }
+    }
+
+    // Reproduce the complete, visible destination left by a successful rename
+    // whose final directory synchronization failed. Do not sync the parent.
+    fn write_visible_file_without_directory_sync(path: &std::path::Path, bytes: &[u8]) {
+        use std::io::Write as _;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let temporary = path.with_extension("pending");
+        let mut file = std::fs::File::create(&temporary).unwrap();
+        file.write_all(bytes).unwrap();
+        file.sync_all().unwrap();
+        std::fs::rename(temporary, path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn resync_does_not_recreate_missing_recovery_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("removed/receipt.json");
+        assert_eq!(
+            sync_existing_file_parent(&path).await.unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert!(!path.parent().unwrap().exists());
+    }
+
+    #[tokio::test]
+    async fn lifecycle_retry_resync_failure_blocks_publish_and_isolates_replay() {
+        let directory = tempfile::tempdir().unwrap();
+        let bus = Arc::new(FailFirstReceiptBus {
+            fail: std::sync::atomic::AtomicBool::new(false),
+            attempts: parking_lot::Mutex::new(Vec::new()),
+        });
+        let finalizer = Finalizer::with_bridge(
+            Arc::new(Ed25519Signer::from_seed(&[7; 32])),
+            directory.path().to_path_buf(),
+            Arc::new(Registry::new()),
+            bus.clone(),
+        );
+        let session = session(Workflow::Signed);
+        let failed_uid = av_core::new_event_uid();
+        let healthy_uid = av_core::new_event_uid();
+        for (kind, uid, class) in [
+            (
+                crate::journal::RECEIPT_OUTBOX_KIND,
+                &failed_uid,
+                av_events::EventClass::Receipt,
+            ),
+            (
+                crate::journal::SESSION_CLOSE_OUTBOX_KIND,
+                &healthy_uid,
+                av_events::EventClass::Session,
+            ),
+        ] {
+            let outbox = LifecycleOutbox {
+                schema_version: LIFECYCLE_OUTBOX_SCHEMA_V1,
+                session_id: session.id.clone(),
+                kind: kind.to_owned(),
+                topic: class.topic().to_owned(),
+                key: session.identity.instance_uid.clone(),
+                value: serde_json::json!({"metadata": {"uid": uid, "sequence": 42}}),
+                ack: None,
+                session_scope: Some(session.session_scope.clone()),
+            };
+            let sealed = crate::journal::seal(
+                &finalizer.journal_key,
+                crate::journal::LIFECYCLE_OUTBOX_DOMAIN,
+                0,
+                &outbox,
+            )
+            .unwrap();
+            write_visible_file_without_directory_sync(
+                &finalizer.lifecycle_outbox_path(&session.id, kind),
+                &sealed,
+            );
+        }
+        let failed_path = finalizer.lifecycle_outbox_path(&session.id, crate::journal::RECEIPT_OUTBOX_KIND);
+        let original_bytes = std::fs::read(&failed_path).unwrap();
+        let failure = ParentSyncFailure::new(&failed_path);
+        let seq_before = session.peek_seq();
+        assert!(finalizer
+            .emit_bridge_event(
+                &session,
+                av_events::EventClass::Receipt,
+                serde_json::json!({}),
+                crate::journal::RECEIPT_OUTBOX_KIND,
+            )
+            .await
+            .is_err());
+        assert_eq!(session.peek_seq(), seq_before);
+        assert!(finalizer
+            .replay_unacked_lifecycle_outbox(&session, crate::journal::RECEIPT_OUTBOX_KIND)
+            .await
+            .is_err());
+        assert!(bus.attempts.lock().is_empty());
+        // The background scan keeps this failed intent and still publishes
+        // the independently durable intent in the same directory.
+        assert_eq!(finalizer.replay_lifecycle_outboxes().await.unwrap(), 1);
+        assert_eq!(bus.attempts.lock().len(), 1);
+        assert_eq!(bus.attempts.lock()[0].1["metadata"]["uid"], healthy_uid);
+        assert_eq!(std::fs::read(&failed_path).unwrap(), original_bytes);
+        drop(failure);
+        finalizer
+            .emit_bridge_event(
+                &session,
+                av_events::EventClass::Receipt,
+                serde_json::json!({}),
+                crate::journal::RECEIPT_OUTBOX_KIND,
+            )
+            .await
+            .unwrap();
+        assert_eq!(bus.attempts.lock().len(), 2);
+        assert_eq!(bus.attempts.lock()[1].1["metadata"]["uid"], failed_uid);
+        finalizer
+            .replay_unacked_lifecycle_outbox(&session, crate::journal::RECEIPT_OUTBOX_KIND)
+            .await
+            .unwrap();
+        assert_eq!(finalizer.replay_lifecycle_outboxes().await.unwrap(), 0);
+        assert_eq!(
+            bus.attempts.lock().len(),
+            2,
+            "retry must retain the original event UID and acknowledgment"
+        );
+    }
+
+    #[tokio::test]
+    async fn unsigned_recovery_resync_failures_preserve_provenance_and_receipt() {
+        let directory = tempfile::tempdir().unwrap();
+        let finalizer = finalizer(directory.path());
+        let original = session(Workflow::Unsigned);
+        original
+            .atif
+            .lock()
+            .push_step(av_atif::Step {
+                step_id: 0,
+                timestamp: None,
+                source: av_atif::Source::User,
+                message: serde_json::json!("retained evidence"),
+                reasoning_effort: None,
+                reasoning_content: None,
+                model_name: None,
+                tool_calls: None,
+                observation: None,
+                metrics: None,
+                is_copied_context: None,
+                llm_call_count: None,
+                extra: None,
+            })
+            .unwrap();
+        let FinalizeOutcome::Atif { path } = finalizer
+            .close_session(original.clone(), StopReason::SessionClosed)
+            .await
+            .unwrap()
+        else {
+            panic!("expected unsigned artifact")
+        };
+        let receipt = finalizer.promote(original.clone()).await.unwrap();
+        let proof = path.with_extension("atif-auth");
+        let receipt_path = finalizer.receipt_path(&original.id);
+        let originals: Vec<_> = [&path, &proof, &receipt_path]
+            .into_iter()
+            .map(|path| (path.clone(), std::fs::read(path).unwrap()))
+            .collect();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        let registry = SessionRegistry::new();
+        for retry_path in [&proof, &receipt_path] {
+            let bytes = std::fs::read(retry_path).unwrap();
+            write_visible_file_without_directory_sync(retry_path, &bytes);
+            let failure = ParentSyncFailure::new(retry_path);
+            assert_eq!(
+                finalizer
+                    .recover_spooled_sessions(&registry, &Default::default())
+                    .await
+                    .unwrap(),
+                0
+            );
+            assert!(registry.get(&original.id).is_none());
+            for (path, bytes) in &originals {
+                assert_eq!(
+                    &std::fs::read(path).unwrap(),
+                    bytes,
+                    "a sync error must not quarantine or overwrite authenticated evidence"
+                );
+            }
+            drop(failure);
+        }
+        assert_eq!(
+            finalizer
+                .recover_spooled_sessions(&registry, &Default::default())
+                .await
+                .unwrap(),
+            1
+        );
+        let recovered = registry.get(&original.id).unwrap();
+        assert_eq!(
+            recovered.receipt.lock().as_ref().unwrap().body.receipt_id,
+            receipt.body.receipt_id
+        );
+    }
+
+    #[tokio::test]
+    async fn signed_receipt_recovery_resync_failure_preserves_source_journal() {
+        let directory = tempfile::tempdir().unwrap();
+        let finalizer = finalizer(directory.path());
+        let original = session(Workflow::Signed);
+        let event = av_events::OcsfEventBuilder::new(
+            av_events::EventClass::Compression,
+            original.id.clone(),
+            original.identity.clone(),
+            0,
+        )
+        .payload(serde_json::json!({}))
+        .build()
+        .unwrap();
+        let event_value = serde_json::to_value(&event).unwrap();
+        original.chain.lock().append(&event_value).unwrap();
+        let FinalizeOutcome::Receipt { receipt } = finalizer
+            .close_session(original.clone(), StopReason::SessionClosed)
+            .await
+            .unwrap()
+        else {
+            panic!("expected signed receipt")
+        };
+        let stem = &av_core::digest::sha256_hex(original.id.as_bytes())[..32];
+        let metadata_path = directory.path().join(format!("{stem}.session.json"));
+        let journal_path = directory.path().join(format!("{stem}.events.ndjson"));
+        let metadata = serde_json::json!({
+            "journal_version": 2, "session_id": original.id,
+            "identity": original.identity, "workflow": "signed",
+        });
+        std::fs::write(
+            &metadata_path,
+            crate::journal::seal(&finalizer.journal_key, "metadata", 0, &metadata).unwrap(),
+        )
+        .unwrap();
+        let record = crate::worker::ActiveJournalRecord {
+            event: event_value,
+            identity: original.identity.clone(),
+            atif_step: None,
+            tool_calls: 0,
+            tool_allowed: 0,
+            tool_blocked: 0,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cached_tokens: 0,
+            cost_usd_micros: 0,
+            prompt_token_correction: 0,
+            stop_reason_id: None,
+            response_attempt: None,
+        };
+        let mut line = crate::journal::seal(
+            &finalizer.journal_key,
+            &format!("{}:active", original.id),
+            0,
+            &record,
+        )
+        .unwrap();
+        line.push(b'\n');
+        std::fs::write(&journal_path, &line).unwrap();
+        crate::worker::persist_broker_ack(
+            directory.path(),
+            &original.id,
+            &event.metadata.uid,
+            &PublishAck {
+                topic: av_events::EventClass::Compression.topic().into(),
+                partition: 0,
+                offset: 1,
+            },
+            &finalizer.journal_key,
+        )
+        .await
+        .unwrap();
+        let receipt_path = finalizer.receipt_path(&original.id);
+        let receipt_bytes = std::fs::read(&receipt_path).unwrap();
+        write_visible_file_without_directory_sync(&receipt_path, &receipt_bytes);
+        let failure = ParentSyncFailure::new(&receipt_path);
+        let registry = SessionRegistry::new();
+        assert_eq!(
+            finalizer
+                .recover_spooled_sessions(&registry, &Default::default())
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(registry.get(&original.id).is_none());
+        assert!(metadata_path.exists());
+        assert_eq!(std::fs::read(&journal_path).unwrap(), line);
+        assert_eq!(std::fs::read(&receipt_path).unwrap(), receipt_bytes);
+        drop(failure);
+        assert_eq!(
+            finalizer
+                .recover_spooled_sessions(&registry, &Default::default())
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            registry
+                .get(&original.id)
+                .unwrap()
+                .receipt
+                .lock()
+                .as_ref()
+                .unwrap()
+                .body
+                .receipt_id,
+            receipt.body.receipt_id
+        );
+        assert!(
+            !journal_path.exists(),
+            "successful durable adoption completes cleanup"
+        );
+    }
+
+    /// Incomplete evidence must remain visible across restarts without
+    /// duplicate lifecycle notifications or a complete signed receipt.
+    #[tokio::test]
+    async fn quarantine_notification_is_durable_deduplicated_and_never_a_receipt() {
+        let directory = tempfile::tempdir().unwrap();
+        let bus = Arc::new(FailFirstReceiptBus {
+            fail: std::sync::atomic::AtomicBool::new(false),
+            attempts: parking_lot::Mutex::new(Vec::new()),
+        });
+        let make_finalizer = || {
+            Finalizer::with_bridge(
+                Arc::new(Ed25519Signer::from_seed(&[7; 32])),
+                directory.path().to_path_buf(),
+                Arc::new(Registry::new()),
+                bus.clone(),
+            )
+        };
+        let first = make_finalizer();
+        let failed = session(Workflow::Signed);
+        failed.mark_capture_failed();
+        assert!(matches!(
+            first
+                .close_session(failed.clone(), StopReason::SessionClosed)
+                .await,
+            Err(FinalizeError::CaptureIncomplete)
+        ));
+        let outbox = first.lifecycle_outbox_path(&failed.id, crate::journal::SESSION_QUARANTINE_OUTBOX_KIND);
+        let notice = quarantine_notice_path(directory.path(), &failed.id);
+        assert!(
+            !outbox.exists(),
+            "completed notices must not consume active replay capacity"
+        );
+        assert!(notice.exists());
+        assert!(!first.receipt_path(&failed.id).exists());
+        // Crash after persisting the broker ack but before archiving it.
+        // Recovery migrates that acknowledged copy without republishing it.
+        std::fs::copy(&notice, &outbox).unwrap();
+        std::fs::remove_file(&notice).unwrap();
+        assert_eq!(
+            replay_lifecycle_outboxes_in(
+                directory.path(),
+                &first.journal_key,
+                bus.clone(),
+                &Registry::new()
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        assert!(notice.exists());
+        assert!(!outbox.exists());
+        // The periodic GC also migrates already acknowledged legacy copies.
+        std::fs::copy(&notice, &outbox).unwrap();
+        first
+            .remove_acked_lifecycle_outboxes(&SessionRegistry::new())
+            .await
+            .unwrap();
+        assert!(
+            notice.exists(),
+            "the quarantine anchor must survive outbox cleanup"
+        );
+        assert!(!outbox.exists());
+        let restarted = make_finalizer();
+        let reconstructed = session(Workflow::Signed);
+        assert_ne!(failed.session_scope, reconstructed.session_scope);
+        reconstructed.mark_capture_failed();
+        restarted.emit_quarantine_event(&reconstructed).await.unwrap();
+        // Model replay completing between the wrapper's initial missing-
+        // anchor check and the inner emit's active-file lookup.
+        restarted
+            .emit_bridge_event(
+                &reconstructed,
+                av_events::EventClass::Session,
+                serde_json::json!({"action": "quarantined", "evidence_complete": false}),
+                crate::journal::SESSION_QUARANTINE_OUTBOX_KIND,
+            )
+            .await
+            .unwrap();
+        {
+            let attempts = bus.attempts.lock();
+            assert_eq!(attempts.len(), 1, "restart must reuse the acknowledged event UID");
+            let (topic, event) = attempts.first().unwrap();
+            assert_eq!(topic, "agent.session");
+            assert_eq!(event.pointer("/payload/action").unwrap(), "quarantined");
+            assert_eq!(event.pointer("/payload/evidence_complete").unwrap(), false);
+            assert!(event.pointer("/payload/receipt").is_none());
+        }
+        // A damaged retained anchor cannot cause a duplicate notification.
+        std::fs::write(notice, b"tampered").unwrap();
+        assert!(restarted.emit_quarantine_event(&reconstructed).await.is_err());
+        assert_eq!(bus.attempts.lock().len(), 1);
+    }
+
+    /// Wrapped I/O errors retain their typed source for callers and tracing.
     #[test]
     fn finalize_error_preserves_io_error_kind_through_source() {
         let error = FinalizeError::atif_source(std::io::Error::new(
@@ -5306,6 +5989,183 @@ mod tests {
             directory.to_path_buf(),
             Arc::new(Registry::new()),
         )
+    }
+
+    #[tokio::test]
+    async fn unsigned_principal_binding_survives_artifact_restart() {
+        for principal in [Some("principal-a"), None] {
+            let directory = tempfile::tempdir().unwrap();
+            let finalizer = finalizer(directory.path());
+            let original = session(Workflow::Unsigned);
+            assert!(original.bind_principal(principal));
+            original
+                .atif
+                .lock()
+                .push_step(av_atif::Step {
+                    step_id: 0,
+                    timestamp: None,
+                    source: av_atif::Source::User,
+                    message: serde_json::json!("private session content"),
+                    reasoning_effort: None,
+                    reasoning_content: None,
+                    model_name: None,
+                    tool_calls: None,
+                    observation: None,
+                    metrics: None,
+                    is_copied_context: None,
+                    llm_call_count: None,
+                    extra: None,
+                })
+                .unwrap();
+            finalizer
+                .close_session(Arc::clone(&original), StopReason::SessionClosed)
+                .await
+                .unwrap();
+            let path = original.atif_path.lock().clone().unwrap();
+            let mut artifact: av_atif::Trajectory =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(
+                artifact.agent.extra.as_ref().unwrap()["principal_binding"],
+                serde_json::json!(principal)
+            );
+            if principal.is_none() {
+                // A legacy artifact has no binding field at all, but its
+                // valid provenance must not let a new principal claim it.
+                artifact
+                    .agent
+                    .extra
+                    .as_mut()
+                    .unwrap()
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("principal_binding");
+                let bytes = serde_json::to_vec(&artifact).unwrap();
+                std::fs::write(&path, &bytes).unwrap();
+                let proof = AtifProvenance {
+                    session_id: original.id.clone(),
+                    digest: av_core::digest::sha256_hex(&bytes),
+                };
+                std::fs::write(
+                    path.with_extension("atif-auth"),
+                    crate::journal::seal(&finalizer.journal_key, "atif-provenance", 0, &proof).unwrap(),
+                )
+                .unwrap();
+                // The old completion marker binds the previous artifact's
+                // bytes. This legacy fixture predates completion markers.
+                let _ = std::fs::remove_file(path.with_extension("close-complete"));
+            }
+            let registry = SessionRegistry::new();
+            finalizer
+                .recover_spooled_sessions(&registry, &Default::default())
+                .await
+                .unwrap();
+            let recovered = registry
+                .get(&original.id)
+                .expect("artifact must be adopted after restart");
+            assert_eq!(recovered.principal_binding().as_deref(), principal);
+            assert!(
+                !recovered.bind_principal(Some("principal-b")),
+                "a different subject must not acquire a recovered session"
+            );
+            assert!(recovered.bind_principal(principal));
+        }
+    }
+
+    #[tokio::test]
+    async fn unsigned_principal_binding_survives_journal_consolidation() {
+        use av_events::{EventClass, OcsfEventBuilder, StatusId};
+        let directory = tempfile::tempdir().unwrap();
+        let finalizer = finalizer(directory.path());
+        let original = session(Workflow::Unsigned);
+        assert!(original.bind_principal(Some("principal-a")));
+        let stem = av_core::digest::sha256_hex(original.id.as_bytes());
+        let stem = &stem[..32];
+        let metadata = serde_json::json!({
+            "journal_version": 2, "session_id": original.id,
+            "identity": original.identity, "workflow": "unsigned",
+            "principal_binding": original.principal_binding(),
+        });
+        std::fs::write(
+            directory.path().join(format!("{stem}.session.json")),
+            crate::journal::seal(&finalizer.journal_key, "metadata", 0, &metadata).unwrap(),
+        )
+        .unwrap();
+        let event = OcsfEventBuilder::new(
+            EventClass::Compression,
+            original.id.clone(),
+            original.identity.clone(),
+            0,
+        )
+        .status(StatusId::Success)
+        .payload(serde_json::json!({}))
+        .build()
+        .unwrap();
+        let record = crate::worker::ActiveJournalRecord {
+            event: serde_json::to_value(&event).unwrap(),
+            identity: original.identity.clone(),
+            atif_step: Some(av_atif::Step {
+                step_id: 0,
+                timestamp: None,
+                source: av_atif::Source::User,
+                message: serde_json::json!("private journal content"),
+                reasoning_effort: None,
+                reasoning_content: None,
+                model_name: None,
+                tool_calls: None,
+                observation: None,
+                metrics: None,
+                is_copied_context: None,
+                llm_call_count: None,
+                extra: None,
+            }),
+            tool_calls: 0,
+            tool_allowed: 0,
+            tool_blocked: 0,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cached_tokens: 0,
+            cost_usd_micros: 0,
+            prompt_token_correction: 0,
+            stop_reason_id: None,
+            response_attempt: None,
+        };
+        let mut line = crate::journal::seal(
+            &finalizer.journal_key,
+            &format!("{}:active", original.id),
+            0,
+            &record,
+        )
+        .unwrap();
+        line.push(b'\n');
+        std::fs::write(directory.path().join(format!("{stem}.events.ndjson")), line).unwrap();
+        crate::worker::persist_broker_ack(
+            directory.path(),
+            &original.id,
+            &event.metadata.uid,
+            &PublishAck {
+                topic: EventClass::Compression.topic().into(),
+                partition: 0,
+                offset: 1,
+            },
+            &finalizer.journal_key,
+        )
+        .await
+        .unwrap();
+        let registry = SessionRegistry::new();
+        finalizer
+            .recover_spooled_sessions(&registry, &Default::default())
+            .await
+            .unwrap();
+        let recovered = registry
+            .get(&original.id)
+            .expect("consolidated artifact must be adopted");
+        assert_eq!(recovered.principal_binding().as_deref(), Some("principal-a"));
+        assert!(!recovered.bind_principal(Some("principal-b")));
+        assert!(recovered.bind_principal(Some("principal-a")));
+        assert!(
+            !directory.path().join(format!("{stem}.session.json")).exists(),
+            "recovery must have moved ownership into the artifact before deleting the journal metadata"
+        );
     }
 
     /// Tick-liveness contract (register #11/#12 follow-through): the
@@ -8144,6 +9004,87 @@ mod tests {
             .lock()
             .contains("uncertain-session"));
         assert!(registry.get("uncertain-session").is_none());
+    }
+
+    #[tokio::test]
+    async fn mcp_durable_startup_distinguishes_deferred_metadata_from_orphan() {
+        let directory = tempfile::tempdir().unwrap();
+        let finalizer = finalizer(directory.path());
+        let registry = SessionRegistry::new();
+        let session_id = "deferred-uncertain";
+        let key = av_core::digest::sha256_hex(b"deferred execution");
+        let executions = directory.path().join(crate::spool::TOOL_EXECUTIONS);
+        std::fs::create_dir(&executions).unwrap();
+        let intent = serde_json::json!({
+            "execution_key": key, "session_id": session_id, "tool": "read",
+            "request_digest": "request-digest", "principal_digest": "principal-digest",
+        });
+        let sealed_intent = crate::journal::seal(
+            &finalizer.journal_key,
+            &format!("{}:{key}", crate::journal::TOOL_INTENT_DOMAIN),
+            0,
+            &intent,
+        )
+        .unwrap();
+        let intent_path = executions.join(format!("{key}{}", crate::spool::TOOL_INTENT_SUFFIX));
+        std::fs::write(&intent_path, &sealed_intent).unwrap();
+        assert!(finalizer
+            .ensure_unresolved_tool_metadata(&registry)
+            .await
+            .is_err());
+        let identity = AgentIdentity {
+            version: "1".to_owned(),
+            charter: "test".into(),
+            instance_uid: "instance-1".to_owned(),
+            ttl_remaining_s: None,
+        };
+        let metadata = serde_json::json!({
+            "journal_version": 2, "session_id": session_id,
+            "identity": identity, "workflow": "unsigned",
+        });
+        let digest = av_core::digest::sha256_hex(session_id.as_bytes());
+        let metadata_path = directory.path().join(format!("{}.session.json", &digest[..32]));
+        std::fs::write(
+            &metadata_path,
+            crate::journal::seal(&finalizer.journal_key, "metadata", 0, &metadata).unwrap(),
+        )
+        .unwrap();
+        // No registry entry is intentionally created: this models an otherwise
+        // valid sidecar left for the next bounded adoption pass.
+        finalizer
+            .ensure_unresolved_tool_metadata(&registry)
+            .await
+            .unwrap();
+        assert!(registry.get(session_id).is_none());
+        for (field, value) in [
+            ("journal_version", serde_json::json!(3)),
+            ("session_id", serde_json::json!("different-session")),
+            ("workflow", serde_json::json!("unknown")),
+            ("identity", serde_json::json!(null)),
+        ] {
+            let mut invalid = metadata.clone();
+            invalid[field] = value;
+            let sealed = crate::journal::seal(&finalizer.journal_key, "metadata", 0, &invalid).unwrap();
+            std::fs::write(&metadata_path, &sealed).unwrap();
+            assert!(
+                finalizer
+                    .ensure_unresolved_tool_metadata(&registry)
+                    .await
+                    .is_err(),
+                "authenticated but irrecoverable {field} must not exempt an orphan"
+            );
+            assert_eq!(std::fs::read(&metadata_path).unwrap(), sealed);
+        }
+        std::fs::write(&metadata_path, b"unauthenticated metadata").unwrap();
+        assert!(finalizer
+            .ensure_unresolved_tool_metadata(&registry)
+            .await
+            .is_err());
+        assert_eq!(
+            std::fs::read(&metadata_path).unwrap(),
+            b"unauthenticated metadata"
+        );
+        assert_eq!(std::fs::read(intent_path).unwrap(), sealed_intent);
     }
 
     #[tokio::test]

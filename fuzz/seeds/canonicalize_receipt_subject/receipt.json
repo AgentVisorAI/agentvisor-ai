@@ -1,0 +1,1 @@
+{"session_id":"seed-session","subject":{"id":"agent:billing","charter":"support"},"events":[{"uid":"event-1","seq":0,"payload":{"action":"read"}}],"digest":"sha256:00","signed_at_ms":1700000000000}

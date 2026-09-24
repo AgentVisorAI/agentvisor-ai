@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """End-to-end smoke against a running API server."""
-import json, os, sys, urllib.request
+import json, os, sys, time, urllib.request, uuid
+from datetime import datetime, timezone
 
 BASE = os.environ.get("API_BASE", "http://127.0.0.1:8985")
+NOW = datetime.now(timezone.utc).isoformat()
+EMAIL = f"grace+{uuid.uuid4().hex}@hopper.mil"
 
-def call(method, path, body=None, cookie=None, headers=None):
+def call(method, path, body=None, cookie=None, headers=None, retried=False):
     hdrs = {}
     if body is not None:
         hdrs["Content-Type"] = "application/json"
@@ -17,6 +20,9 @@ def call(method, path, body=None, cookie=None, headers=None):
             set_cookie = r.headers.get("Set-Cookie", "")
             return r.status, r.read().decode(), set_cookie
     except urllib.error.HTTPError as e:
+        if e.code == 429 and not retried:
+            time.sleep(min(61, max(1, int(e.headers.get("Retry-After", "60")))) + 1)
+            return call(method, path, body, cookie, headers, retried=True)
         return e.code, e.read().decode(), ""
 
 def ok(label, status, expected):
@@ -32,7 +38,7 @@ if not ok("health", s, 200): fails += 1
 
 # signup with fake-but-shell-safe email
 s, body, sc = call("POST", "/api/v1/auth/signup", {
-    "email": "grace@hopper.mil",
+    "email": EMAIL,
     "password": "so-many-bugs-so-little-time",
     "orgName": "Northwind Travel",
 })
@@ -79,19 +85,19 @@ daemon = {"Authorization": f"Bearer {token}", "X-AV-Deployment": dep_id}
 # upsert session
 s, _, _ = call("POST", "/api/v1/ingest/sessions", {
     "externalId": "sess-real-1", "agent": "refund-agent",
-    "openedAt": "2026-08-24T09:12:04Z",
+    "openedAt": NOW,
 }, headers=daemon)
 if not ok("ingest session", s, 200): fails += 1
 
 # ingest events
 s, body, _ = call("POST", "/api/v1/ingest/events", [
     {"sessionExternalId": "sess-real-1", "seq": 0, "kind": "sys", "tag": "SESSION",
-     "body": "sess-real-1 opened", "occurredAt": "2026-08-24T09:12:04Z"},
+     "body": "sess-real-1 opened", "occurredAt": NOW},
     {"sessionExternalId": "sess-real-1", "seq": 1, "kind": "tool", "tag": "TOOL",
-     "body": "lookup_booking", "occurredAt": "2026-08-24T09:12:26Z",
+     "body": "lookup_booking", "occurredAt": NOW,
      "addToolsAllowed": 1, "addPromptTokens": 1408, "addCostUsdMicros": 4100},
     {"sessionExternalId": "sess-real-1", "seq": 2, "kind": "block", "tag": "BLOCKED",
-     "body": "HTTP 403 issue_refund $8400", "occurredAt": "2026-08-24T09:13:41Z",
+     "body": "HTTP 403 issue_refund $8400", "occurredAt": NOW,
      "addToolsBlocked": 1, "addBlockedPayoutUsdMicros": 8400000000},
 ], headers=daemon)
 if not ok("ingest events", s, 200): fails += 1
@@ -100,19 +106,19 @@ print("      inserted:", json.loads(body)["inserted"])
 # ingest duplicate — must be idempotent
 s, body, _ = call("POST", "/api/v1/ingest/events", [
     {"sessionExternalId": "sess-real-1", "seq": 0, "kind": "sys", "tag": "SESSION",
-     "body": "sess-real-1 opened (dup)", "occurredAt": "2026-08-24T09:12:04Z"},
+     "body": "sess-real-1 opened (dup)", "occurredAt": NOW},
 ], headers=daemon)
 if not ok("ingest duplicate events (idempotent)", s, 200): fails += 1
 
 # ingest bad token
 s, _, _ = call("POST", "/api/v1/ingest/sessions", {
-    "externalId": "x", "agent": "a", "openedAt": "2026-08-24T09:12:04Z",
+    "externalId": "x", "agent": "a", "openedAt": NOW,
 }, headers={"Authorization": "Bearer nope", "X-AV-Deployment": dep_id})
 if not ok("ingest bad token", s, 401): fails += 1
 
 # ingest missing headers
 s, _, _ = call("POST", "/api/v1/ingest/sessions", {
-    "externalId": "x", "agent": "a", "openedAt": "2026-08-24T09:12:04Z",
+    "externalId": "x", "agent": "a", "openedAt": NOW,
 })
 if not ok("ingest missing headers", s, 401): fails += 1
 
@@ -137,13 +143,13 @@ if not ok("weak password rejected", s, 400): fails += 1
 
 # duplicate email
 s, _, _ = call("POST", "/api/v1/auth/signup", {
-    "email": "grace@hopper.mil", "password": "correct-horse-battery-staple", "orgName": "Y",
+    "email": EMAIL, "password": "correct-horse-battery-staple", "orgName": "Y",
 })
 if not ok("duplicate email rejected", s, 409): fails += 1
 
 # tenant isolation: create a second org, verify its overview is empty
 s, sig, sc2 = call("POST", "/api/v1/auth/signup", {
-    "email": "linus@torvalds.fi", "password": "just-for-fun-linus-1991",
+    "email": f"linus+{uuid.uuid4().hex}@torvalds.fi", "password": "just-for-fun-linus-1991",
     "orgName": "Torvalds Ltd",
 })
 if not ok("second signup", s, 201): fails += 1
@@ -166,13 +172,13 @@ new_token = json.loads(body)["ingestToken"]
 
 # old token no longer works
 s, _, _ = call("POST", "/api/v1/ingest/sessions", {
-    "externalId": "x", "agent": "a", "openedAt": "2026-08-24T09:12:04Z",
+    "externalId": "x", "agent": "a", "openedAt": NOW,
 }, headers={"Authorization": f"Bearer {token}", "X-AV-Deployment": dep_id})
 if not ok("old token revoked", s, 401): fails += 1
 
 # new token works
 s, _, _ = call("POST", "/api/v1/ingest/sessions", {
-    "externalId": "sess-real-2", "agent": "a", "openedAt": "2026-08-24T09:12:04Z",
+    "externalId": "sess-real-2", "agent": "a", "openedAt": NOW,
 }, headers={"Authorization": f"Bearer {new_token}", "X-AV-Deployment": dep_id})
 if not ok("new token works", s, 200): fails += 1
 

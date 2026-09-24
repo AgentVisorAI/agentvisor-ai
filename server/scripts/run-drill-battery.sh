@@ -12,7 +12,7 @@
 #
 # Usage: server/scripts/run-drill-battery.sh [drill-name ...]
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 
 export APP_BASE_URL=${APP_BASE_URL:-http://127.0.0.1:8988}
 export ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://127.0.0.1:8988}
@@ -28,8 +28,8 @@ FAILED_NAMES=""
 run_drill() {
   local name=$1 port=$2; shift 2
   local pidfile
-  pidfile=$(mktemp)
-  ( export PORT=$port API_PUBLIC_URL="http://127.0.0.1:$port" DATABASE_URL="$AVURL" "$@"
+  pidfile=$(mktemp) || return 1
+  ( env PORT="$port" API_PUBLIC_URL="http://127.0.0.1:$port" DATABASE_URL="$AVURL" "$@" \
     node node_modules/.bin/tsx src/index.ts > "/tmp/drill-$name.log" 2>&1 & echo $! > "$pidfile" )
   local up=0
   for _ in $(seq 1 60); do curl -sf -o /dev/null "http://127.0.0.1:$port/healthz" && { up=1; break; }; sleep 1; done
@@ -56,6 +56,7 @@ run_drill() {
 
 # name|port[|extra-env...] — | because env values carry URLs with colons
 ALL_DRILLS=(
+  "quarantine-drill|20753"
   "apikey-drill|20745"
   "apikey-hardening|20745"
   "invite-drill|20445"

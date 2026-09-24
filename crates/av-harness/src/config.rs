@@ -52,14 +52,12 @@ pub const WORKER_FINALIZE_PHASE_SECS: u64 = 30;
 /// truth" purpose as [`WORKER_FINALIZE_PHASE_SECS`].
 pub const OTEL_FLUSH_SECS: u64 = 5;
 
-/// Default upstream read timeout (per-chunk) when `upstream_read_timeout_s`
-/// is unset. Public because [`HarnessConfig::effective_drain_timeout`]
-/// needs it to preserve the "one in-flight request cannot outlive the
-/// drain window" invariant its doc-comment promises — using two
-/// separate defaults (30 in the derivation, 60 in the pipeline) let a
-/// legitimate 60 s upstream read outlast a 30 s drain when both were
-/// left unset in the config.
+/// Default upstream read-idle timeout. Successful reads restart this
+/// timer; it is not a total deadline for streamed chat responses.
 pub const DEFAULT_UPSTREAM_READ_TIMEOUT_S: u64 = 60;
+
+/// Total deadline for an outbound MCP request, including its response body.
+pub const DEFAULT_MCP_REQUEST_TIMEOUT_S: u64 = 60;
 
 /// Top-level harness configuration.
 ///
@@ -85,18 +83,21 @@ pub struct HarnessConfig {
     /// Use cleartext HTTP/2 prior knowledge for trusted h2c upstreams.
     #[serde(default)]
     pub upstream_http2_prior_knowledge: bool,
-    /// Optional provider read-idle timeout override. When unset the
-    /// pipeline applies its 60 s default unconditionally
-    /// — streams cannot be held indefinitely; widen this to extend it
-    /// (capped at one day like every `_s` interval).
+    /// Optional upstream read-idle timeout override (default 60 s).
+    /// Successful reads restart this timer. It does not bound total
+    /// streamed-chat duration. Capped at one day like every `_s` interval.
     #[serde(default)]
     pub upstream_read_timeout_s: Option<u64>,
+    /// Total outbound MCP deadline, including response-body reads. The
+    /// default is 60 s; this also bounds tool work after caller cancellation.
+    /// This does not impose a total deadline on streamed chat responses.
+    #[serde(default)]
+    pub mcp_request_timeout_s: Option<u64>,
     /// Graceful-shutdown drain budget in seconds. When unset the
-    /// effective budget is `max(30, upstream_read_timeout_s + 5)` so a
-    /// single legitimate in-flight request cannot outlive the drain
-    /// window by construction (this budget was once
-    /// a hardcoded 30 s while shipped configs set a 300 s read timeout
-    /// — every rollout with one live long request exited 1 and paged).
+    /// effective budget is `max(30, max(upstream_read_timeout_s,
+    /// mcp_request_timeout_s) + 5)`, using each field's default when unset.
+    /// This covers one read-idle window or MCP network deadline with
+    /// padding; long chat streams and audit work may exceed it.
     /// Kubernetes users must keep `terminationGracePeriodSeconds`
     /// above this value or the kubelet SIGKILLs mid-drain.
     #[serde(default)]
@@ -211,6 +212,11 @@ pub struct HarnessConfig {
     /// Key id assigned to the development HMAC secret.
     #[serde(default = "default_hmac_kid")]
     pub identity_hmac_kid: String,
+    /// Maximum delegation depth for NHI token chains. Controls both
+    /// `parent_token` chain links and `act` claim nesting. Defaults to 4.
+    #[serde(default = "default_max_delegation_depth")]
+    pub max_delegation_depth: usize,
+
     /// Enforce operation scopes on validated identities.
     ///
     /// Default flipped from `true` to `false` so it
@@ -420,8 +426,174 @@ pub struct HarnessConfig {
     /// `allowed_hosts = ["localhost", "127.0.0.1", "agentvisor.internal"]`.
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
+
+    // ── Pillar 4: per-backend routing ────────────────────────────────
+    /// Named backends that MCP tool calls can be routed to. Each entry
+    /// defines a name, URL, and auth policy. When absent, the single
+    /// `tool_upstream_url` is used as an implicit "default" backend.
+    #[serde(default)]
+    pub backends: Vec<BackendConfig>,
+
+    // ── Pillar 2: intent mapping / AuthZEN ───────────────────────────
+    /// Tool-name → business-intent mapping. An unmapped tool is refused
+    /// with `UNMAPPED_TOOL` when `require_intent_mapping` is true.
+    #[serde(default)]
+    pub intent_map: std::collections::BTreeMap<String, String>,
+
+    /// When true, every tool call must have an entry in `intent_map` or
+    /// it is refused with `UNMAPPED_TOOL`. Defaults to false for
+    /// backward compatibility.
+    #[serde(default)]
+    pub require_intent_mapping: bool,
+
+    /// Active mission constraints. A mission narrows the static policy:
+    /// only the listed intents are permitted while the mission is active.
+    /// When absent, all mapped intents are permitted.
+    #[serde(default)]
+    pub mission: Option<MissionConfig>,
+
+    /// Intent token TTL in seconds. Defaults to 60 (the AuthZEN
+    /// recommendation for short-lived per-call tokens).
+    #[serde(default = "default_intent_token_ttl")]
+    pub intent_token_ttl_s: u64,
+
+    // ── Pillar 3: token exchange ─────────────────────────────────────
+    /// Enable the RFC 8693 token exchange endpoint at
+    /// `/v1/token`. When true, the harness signs exchanged tokens
+    /// with a dedicated Ed25519 key (separate from the receipt signer).
+    #[serde(default)]
+    pub token_exchange_enabled: bool,
+
+    /// File containing the Ed25519 signing seed for token exchange.
+    /// Must be distinct from the receipt signing seed. Owner-only
+    /// permissions enforced on Unix.
+    #[serde(default)]
+    pub token_exchange_seed_file: Option<String>,
+
+    /// TTL in seconds for exchanged tokens. Defaults to 300 (five
+    /// minutes). Capped at 900 to prevent indefinite delegation.
+    #[serde(default = "default_exchange_ttl")]
+    pub token_exchange_ttl_s: u64,
+
+    /// Named operator credentials authorized for administrative revocation.
+    /// Only SHA-256 digests are stored in configuration.
+    #[serde(default)]
+    pub operator_tokens: Vec<OperatorTokenConfig>,
+
+    /// Separate backend credentials for the token introspection endpoint.
+    #[serde(default)]
+    pub introspection_tokens: Vec<IntrospectionTokenConfig>,
+
+    /// Maximum revocation audit events per minute. Defaults to 600.
+    #[serde(default = "default_revocation_audit_per_minute")]
+    pub revocation_audit_per_minute: u32,
+
+    // ── Pillar 6: OTEL per-tenant ────────────────────────────────────
+    /// Per-tenant OTEL exporter endpoint. When set, full-fidelity
+    /// traces are shipped to the customer's own collector.
+    #[serde(default)]
+    pub otel_tenant_endpoint: Option<String>,
+
+    /// File containing the bearer token for the tenant OTEL endpoint.
+    /// Owner-only permissions enforced on Unix.
+    #[serde(default)]
+    pub otel_tenant_auth_file: Option<String>,
+
+    /// Sensitive-data redaction patterns (regex). Applied to event
+    /// payloads and ATIF step fields before journal write.
+    #[serde(default)]
+    pub redaction_patterns: Vec<String>,
+
+    /// JSON pointer paths to always redact in event payloads and structured
+    /// ATIF fields. Setting either paths or patterns also enables builtins.
+    #[serde(default)]
+    pub redaction_paths: Vec<String>,
 }
 
+/// Operator credential for administrative revocation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorTokenConfig {
+    /// Unique operator name recorded in administrative audit events.
+    pub name: String,
+    /// SHA-256 of the bearer token, encoded as 64 hexadecimal characters.
+    pub sha256: String,
+}
+
+/// Backend credential for introspection, separate from upstream credentials.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntrospectionTokenConfig {
+    /// Configured backend name whose tokens this credential may inspect.
+    pub backend: String,
+    /// SHA-256 of the bearer token, encoded as 64 hexadecimal characters.
+    pub sha256: String,
+}
+
+fn default_revocation_audit_per_minute() -> u32 {
+    600
+}
+
+/// Per-backend routing configuration (pillar 4).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackendConfig {
+    /// Unique backend name (used in intent mapping and metrics).
+    pub name: String,
+    /// Base URL of the backend MCP server.
+    pub url: String,
+    /// Auth policy for this backend.
+    #[serde(default = "default_backend_auth")]
+    pub auth: BackendAuth,
+    /// Tools routed to this backend. When empty, this backend serves
+    /// as the default for unmapped tools.
+    #[serde(default)]
+    pub tools: Vec<String>,
+}
+
+/// Authentication mode for a backend.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendAuth {
+    /// No authentication.
+    #[default]
+    None,
+    /// Static bearer token from an environment variable.
+    StaticEnv(String),
+    /// Static bearer token from a file (owner-only permissions enforced).
+    StaticFile(String),
+    /// Exchange the inbound NHI token for a backend-scoped token via
+    /// the harness's token exchange service. The exchanged token
+    /// carries `aud` set to this backend's name.
+    Exchange,
+}
+
+/// Mission configuration: narrows the static policy for a time window.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MissionConfig {
+    /// Mission identifier.
+    pub id: String,
+    /// Permitted intents during this mission. Tool calls whose mapped
+    /// intent is not in this list are refused with `MISSION_DENIED`.
+    pub allowed_intents: Vec<String>,
+    /// Mission expiry as epoch seconds. After this time, all tool calls
+    /// are refused with `MISSION_EXPIRED`.
+    pub expires_at: u64,
+}
+
+fn default_max_delegation_depth() -> usize {
+    4
+}
+fn default_intent_token_ttl() -> u64 {
+    60
+}
+fn default_exchange_ttl() -> u64 {
+    300
+}
+fn default_backend_auth() -> BackendAuth {
+    BackendAuth::None
+}
 fn default_config_version() -> u32 {
     CONFIG_VERSION
 }
@@ -747,6 +919,27 @@ pub fn load_config_with_override(
 }
 
 impl HarnessConfig {
+    /// Read the optional tenant telemetry bearer token using the same
+    /// owner-only secret-file checks as backend credentials.
+    pub fn tenant_otel_authorization(&self) -> Result<Option<axum::http::HeaderValue>, String> {
+        let token = crate::pipeline::read_secret(
+            None,
+            self.otel_tenant_auth_file.as_deref(),
+            "tenant OTEL bearer token",
+        )
+        .map_err(|error| error.to_string())?;
+        token
+            .map(|token| {
+                let mut header =
+                    axum::http::HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| {
+                        "tenant OTEL bearer token cannot be represented as an HTTP header".to_owned()
+                    })?;
+                header.set_sensitive(true);
+                Ok(header)
+            })
+            .transpose()
+    }
+
     /// Parse from TOML, validating the version and structural sanity.
     pub fn from_toml(s: &str) -> Result<Self, String> {
         Self::check_declared_version(s)?;
@@ -807,21 +1000,20 @@ impl HarnessConfig {
     }
 
     /// Effective graceful-shutdown drain budget. Explicit
-    /// `shutdown_drain_timeout_s` wins; otherwise derive
-    /// `max(30, upstream_read_timeout_s + 5)` — falling back to the
-    /// pipeline's own [`DEFAULT_UPSTREAM_READ_TIMEOUT_S`] when the
-    /// field is unset — so one legitimate in-flight request cannot
-    /// exceed the drain window (§8.8). Two different defaults here (30
-    /// in the derivation, 60 in the pipeline) previously let a 60 s
-    /// upstream read outlive a 30 s drain and get truncated by the
-    /// drain deadline while the config was still `None` on both sides.
+    /// `shutdown_drain_timeout_s` wins; otherwise allow the greater of one
+    /// upstream read-idle window and the total MCP network deadline, plus
+    /// five seconds, with a 30-second floor. Long streamed chat responses
+    /// and audit work are still subject to this shutdown deadline.
     pub fn effective_drain_timeout(&self) -> std::time::Duration {
         let read_timeout_s = self
             .upstream_read_timeout_s
             .unwrap_or(DEFAULT_UPSTREAM_READ_TIMEOUT_S);
+        let mcp_timeout_s = self
+            .mcp_request_timeout_s
+            .unwrap_or(DEFAULT_MCP_REQUEST_TIMEOUT_S);
         let seconds = self
             .shutdown_drain_timeout_s
-            .unwrap_or_else(|| read_timeout_s.saturating_add(5).max(30));
+            .unwrap_or_else(|| read_timeout_s.max(mcp_timeout_s).saturating_add(5).max(30));
         std::time::Duration::from_secs(seconds)
     }
 
@@ -1066,6 +1258,9 @@ impl HarnessConfig {
         }
         if matches!(self.vector(), Ok(VectorBackend::Qdrant { .. })) {
             require(cfg!(feature = "qdrant"), "vector_backend", "qdrant", "qdrant");
+        }
+        if self.otel_tenant_endpoint.is_some() {
+            require(cfg!(feature = "otel"), "otel_tenant_endpoint", "<set>", "otel");
         }
         missing
     }
@@ -1575,17 +1770,32 @@ impl HarnessConfig {
                 // redis crate accepts and the doctor's
                 // `probe_endpoint_any` already recognizes. Split on
                 // ',' and validate each member independently.
-                for member in endpoint.split(',').map(str::trim).filter(|m| !m.is_empty()) {
+                let mut previous_tls = None;
+                for (index, member) in endpoint.split(',').map(str::trim).enumerate() {
                     let ok = member.starts_with("redis://")
                         || member.starts_with("rediss://")
                         || member.starts_with("unix:")
                         || member.starts_with("redis+unix:");
                     if !ok {
                         errors.push(format!(
-                            "state_endpoint (redis backend) member {member:?} must be \
-                             redis://, rediss://, unix:, or redis+unix: (got {member:?} in {endpoint:?})"
+                            "state_endpoint (redis backend) member {} must be \
+                             redis://, rediss://, unix:, or redis+unix:",
+                            index + 1
                         ));
                     }
+                    let tls = member.starts_with("rediss://");
+                    if tls
+                        && member
+                            .split_once('#')
+                            .is_some_and(|(_, fragment)| fragment == "insecure")
+                    {
+                        errors
+                            .push("state_endpoint cannot disable Redis TLS certificate verification".into());
+                    }
+                    if previous_tls.is_some_and(|previous| previous != tls) {
+                        errors.push("state_endpoint cluster members must all use the same transport".into());
+                    }
+                    previous_tls = Some(tls);
                 }
             }
             Ok(StateBackend::Memory) => {}
@@ -1667,10 +1877,18 @@ impl HarnessConfig {
             }
             interval_fields.push(("upstream_read_timeout_s", read_timeout));
         }
+        if let Some(timeout) = self.mcp_request_timeout_s {
+            if timeout == 0 {
+                errors.push(
+                    "mcp_request_timeout_s = 0 would time out every outbound MCP request immediately — omit the key to use the built-in 60 s default".into(),
+                );
+            }
+            interval_fields.push(("mcp_request_timeout_s", timeout));
+        }
         if let Some(drain) = self.shutdown_drain_timeout_s {
             if drain == 0 {
                 errors.push(
-                    "shutdown_drain_timeout_s = 0 would abandon every in-flight request at shutdown — omit the key to derive it from upstream_read_timeout_s".into(),
+                    "shutdown_drain_timeout_s = 0 would abandon every in-flight request at shutdown — omit the key to derive it from the upstream read-idle and MCP request timeouts".into(),
                 );
             }
             interval_fields.push(("shutdown_drain_timeout_s", drain));
@@ -1793,6 +2011,205 @@ impl HarnessConfig {
         // The qdrant_url / state_endpoint / bridge_endpoint scheme
         // allowlists live in the typed-backend block above, running
         // against the resolved companion values.
+
+        // ── Pillar 2: intent mapping / AuthZEN ──────────────────────
+        if self.require_intent_mapping && self.intent_map.is_empty() {
+            errors.push(
+                "require_intent_mapping is true but intent_map is empty; every tool call \
+                 would be denied with UNMAPPED_TOOL"
+                    .into(),
+            );
+        }
+        if self.intent_token_ttl_s == 0 {
+            errors.push("intent_token_ttl_s must be > 0".into());
+        }
+        if self.intent_token_ttl_s > 900 {
+            errors.push(
+                "intent_token_ttl_s exceeds the 900 s ceiling; intent tokens must be short-lived".into(),
+            );
+        }
+        if let Some(ref mission) = self.mission {
+            let now_s = av_core::time::now_ms() / 1000;
+            if mission.expires_at <= now_s {
+                tracing::warn!(
+                    mission_id = %mission.id,
+                    expires_at = mission.expires_at,
+                    now = now_s,
+                    "mission is already expired; the PDP will deny every call \
+                     until the mission is removed or updated"
+                );
+            }
+            if mission.allowed_intents.is_empty() {
+                errors.push(format!(
+                    "mission {:?} has no allowed_intents; every call would be denied",
+                    mission.id
+                ));
+            }
+        }
+
+        // ── Pillar 3: token exchange ────────────────────────────────
+        if self
+            .token_exchange_seed_file
+            .as_ref()
+            .is_some_and(|path| path.trim().is_empty())
+        {
+            errors.push(
+                "token_exchange_seed_file must not be empty; omit it when token signing is disabled".into(),
+            );
+        }
+        if self.token_exchange_enabled && self.token_exchange_seed_file.is_none() {
+            errors.push(
+                "token_exchange_enabled is true but token_exchange_seed_file is not set; \
+                 the /v1/token endpoint has no key to sign exchanged tokens with"
+                    .into(),
+            );
+        }
+        let has_identity_source = self
+            .identity_jwks_url
+            .as_deref()
+            .is_some_and(|url| !url.is_empty())
+            || self
+                .identity_hmac_secret_file
+                .as_deref()
+                .is_some_and(|path| !path.is_empty());
+        if self.token_exchange_enabled && !has_identity_source {
+            errors.push(
+                "token_exchange_enabled is true but neither identity_jwks_url nor \
+                 identity_hmac_secret_file is set; the /v1/token endpoint cannot validate \
+                 subject tokens"
+                    .into(),
+            );
+        }
+        if self.token_exchange_enabled && self.backends.is_empty() {
+            errors.push(
+                "token_exchange_enabled is true but no [[backends]] are configured; the \
+                 gateway signs exchanged tokens only for configured backend names, so every \
+                 exchange would be refused with invalid_target"
+                    .into(),
+            );
+        }
+        if self.token_exchange_ttl_s == 0 {
+            errors.push("token_exchange_ttl_s must be > 0".into());
+        }
+        if self.token_exchange_ttl_s > 900 {
+            errors.push(format!(
+                "token_exchange_ttl_s = {} exceeds the 900 s ceiling; \
+                 exchanged tokens must be short-lived",
+                self.token_exchange_ttl_s
+            ));
+        }
+        let has_exchange_backend = self
+            .backends
+            .iter()
+            .any(|b| matches!(b.auth, BackendAuth::Exchange));
+        if has_exchange_backend && self.token_exchange_seed_file.is_none() {
+            errors.push(
+                "a backend uses auth = \"exchange\" but token_exchange_seed_file is not set; \
+                 the gateway cannot sign exchanged tokens without a seed"
+                    .into(),
+            );
+        }
+        if has_exchange_backend && !self.require_identity {
+            errors.push(
+                "a backend uses auth = \"exchange\" but require_identity is false; \
+                 the gateway needs a validated caller identity to perform token exchange"
+                    .into(),
+            );
+        }
+        errors.extend(crate::backend::validate_configs(&self.backends));
+        if !self.redaction_patterns.is_empty() || !self.redaction_paths.is_empty() {
+            if let Err(error) = av_redact::RedactionEngine::new(av_redact::RedactionConfig {
+                regex_patterns: self.redaction_patterns.clone(),
+                pointer_paths: self.redaction_paths.clone(),
+                ..av_redact::RedactionConfig::default()
+            }) {
+                errors.push(format!("invalid redaction configuration: {error}"));
+            }
+        }
+        if let Some(endpoint) = &self.otel_tenant_endpoint {
+            if let Err(error) = crate::backend::validate_http_endpoint(endpoint, "otel_tenant_endpoint") {
+                errors.push(error);
+            }
+        }
+        if let Some(path) = &self.otel_tenant_auth_file {
+            if path.trim().is_empty() {
+                errors.push("otel_tenant_auth_file must not be empty".into());
+            }
+            if self.otel_tenant_endpoint.is_none() {
+                errors.push("otel_tenant_auth_file requires otel_tenant_endpoint".into());
+            }
+        }
+        if self.revocation_audit_per_minute == 0 {
+            errors.push("revocation_audit_per_minute must be > 0".into());
+        }
+        let valid_digest = |digest: &str| digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit());
+        let mut operator_names = std::collections::HashSet::new();
+        let mut introspection_backends = std::collections::HashSet::new();
+        let mut credential_digests = std::collections::HashSet::new();
+        if !self.operator_tokens.is_empty() && !has_identity_source {
+            errors.push("operator_tokens requires identity_jwks_url or identity_hmac_secret_file".into());
+        }
+        if !self.introspection_tokens.is_empty() {
+            if !has_identity_source {
+                errors.push(
+                    "introspection_tokens requires identity_jwks_url or identity_hmac_secret_file".into(),
+                );
+            }
+            if self
+                .token_exchange_seed_file
+                .as_deref()
+                .is_none_or(|path| path.trim().is_empty())
+            {
+                errors.push("introspection_tokens requires token_exchange_seed_file".into());
+            }
+        }
+        for token in &self.operator_tokens {
+            if token.name.trim().is_empty() || !operator_names.insert(&token.name) {
+                errors.push("operator_tokens names must be non-empty and unique".into());
+            }
+            if !valid_digest(&token.sha256) {
+                errors.push(format!(
+                    "operator_tokens {:?} sha256 must contain exactly 64 hexadecimal characters",
+                    token.name
+                ));
+            }
+            if !credential_digests.insert(token.sha256.to_ascii_lowercase()) {
+                errors.push(
+                    "operator_tokens and introspection_tokens must use distinct sha256 credential digests"
+                        .into(),
+                );
+            }
+        }
+        for token in &self.introspection_tokens {
+            if !introspection_backends.insert(&token.backend) {
+                errors.push(format!(
+                    "duplicate introspection_tokens backend {:?}",
+                    token.backend
+                ));
+            }
+            let known_backend = self.backends.iter().any(|backend| backend.name == token.backend)
+                || (token.backend == crate::backend::DEFAULT_BACKEND_NAME
+                    && self.backends.is_empty()
+                    && self.tool_upstream_url.is_some());
+            if !known_backend {
+                errors.push(format!(
+                    "introspection_tokens references unknown backend {:?}",
+                    token.backend
+                ));
+            }
+            if !valid_digest(&token.sha256) {
+                errors.push(format!(
+                    "introspection_tokens {:?} sha256 must contain exactly 64 hexadecimal characters",
+                    token.backend
+                ));
+            }
+            if !credential_digests.insert(token.sha256.to_ascii_lowercase()) {
+                errors.push(
+                    "operator_tokens and introspection_tokens must use distinct sha256 credential digests"
+                        .into(),
+                );
+            }
+        }
     }
 
     /// R69 F3 (landed R70): reject a `BudgetSpec` with any `Some(0)`
@@ -1833,6 +2250,202 @@ impl HarnessConfig {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    #[test]
+    fn security_config_rejects_backend_routing_and_redaction_errors_structurally() {
+        let base = HarnessConfig::for_tests("http://upstream", "/tmp/spool", "/tmp/bridge");
+        base.validate().unwrap();
+        for (name, url, tools, expected) in [
+            ("", "http://backend", vec!["read"], "backend name"),
+            ("default", "http://backend", vec!["read"], "reserved"),
+            ("tools", "https:///mcp", vec!["read"], "host"),
+            ("tools", "file:///tmp/mcp", vec!["read"], "http"),
+            ("tools", "http://backend:bad", vec!["read"], "valid URL"),
+            ("tools", "http://backend", vec!["Read"], "lowercase ASCII"),
+            ("tools", "http://backend", vec!["read", "read"], "repeated"),
+        ] {
+            let mut config = base.clone();
+            config.backends = vec![BackendConfig {
+                name: name.into(),
+                url: url.into(),
+                auth: BackendAuth::None,
+                tools: tools.into_iter().map(str::to_owned).collect(),
+            }];
+            assert!(config.validate().unwrap_err().contains(expected));
+        }
+        for (patterns, paths) in [
+            (vec!["["], vec![]),
+            (vec!["REDACTED"], vec![]),
+            (vec![], vec!["password"]),
+        ] {
+            let mut config = base.clone();
+            config.redaction_patterns = patterns.into_iter().map(str::to_owned).collect();
+            config.redaction_paths = paths.into_iter().map(str::to_owned).collect();
+            assert!(config.validate().unwrap_err().contains("redaction"));
+        }
+        for (ttl, expected) in [(0, false), (900, true), (901, false), (u64::MAX, false)] {
+            let mut config = base.clone();
+            config.intent_token_ttl_s = ttl;
+            assert_eq!(config.validate().is_ok(), expected);
+        }
+        let mut empty_seed = base;
+        empty_seed.token_exchange_seed_file = Some(String::new());
+        assert!(empty_seed
+            .validate()
+            .unwrap_err()
+            .contains("token_exchange_seed_file"));
+    }
+
+    #[test]
+    fn security_config_separates_structural_otel_checks_from_build_features() {
+        let mut config = HarnessConfig::for_tests("http://upstream", "/tmp/spool", "/tmp/bridge");
+        config.otel_tenant_endpoint = Some("https://tenant.example/v1/traces".into());
+        config.validate().unwrap();
+        assert_eq!(
+            config
+                .unsupported_backend_requirements()
+                .iter()
+                .any(|error| error.contains("otel")),
+            !cfg!(feature = "otel")
+        );
+        config.otel_tenant_endpoint = Some("tenant.example/traces".into());
+        assert!(config.validate().unwrap_err().contains("otel_tenant_endpoint"));
+        config.otel_tenant_endpoint = None;
+        config.otel_tenant_auth_file = Some("/run/secrets/tenant".into());
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .contains("requires otel_tenant_endpoint"));
+    }
+
+    #[test]
+    fn security_config_validates_operator_and_introspection_credentials() {
+        let mut config = HarnessConfig::for_tests("http://upstream", "/tmp/spool", "/tmp/bridge");
+        config.identity_hmac_secret_file = Some("/run/secrets/identity".into());
+        config.token_exchange_seed_file = Some("/run/secrets/exchange".into());
+        config.backends = vec![BackendConfig {
+            name: "db".into(),
+            url: "http://db".into(),
+            auth: BackendAuth::None,
+            tools: vec![],
+        }];
+        config.operator_tokens = vec![OperatorTokenConfig {
+            name: "operator".into(),
+            sha256: "ab".repeat(32),
+        }];
+        config.introspection_tokens = vec![IntrospectionTokenConfig {
+            backend: "db".into(),
+            sha256: "cd".repeat(32),
+        }];
+        config.validate().unwrap();
+        let good = config.clone();
+        config
+            .operator_tokens
+            .push(config.operator_tokens.first().unwrap().clone());
+        assert!(config.validate().unwrap_err().contains("unique"));
+        config = good.clone();
+        config
+            .introspection_tokens
+            .push(config.introspection_tokens.first().unwrap().clone());
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .contains("duplicate introspection_tokens"));
+        config = good.clone();
+        config.introspection_tokens.first_mut().unwrap().backend = "unknown".into();
+        assert!(config.validate().unwrap_err().contains("unknown backend"));
+        for digest in ["f".repeat(63), "g".repeat(64), "f".repeat(65)] {
+            config = good.clone();
+            config.operator_tokens.first_mut().unwrap().sha256 = digest.clone();
+            config.introspection_tokens.first_mut().unwrap().sha256 = digest;
+            let errors = config.validate().unwrap_err();
+            assert!(errors.contains("operator_tokens"));
+            assert!(errors.contains("introspection_tokens"));
+        }
+        config = good;
+        config.revocation_audit_per_minute = 0;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .contains("revocation_audit_per_minute"));
+    }
+
+    #[test]
+    fn security_config_rejects_reused_control_credentials_and_missing_identity_sources() {
+        let mut config = HarnessConfig::for_tests("http://upstream", "/tmp/spool", "/tmp/bridge");
+        config.identity_hmac_secret_file = Some("/run/secrets/identity".into());
+        config.token_exchange_seed_file = Some("/run/secrets/exchange".into());
+        config.backends = ["db", "search"]
+            .into_iter()
+            .map(|name| BackendConfig {
+                name: name.into(),
+                url: format!("http://{name}"),
+                auth: BackendAuth::None,
+                tools: vec![name.into()],
+            })
+            .collect();
+        config.operator_tokens = vec![OperatorTokenConfig {
+            name: "operator".into(),
+            sha256: "ab".repeat(32),
+        }];
+        config.introspection_tokens = vec![IntrospectionTokenConfig {
+            backend: "db".into(),
+            sha256: "cd".repeat(32),
+        }];
+        config.validate().unwrap();
+        let valid = config.clone();
+
+        config.operator_tokens.push(OperatorTokenConfig {
+            name: "second-operator".into(),
+            sha256: "AB".repeat(32),
+        });
+        assert!(config.validate().unwrap_err().contains("distinct sha256"));
+        config = valid.clone();
+        config.introspection_tokens.push(IntrospectionTokenConfig {
+            backend: "search".into(),
+            sha256: "CD".repeat(32),
+        });
+        assert!(config.validate().unwrap_err().contains("distinct sha256"));
+        config = valid.clone();
+        config.introspection_tokens.first_mut().unwrap().sha256 = config
+            .operator_tokens
+            .first()
+            .unwrap()
+            .sha256
+            .to_ascii_uppercase();
+        assert!(config.validate().unwrap_err().contains("distinct sha256"));
+
+        config = valid.clone();
+        config.identity_hmac_secret_file = None;
+        let errors = config.validate().unwrap_err();
+        assert!(errors.contains("operator_tokens requires identity"));
+        assert!(errors.contains("introspection_tokens requires identity"));
+        config = valid;
+        config.token_exchange_seed_file = None;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .contains("introspection_tokens requires token_exchange_seed_file"));
+        config.introspection_tokens.clear();
+        config.validate().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn security_config_loads_tenant_auth_with_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("tenant-token");
+        std::fs::write(&path, "tenant-secret\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut config = HarnessConfig::for_tests("http://upstream", "/tmp/spool", "/tmp/bridge");
+        config.otel_tenant_auth_file = Some(path.to_string_lossy().into_owned());
+        let header = config.tenant_otel_authorization().unwrap().unwrap();
+        assert_eq!(header, "Bearer tenant-secret");
+        assert!(header.is_sensitive());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(config.tenant_otel_authorization().is_err());
+    }
 
     /// Register item 25: docs/reference/CONFIGURATION.md claims to be
     /// the configuration reference, yet 29 of 63 fields (including
@@ -2790,13 +3403,44 @@ mod tests {
              cluster network reachability, so any workload with Service access \
              could otherwise enumerate sessions/costs/receipts (register item 4)"
         );
+        assert!(config.require_identity, "K8s workloads must authenticate callers");
         assert!(
-            config.allow_wildcard_bind,
-            "K8s ConfigMap MUST carry allow_wildcard_bind = true (paired with \
-             the 0.0.0.0 listen + require_identity = false posture); config \
-             validation refuses the combination otherwise and the daemon \
-             CrashLoopBackOffs at boot"
+            !config.allow_wildcard_bind,
+            "anonymous wildcard binding must not be enabled"
         );
+        assert_eq!(config.audience, "agentvisor-ai");
+        assert_eq!(
+            config.identity_hmac_secret_file.as_deref(),
+            Some("/etc/agentvisor-ai/identity.hmac")
+        );
+        assert_eq!(
+            config.state_backend, "redis",
+            "production revocations must survive restart"
+        );
+        assert_eq!(
+            config.state_endpoint.as_deref(),
+            Some("rediss://redis.example.invalid:6379")
+        );
+        assert!(yaml.contains("name: AV_STATE_ENDPOINT"));
+        assert!(yaml.contains("name: agentvisor-ai-state"));
+        assert!(yaml.contains("key: redis-url"));
+    }
+
+    #[test]
+    fn shipped_cloudfoundry_config_requires_identity_and_durable_revocations() {
+        let config = HarnessConfig::from_toml(include_str!("../../../deploy/cloudfoundry/harness.toml"))
+            .expect("Cloud Foundry configuration must validate");
+        assert!(config.require_identity);
+        assert!(!config.dashboard_enabled);
+        assert!(!config.allow_wildcard_bind);
+        assert_eq!(config.audience, "agentvisor-ai");
+        assert_eq!(config.state_backend, "redis");
+        assert_eq!(
+            config.state_endpoint.as_deref(),
+            Some("rediss://redis.example.invalid:6379")
+        );
+        let manifest = include_str!("../../../deploy/cloudfoundry/manifest.yml");
+        assert!(manifest.contains("AV_STATE_ENDPOINT: ((redis_url))"));
     }
 
     /// The K8s manifest ships a specific `terminationGracePeriodSeconds`
@@ -2861,6 +3505,24 @@ mod tests {
             extract_yaml_grace_seconds(compose, "stop_grace_period:").unwrap(),
             // Docker compose has no preStop equivalent.
             0,
+        );
+    }
+
+    #[test]
+    fn shipped_full_docker_config_disables_unauthenticated_dashboard() {
+        let config = HarnessConfig::from_toml(include_str!("../../../config/harness.docker.toml")).unwrap();
+        assert!(config.require_identity, "full-stack callers must authenticate");
+        assert!(
+            config.enforce_identity_scopes,
+            "full-stack callers need operation scopes"
+        );
+        assert!(
+            !config.dashboard_enabled,
+            "Compose peers can reach the listener without the host loopback port mapping"
+        );
+        assert!(
+            !config.allow_wildcard_bind,
+            "the authenticated full stack must not bypass the wildcard safety guards"
         );
     }
 
@@ -3394,6 +4056,31 @@ spec:
         .is_ok());
     }
 
+    #[test]
+    fn mcp_request_timeout_is_positive_and_bounded() {
+        let default = HarnessConfig::from_toml(r#"upstream_url = "https://api""#).unwrap();
+        assert_eq!(
+            default
+                .mcp_request_timeout_s
+                .unwrap_or(DEFAULT_MCP_REQUEST_TIMEOUT_S),
+            60
+        );
+        for invalid in [0, MAX_SECONDS_INTERVAL + 1] {
+            let error = HarnessConfig::from_toml(&format!(
+                "upstream_url = \"https://api\"\nmcp_request_timeout_s = {invalid}"
+            ))
+            .unwrap_err();
+            assert!(error.contains("mcp_request_timeout_s"), "{error}");
+        }
+        for valid in [1, DEFAULT_MCP_REQUEST_TIMEOUT_S, MAX_SECONDS_INTERVAL] {
+            let config = HarnessConfig::from_toml(&format!(
+                "upstream_url = \"https://api\"\nmcp_request_timeout_s = {valid}"
+            ))
+            .unwrap();
+            assert_eq!(config.mcp_request_timeout_s, Some(valid));
+        }
+    }
+
     /// Refuse `enforce_identity_scopes = true` while
     /// `require_identity = false`. The combo silently falls through
     /// to the anonymous identity on unauthenticated requests,
@@ -3423,41 +4110,28 @@ spec:
         .is_ok());
     }
 
-    /// §8.8: the graceful-drain budget must key off the longest
-    /// legitimate in-flight request instead of a hardcoded 30 s.
+    /// Shutdown derives from both network timeout settings. Read-idle
+    /// padding does not promise that a whole chat stream can finish.
     #[test]
     fn drain_timeout_derives_from_upstream_read_timeout() {
-        // Unset drain + unset read timeout: falls back to the pipeline's
-        // DEFAULT_UPSTREAM_READ_TIMEOUT_S (60 s) so a legitimate
-        // in-flight request cannot outlive the derived drain. Using
-        // separate defaults (30 in the derivation, 60 in the pipeline)
-        // let a live 60 s read get truncated by a 30 s drain — the
-        // exact "one in-flight request cannot exceed the drain window"
-        // invariant this function's doc-comment promises.
         let base = HarnessConfig::for_tests("http://127.0.0.1:9", "/tmp", "/tmp");
-        assert_eq!(
-            base.effective_drain_timeout().as_secs(),
-            DEFAULT_UPSTREAM_READ_TIMEOUT_S.saturating_add(5),
-            "unset drain must derive from the SAME default the pipeline uses"
-        );
-        // Unset drain + 300 s read timeout → 305 s (one in-flight
-        // request can never legitimately outlive the drain window).
-        let mut derived = HarnessConfig::for_tests("http://127.0.0.1:9", "/tmp", "/tmp");
+        assert_eq!(base.effective_drain_timeout().as_secs(), 65);
+        let mut derived = base.clone();
         derived.upstream_read_timeout_s = Some(300);
         assert_eq!(derived.effective_drain_timeout().as_secs(), 305);
-        // Unset drain + very small read timeout → 30 s floor (the
-        // documented lower bound; a 5 s read + 5 s doesn't leave enough
-        // slack for shutdown-side work).
-        let mut short = HarnessConfig::for_tests("http://127.0.0.1:9", "/tmp", "/tmp");
+        derived.mcp_request_timeout_s = Some(600);
+        assert_eq!(derived.effective_drain_timeout().as_secs(), 605);
+        // A short read-idle setting must not shrink the MCP deadline.
+        let mut short = base.clone();
         short.upstream_read_timeout_s = Some(10);
+        assert_eq!(short.effective_drain_timeout().as_secs(), 65);
+        short.mcp_request_timeout_s = Some(10);
         assert_eq!(short.effective_drain_timeout().as_secs(), 30);
-        // Explicit value always wins.
-        let mut explicit = HarnessConfig::for_tests("http://127.0.0.1:9", "/tmp", "/tmp");
-        explicit.upstream_read_timeout_s = Some(300);
+        // An operator-supplied shutdown limit still takes precedence.
+        let mut explicit = derived;
         explicit.shutdown_drain_timeout_s = Some(110);
         assert_eq!(explicit.effective_drain_timeout().as_secs(), 110);
-        // Zero is refused at validate.
-        let mut zero = HarnessConfig::for_tests("http://127.0.0.1:9", "/tmp", "/tmp");
+        let mut zero = base;
         zero.shutdown_drain_timeout_s = Some(0);
         assert!(zero.validate().unwrap_err().contains("shutdown_drain_timeout_s"));
     }
@@ -3598,9 +4272,26 @@ spec:
         HarnessConfig::from_toml(
             r#"upstream_url = "https://api"
                state_backend = "redis"
-               state_endpoint = "redis://a:6379,rediss://b:6380""#,
+               state_endpoint = "rediss://a:6379,rediss://b:6380""#,
         )
         .unwrap();
+        for endpoint in [
+            "redis://a:6379,rediss://b:6380",
+            "rediss://a:6379/#insecure",
+            "redis://a:6379,",
+            "",
+            "http://user:fixture-secret@cache:6379",
+        ] {
+            let err = HarnessConfig::from_toml(&format!(
+                "upstream_url = \"https://api\"\nstate_backend = \"redis\"\nstate_endpoint = {endpoint:?}"
+            ))
+            .unwrap_err();
+            assert!(err.contains("state_endpoint"), "{err}");
+            assert!(
+                !err.contains("fixture-secret"),
+                "configuration errors must not expose credentials"
+            );
+        }
         // redis+unix: is a legitimate Unix-socket form
         // the redis crate accepts; validate must not reject it.
         HarnessConfig::from_toml(

@@ -1,0 +1,23 @@
+# Edit the identity provider, issuer, and audience before building the CF image.
+# The reserved .invalid hostname prevents accidental trust in a real provider.
+config_version = 1
+listen = "0.0.0.0:8484"
+upstream_url = "https://api.openai.com"
+require_identity = true
+enforce_identity_scopes = true
+identity_jwks_url = "https://identity.example.invalid/.well-known/jwks.json"
+identity_allowed_issuers = ["https://identity.example.invalid"]
+audience = "agentvisor-ai"
+dashboard_enabled = false
+default_workflow = "signed"
+atif_spool_dir = "/app/spool/atif"
+bridge_data_dir = "/app/data/bridge"
+bridge_backend = "embedded"
+tool_schema_dir = "/app/config/tool-schemas"
+wasm_policy_paths = ["/app/config/policies/payload_limit.wat"]
+# The required manifest variable supplies AV_STATE_ENDPOINT at runtime.
+state_backend = "redis"
+state_endpoint = "rediss://redis.example.invalid:6379"
+embedder_backend = "hash"
+vector_backend = "memory"
+shutdown_drain_timeout_s = 30

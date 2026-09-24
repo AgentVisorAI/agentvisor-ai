@@ -1,6 +1,8 @@
 .git
 .gitignore
 target
+**/node_modules
+**/__pycache__
 spool
 data
 # Any per-directory dotenv or secret bundle: keep the build context clean even

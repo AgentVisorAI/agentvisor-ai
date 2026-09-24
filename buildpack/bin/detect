@@ -1,0 +1,15 @@
+#!/bin/sh
+set -eu
+# Classic CF detects only a final buildpack. This component must be listed
+# explicitly before the application's language buildpack and never selected alone.
+if [ -z "${CNB_PLATFORM_DIR:-}" ] && [ "$#" -lt 2 ]; then
+    exit 1
+fi
+CNB_PLATFORM_DIR=${CNB_PLATFORM_DIR:-${1:-/platform}}
+export CNB_PLATFORM_DIR
+buildpack_dir=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+# shellcheck source=buildpack/lib/binding.sh
+. "$buildpack_dir/lib/binding.sh"
+binding=$(read_binding)
+[ "$binding" != null ] || exit 100
+printf 'agentvisor\n'

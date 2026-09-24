@@ -217,7 +217,13 @@ export async function oauthRoutes(app: FastifyInstance): Promise<void> {
       return errRedirect("oauth_provider_not_configured");
     }
 
-    const cfg = await getConfig(p);
+    let cfg: oidc.Configuration;
+    try {
+      cfg = await getConfig(p);
+    } catch (err) {
+      req.log.warn({ err, provider: p.id }, "oauth_discovery_failed");
+      return errRedirect("oauth_provider_unavailable");
+    }
     const codeVerifier = oidc.randomPKCECodeVerifier();
     const codeChallenge = await oidc.calculatePKCECodeChallenge(codeVerifier);
     const state = oidc.randomState();
@@ -311,7 +317,13 @@ export async function oauthRoutes(app: FastifyInstance): Promise<void> {
     if (!p) {
       return errRedirect("oauth_provider_not_configured");
     }
-    const cfg = await getConfig(p);
+    let cfg: oidc.Configuration;
+    try {
+      cfg = await getConfig(p);
+    } catch (err) {
+      req.log.warn({ err, provider: p.id }, "oauth_discovery_failed");
+      return errRedirect("oauth_provider_unavailable");
+    }
 
     // R97 F-D: reconstruct the callback URL from APP_BASE_URL,
     // not from raw request headers. Prior shape read

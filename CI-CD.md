@@ -7,151 +7,202 @@ how updates land, how backups escape any single provider.
 
 ```
         ┌─────────────────────────────────────────────────────────────┐
-        │  Push to a branch / open a PR                               │
+        │  Push to main / open a PR                                   │
         └──────────────────────────┬──────────────────────────────────┘
                                    │
       ┌────────────────────────────┼───────────────────────────┐
       ▼                            ▼                           ▼
  ┌────────────┐            ┌────────────────┐        ┌────────────────┐
  │ ci.yml     │            │ console-api.yml│        │ deploy.yml     │
- │ Rust check │            │ SPA + backend  │        │ Build → scan → │
- │ + tests    │            │ smoke + e2e    │        │ SBOM → sign →  │
- │            │            │ docker image   │        │ push GHCR      │
+ │ Rust check │            │ SPA + backend  │        │ Build → test → │
+ │ + tests    │            │ smoke + e2e    │        │ scan → attest │
+ │            │            │ docker image   │        │ → promote      │
  └────────────┘            └────────────────┘        └───────┬────────┘
                                                              │
               ┌──────────────────────────────────────────────┤
               ▼                                              ▼
      ┌────────────────────┐                       ┌────────────────────┐
-     │ On PR: sticky      │                       │ On main: Fly.io    │
-     │ comment with       │                       │ rolling deploy     │
-     │ pull/run + Render  │                       │ (opt-in via        │
-     │ / Fly instructions │                       │ FLY_API_TOKEN)     │
+     │ On PR: read-only   │                       │ On main: Fly.io    │
+     │ API/runtime checks │                       │ rolling deploy     │
+     │ and downloadable   │                       │ (opt-in via        │
+     │ image + evidence   │                       │ FLY_API_TOKEN)     │
      └────────────────────┘                       └────────────────────┘
 
 Nightly (04:17 UTC)         Weekly (Mon 06:00 UTC)
  backup.yml                  Dependabot
- pg_dump → artifact          npm / cargo / actions / docker
+ pg_dump → verified encryption → artifact          npm / cargo / actions / docker
  30-day retention            → patch auto-merge, minor+ needs review
 ```
 
 ## The workflows in detail
 
-| Workflow | Runs on | Purpose | Free-tier cost |
-|---|---|---|---|
-| `.github/workflows/ci.yml` | push to main, all PRs | Rust workspace fmt / clippy / tests, live contract services, cargo-deny already gates supply chain | 20-30 runner-minutes |
-| `.github/workflows/console-api.yml` | push/PR touching `docs/app/**` or `server/**` | Console syntax check, TypeScript typecheck, Prisma migration deploy against a fresh PG, Python smoke + Node e2e, Docker image build | 5 runner-minutes |
-| `.github/workflows/deploy.yml` | push to main (`server/**`) + PRs + manual | Build multi-arch image (amd64+arm64) → Trivy scan → SPDX SBOM → SLSA v1 provenance → push GHCR → (if `FLY_API_TOKEN`) Fly rolling deploy → PR preview comment | 5 runner-minutes |
-| `.github/workflows/pages.yml` | push to main | Rustdoc + docs SPA + `.well-known/security.txt` → GitHub Pages | 3 runner-minutes |
-| `.github/workflows/deny.yml` | push to main, all PRs | cargo-deny CVE / license / duplicate check | 2 runner-minutes |
-| `.github/workflows/publish-crates.yml` | tag `av-*-vX.Y.Z` | Publish crates to crates.io | On-demand |
-| `.github/workflows/release.yml` | tag `vX.Y.Z` | Build cross-platform release binaries + GH release | On-demand |
-| `.github/workflows/dependabot-automerge.yml` | Dependabot PRs | Approve + auto-merge patch bumps (and SHA-pinned minor bumps) once CI is green | Seconds |
-| `.github/workflows/backup.yml` | daily 04:17 UTC + manual | pg_dump against `$BACKUP_DATABASE_URL` → 30-day artifact | ~1 runner-minute/day |
+| Workflow | Runs on | Purpose |
+|---|---|---|
+| `.github/workflows/ci.yml` | push to main, all PRs | Rust workspace checks, tests, and live contract services |
+| `.github/workflows/console-api.yml` | push to main, all PRs | Console syntax and TypeScript checks, API and browser tests, two-instance recovery, daemon crash synchronization, container runtime checks, and encrypted backup/restore tests |
+| `.github/workflows/deploy.yml` | main pushes and PRs matching console/release-tool paths; manual runs | Build local OCI archives, test and scan each platform, promote verified bytes on main, then optionally deploy the exact digest to Fly |
+| `.github/workflows/pages.yml` | main pushes matching its source/docs path filters; manual runs | Rustdoc and the docs SPA to GitHub Pages |
+| `.github/workflows/deny.yml` | push to main, all PRs | cargo-deny advisory, license, and duplicate checks |
+| `.github/workflows/publish-crates.yml` | tag `av-*-vX.Y.Z` | Publish crates to crates.io |
+| `.github/workflows/release.yml` | tag `vX.Y.Z` | Build release binaries and a GitHub release |
+| `.github/workflows/dependabot-automerge.yml` | Dependabot PRs | Approve and enable auto-merge for eligible dependency updates after required checks pass |
+| `.github/workflows/backup.yml` | daily 04:17 UTC; manual runs | Verify and encrypt a PostgreSQL dump, then upload the ciphertext with 30-day retention |
 
-Everything is pinned by commit SHA — a tag rewrite (see the March 2025
-tj-actions/changed-files incident) cannot silently substitute code into
-our pipeline.
+Third-party GitHub Actions are pinned by commit SHA. This does not imply
+that every downloaded tool, image tag, or hosted runner is immutable.
+
+The Rust workflow also requires the delayed-Redis introspection regression on
+every pull request and main push. A separate job builds the daemon with Redis
+support, starts its own authenticated Redis process, and verifies that a token
+which expires during a revocation read returns only `active: false`. The
+11-check drill removes its processes and private credentials and retains only
+its result and diagnostic logs in the `introspection-expiry` artifact for 14 days.
 
 ## Container image lifecycle
 
-Every push to `main` produces an OCI image at `ghcr.io/agentvisorai/agentvisor-api`
-with three tags:
+`deploy.yml` runs for changes to the console, its datasource/runtime checks,
+the release-policy helper/tests, or the workflow itself. It can also be
+started manually. Pull requests build and validate amd64 with read-only
+permissions. Main and manual runs validate amd64 and arm64 on separate native
+runners. No validation job logs in to GHCR or receives registry, OIDC, or
+attestation write permissions.
 
-| Tag | When it moves | Use it for |
+The same run also calls the complete console regression workflow. Its
+authentication, database recovery, browser, backup, and daemon synchronization
+checks must succeed before the promotion job can start.
+
+Notification recovery tests run against both the TypeScript source and the
+compiled module inside the production image. A controlled PostgreSQL protocol
+peer stalls setup, publication, and listener traffic to exercise deadlines,
+queue limits, reconnection, and tenant isolation using the installed database
+driver. These fault-injection tests complement the separate real PostgreSQL
+outage and recovery drill; they do not simulate database durability.
+
+Each platform produces an OCI archive containing its BuildKit provenance and
+SPDX attestations. The runner checks the archive graph and architecture,
+loads its runnable image, and compares its configuration and filesystem
+hashes before executing the API and startup checks. Trivy 0.74.0 is pinned by its
+multi-platform image digest, matching the locally validated scanner. It writes a complete
+report with all severities and unfixed findings; the policy then rejects
+fixable HIGH/CRITICAL findings, missing reports, and reports for another image.
+A separate SPDX inventory, test logs, archive checksum, source revision, and
+workflow run identity travel with the validated archive.
+
+Only a successful push or manual run on the current `main` revision in a
+non-fork repository may promote images. The promotion job first rechecks
+both platforms and their artifact hashes, then logs in to GHCR. It copies
+the archives without rebuilding, preserves their digests, and verifies that
+the merged index contains exactly their runtime and attestation descriptors.
+Public repositories attach GitHub-signed provenance to that index and signed
+SPDX inventories to each platform index before deployable tags move. Private
+repositories retain the embedded BuildKit metadata and downloadable SPDX
+inventories, but skip those GitHub-signed attestations.
+
+| Reference | Behavior | Use |
 |---|---|---|
-| `:latest` | Every push to main | Prod deploys (rolling) |
-| `:main` | Every push to main | Sticky reference from Render/Railway/Koyeb blueprints |
-| `:sha-<7>` | Once, never moves | Reproducible + rollback target |
+| `:validated-<run>-<attempt>[-<arch>]` | Receives already tested bytes while the promotion job verifies and attests them | Internal staging reference; its existence does not prove promotion completed |
+| `:latest`, `:main` | Updated only after both platforms and required attestations pass | Convenience references; record the resulting digest |
+| `:sha-<full revision>` | Identifies source but can change after an approved rebuild | Find a release, then record its digest |
+| `@sha256:<digest>` | Identifies immutable image content | Pin the promoted deployment or rollback target |
 
-Every PR produces an ephemeral tag:
+A failed build, runtime check, scan, or artifact verification cannot update
+these deployable tags. Registry tag updates are separate requests, so a
+publication interruption may update only some tags; every updated tag still
+points to validated bytes. Fly runs only after all tag copies and digest
+checks succeed, and uses the exact digest output rather than a mutable tag.
+No image rebuild occurs between testing and deployment.
 
-| Tag | Retention | Use it for |
-|---|---|---|
-| `:pr-<num>-sha-<7>` | 7 days on GHCR | Preview deploys, reviewer sanity check |
+The `console-evidence-<arch>` artifacts retain available reports even when a
+validation step fails. Successful archives are kept as
+`console-release-<arch>` artifacts for seven days. The `console-promotion`
+artifact records the selected index and copy digests. No PR preview tag or
+write-permission comment is published. Unfixed vulnerabilities remain visible
+and require release review; passing the policy is not a zero-findings claim.
 
-Attached to every image (as OCI referrers, verifiable with `gh attestation verify`):
-
-1. **SLSA v1 build provenance** — proves the image came from this repo,
-   this commit, this workflow run.
-2. **SPDX SBOM** — every package in the image, machine-readable.
-
-Verify from a shell:
+When the public-repository attestation steps ran, verify the promoted index:
 
 ```bash
+# Set IMAGE_DIGEST to the promoted sha256:... digest from the workflow.
 gh attestation verify \
-  oci://ghcr.io/agentvisorai/agentvisor-api:sha-<7> \
+  "oci://ghcr.io/agentvisorai/agentvisor-api@${IMAGE_DIGEST:?}" \
   --owner AgentVisorAI
 ```
 
+The copy boundary uses Skopeo's [digest-preserving OCI copy](https://github.com/containers/skopeo/blob/main/docs/skopeo-copy.1.md)
+and Docker's [multiarch index operations](https://docs.docker.com/reference/cli/docker/buildx/imagetools/create/).
+These controls preserve and identify the tested bytes; they do not establish
+reproducible builds or an independently certified SLSA level.
+
 ## Deploying
 
-The recommended production target is Fly.io (rolling deploys, free tier
-absorbs the pitch demo). Any container host works.
+The workflow supports an optional Fly.io deployment. Other container hosts
+can use the same OCI image. Configure the database, HTTPS origins, mailer,
+application secrets, and host networking before the first deployment; see
+[the deployment guide](server/DEPLOY.md). Local tests do not establish
+availability or capacity on a selected production host.
 
-### Automated (Fly.io on push to main)
+### Automated (Fly.io on a matching push to main)
 
-Once `FLY_API_TOKEN` is added as a repository secret:
+With `FLY_API_TOKEN` configured as a repository secret:
 
-1. Push to main → deploy.yml builds + scans the image, pushes GHCR.
-2. `deploy-fly` job fires `fly deploy --image ghcr.io/…@<digest> --strategy rolling`.
-3. Fly rolls one machine at a time, waits for the healthcheck, moves on.
-4. Zero downtime, sub-second cutover per machine.
+1. A matching main push validates both local platform archives, then the promotion job copies and verifies their bytes before updating deployable tags.
+2. After promotion succeeds, `deploy-fly` runs `fly deploy` with the exact verified image digest and `--strategy rolling`.
+3. The platform replaces machines using its configured health checks.
 
-Without `FLY_API_TOKEN`, the deploy-fly job is a documented no-op. The
-image still lands in GHCR so any operator can `fly deploy --image …`
-manually — or point Render / Railway / Koyeb at the same tag.
+Availability during replacement depends on healthy replicas, spare capacity,
+readiness checks, and the deployment configuration. No downtime or cutover
+latency guarantee has been measured here. Without `FLY_API_TOKEN`, the Fly
+step skips deployment; the image remains available in GHCR.
 
-### Manual (any other host)
+### Manual (an already configured host)
+
+Use the digest of a build whose checks have passed. These commands assume
+that the target application and its required configuration already exist.
 
 ```bash
-# Fly
-fly deploy --image ghcr.io/agentvisorai/agentvisor-api:sha-<7>
+# Set IMAGE_DIGEST to the reviewed sha256:... digest.
+image_ref="ghcr.io/agentvisorai/agentvisor-api@${IMAGE_DIGEST:?}"
 
-# Render — paste the image URL in the dashboard, or:
-render deploys create --service-id srv-… --image-url ghcr.io/agentvisorai/agentvisor-api:sha-<7>
+# Fly; run from server/ so fly.toml is available.
+(cd server && fly deploy --image "$image_ref")
 
 # Cloud Run
-gcloud run deploy agentvisor-api --image ghcr.io/agentvisorai/agentvisor-api:sha-<7>
+gcloud run deploy agentvisor-api --image "$image_ref"
 
 # Kubernetes
-kubectl set image deployment/agentvisor-api api=ghcr.io/agentvisorai/agentvisor-api:sha-<7>
+kubectl set image deployment/agentvisor-api "api=$image_ref"
 
-# Plain Docker
-docker run -p 8080:8080 -e DATABASE_URL=… -e JWT_SECRET=… \
-  ghcr.io/agentvisorai/agentvisor-api:sha-<7>
+# Plain Docker behind an HTTPS reverse proxy. The private environment file
+# must supply DATABASE_URL, JWT_SECRET, HTTPS APP_BASE_URL, ALLOWED_ORIGINS,
+# and SMTP_URL or RESEND_API_KEY. Configure API_PUBLIC_URL if it differs.
+# Keep this file outside the repository with owner-only read permissions.
+docker run --env-file "${CONSOLE_ENV_FILE:?}" \
+  -p 127.0.0.1:8080:8080 "$image_ref"
 ```
 
-Every path is one command. No platform-native artifact required.
+Provider setup, migrations, secret delivery, and restore compatibility need
+separate validation. An image update command alone does not establish them.
 
 ## Rollback
 
-```bash
-# Fly — the same command, older SHA.
-fly deploy --image ghcr.io/agentvisorai/agentvisor-api:sha-<older>
+Record the previous successful image digest before deploying. From `server/`:
 
-# Or if you already know the machine ID:
-fly machines update <machine-id> --image ghcr.io/agentvisorai/agentvisor-api:sha-<older>
+```bash
+fly deploy --image "ghcr.io/agentvisorai/agentvisor-api@${PREVIOUS_IMAGE_DIGEST:?}"
 ```
 
-Because every commit produces an immutable `:sha-<7>` tag, rollback is
-just re-pointing to a previous digest. No re-build, no cross-branch git
-gymnastics. The rollback is byte-identical to what CI produced when that
-commit landed.
+A digest selects the same image bytes without rebuilding. Source-revision
+tags can be overwritten, so they are not immutable rollback references.
+Check database migration compatibility before rolling back the application.
 
-## Preview deploys (PRs)
+## Pull request validation
 
-Every PR that touches `server/**` triggers `deploy.yml` on the PR
-branch. Once the build finishes, a sticky bot comment lands on the PR
-with:
-
-- The image digest (immutable OCI reference).
-- A `docker run` snippet with the right env vars.
-- A `fly deploy --image …` snippet.
-- A `gh attestation verify` command so reviewers can verify provenance.
-
-Non-technical reviewers can hand the digest to anyone with a Docker
-host to see the change live. Technical reviewers can `docker run` it in
-under a minute.
+Pull requests run the amd64 image's API/startup checks and scan, including
+fork PRs. They request only `contents: read`, do not log in to a registry,
+and cannot reach the promotion or Fly jobs. Downloadable image/evidence
+artifacts replace the old published preview tags and sticky comments.
+An artifact is test evidence, not an approved production release. A manual
+run on a non-main branch also cannot publish or deploy.
 
 ## Continuous updates
 
@@ -178,42 +229,29 @@ bump.
 
 `backup.yml` runs every night at 04:17 UTC:
 
-1. Installs `postgres-client-16` on the runner.
-2. `pg_dump --format=custom --compress=9` against `$BACKUP_DATABASE_URL`.
-3. Uploads the dump as a GitHub-hosted artifact with 30-day retention.
+1. Installs PostgreSQL 18 clients and invokes their versioned binaries.
+2. Runs `scripts/postgres-backup.py` with the database URI and passphrase supplied through environment variables. The helper keeps credentials out of tool arguments and sends the GnuPG passphrase through standard input.
+3. Creates a custom-format dump in a private temporary directory, validates its archive, encrypts it with AES-256, and decrypts it again to verify the original bytes.
+4. Publishes only the verified ciphertext and uploads that single file with 30-day retention. Failures, deadlines, and handled termination remove temporary plaintext and prevent an upload from that step.
 
-This is an off-provider copy — even if Neon disappears overnight, the
-last 30 days of data are restorable via `pg_restore` to any Postgres
-target (self-hosted, Cloud SQL, Supabase, RDS, anywhere). Zero paid
-service in the loop.
+This copy is independent of the database provider. Recovery requires a compatible PostgreSQL target, a matching PostgreSQL 18 restore client, and the passphrase stored in a separate accessible vault. A missing database URL skips the job; a configured URL without a passphrase fails. The helper has a 15-minute deadline, and the whole job has a 25-minute limit.
 
-Longer-horizon backups should push the artifact to S3 / R2 / any object
-store from the same workflow (three lines to add).
+The console CI runs failure and cancellation tests plus an isolated PostgreSQL 18 encrypted backup/restore drill. The drill checks row content, Unicode, JSON, binary data, restored constraints and sequences, and rejection of incorrect passphrases and modified ciphertext. It does not fetch production artifacts or prove that the production vault is accessible.
+
+See [the recovery runbook](docs/RUNBOOK.md) for restoring a scheduled artifact into a separate empty database. Longer retention requires configuring an additional storage destination and testing its retrieval path.
 
 ## Supply-chain hardening summary
 
 - All third-party actions pinned by full commit SHA.
 - Every workflow has a top-level `permissions:` block; jobs opt in.
-- `deploy.yml` uses OIDC (`id-token: write`) to sign attestations —
-  no long-lived registry credentials in secrets.
-- Trivy blocks HIGH/CRITICAL CVEs at image push time.
+- Public-repository builds use OIDC (`id-token: write`) for signed attestations. Registry publication uses the job's GitHub token.
+- Trivy retains a complete vulnerability report, including unfixed findings. Both platforms must pass the fixable HIGH/CRITICAL policy before the promotion job can publish anything; scanner errors and artifact mismatches fail closed. Unfixed findings require release review.
 - cargo-deny gates every PR against a curated advisory + license list.
 - `.well-known/security.txt` served from both the SPA and the API.
 
-## Cost snapshot (public repo)
+## Costs and limits
 
-| Item | Cost |
-|---|---|
-| GitHub Actions runner-minutes | 0 (public repos have unlimited minutes) |
-| GHCR public image storage | 0 |
-| GHCR public image bandwidth | 0 |
-| Cloudflare Pages (frontend) | 0 |
-| Neon Postgres (0.5 GB) | 0 |
-| Fly.io hobby (256 MB, auto-stop) | 0 |
-| Uptime monitoring (BetterStack free / UptimeRobot) | 0 |
-| **Total** | **$0** |
-
-The whole CI/CD/CU pipeline costs zero dollars up to the pitch-demo
-footprint. Every step of the pipeline uses standard, portable formats
-(OCI, SPDX, SLSA, pg_dump custom) — no vendor lock-in, no rewrite when
-we outgrow a tier.
+Runner usage, registry storage, hosting, database, and backup retention costs
+depend on the current provider plans and workload. This repository does not
+guarantee a free deployment or a fixed CI duration. Review those limits for
+the selected environment before relying on a deployment budget.

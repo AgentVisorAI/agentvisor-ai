@@ -1,4 +1,4 @@
-FROM cgr.dev/chainguard/rust:latest-dev AS build
+FROM cgr.dev/chainguard/rust:latest-dev@sha256:609f3d55d8b2037ead3a2c034415d15fe1721c25ad3fc1b93305795395747a66 AS build
 USER root
 RUN apk add --no-cache cmake curl-dev
 USER 65532
@@ -15,10 +15,12 @@ COPY crates ./crates
 # tree is only needed at runtime and is copied into the runtime stage
 # directly from the build context.)
 COPY schemas ./schemas
+# Bound peak memory on small builders; operators may raise this explicitly.
+ARG CARGO_BUILD_JOBS=2
 RUN cargo build --locked --release -p av-harness --features full --bin agentvisord -p av-cli --bin avctl
 RUN mkdir -p /tmp/runtime-root/data /tmp/runtime-root/spool
 
-FROM cgr.dev/chainguard/glibc-dynamic:latest AS runtime
+FROM cgr.dev/chainguard/glibc-dynamic:latest@sha256:3a06f226c257c2934900ef6a0bff311ceb5fe9df184f6d8159812b2dabb852f9 AS runtime
 WORKDIR /app
 COPY --from=build /src/target/release/agentvisord /usr/local/bin/agentvisord
 COPY --from=build /src/target/release/avctl /usr/local/bin/avctl

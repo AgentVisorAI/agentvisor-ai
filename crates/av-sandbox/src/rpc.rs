@@ -1,6 +1,7 @@
 //! JSON-RPC 2.0 / MCP `tools/call` parsing. Total: never panics on arbitrary
 //! bytes (property-tested), returns typed errors for every malformed shape.
 
+use crate::denial_code::DenialCode;
 use serde_json::Value;
 
 /// A parsed MCP tool-call request.
@@ -351,6 +352,21 @@ pub fn authorization_error(id: Option<&Value>, reason: &str) -> Value {
     })
 }
 
+/// [`authorization_error`] plus the machine-readable denial code in
+/// `error.data.code`, so an agent can branch on the code without parsing
+/// the reason text.
+pub fn denial_error(id: Option<&Value>, code: DenialCode, reason: &str) -> Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id.cloned().unwrap_or(Value::Null),
+        "error": {
+            "code": -32001,
+            "message": "tool call blocked by AgentVisor AI policy",
+            "data": { "reason": reason, "code": code.as_str() }
+        }
+    })
+}
+
 /// Recover the request `id` for an error response, per JSON-RPC 2.0 §5:
 /// the response `id` MUST echo the request's when it is detectable, and
 /// be `null` only "if there was an error in detecting the id" (parse
@@ -388,7 +404,7 @@ pub fn protocol_error(id: Option<&Value>, error: &RpcError) -> Value {
         RpcError::BadParams(_) => (-32602, "invalid params"),
         // Passthrough refusal is an application-level policy choice.
         RpcError::NotToolCall(_) => {
-            return authorization_error(id, &error.to_string());
+            return denial_error(id, DenialCode::PassthroughRefused, &error.to_string());
         }
     };
     serde_json::json!({
@@ -397,7 +413,7 @@ pub fn protocol_error(id: Option<&Value>, error: &RpcError) -> Value {
         "error": {
             "code": code,
             "message": message,
-            "data": { "reason": error.to_string() }
+            "data": { "reason": error.to_string(), "code": DenialCode::ParseError.as_str() }
         }
     })
 }
@@ -583,6 +599,31 @@ mod tests {
         assert_eq!(e["id"], 9);
         assert_eq!(e["error"]["code"], -32001);
         assert_eq!(e["error"]["data"]["reason"], "budget exceeded");
+    }
+
+    #[test]
+    fn denial_error_carries_machine_readable_code() {
+        let e = denial_error(
+            Some(&json!("req-7")),
+            DenialCode::BudgetExceeded,
+            "budget exceeded",
+        );
+        assert_eq!(e["jsonrpc"], "2.0");
+        assert_eq!(e["id"], "req-7");
+        assert_eq!(e["error"]["code"], -32001);
+        assert_eq!(e["error"]["data"]["reason"], "budget exceeded");
+        assert_eq!(e["error"]["data"]["code"], "BUDGET_EXCEEDED");
+    }
+
+    #[test]
+    fn protocol_errors_carry_denial_codes() {
+        let parse = protocol_error(None, &RpcError::Json("bad".into()));
+        assert_eq!(parse["error"]["code"], -32700);
+        assert_eq!(parse["error"]["data"]["code"], "PARSE_ERROR");
+        let passthrough = protocol_error(Some(&json!(3)), &RpcError::NotToolCall("tools/list".into()));
+        assert_eq!(passthrough["id"], 3);
+        assert_eq!(passthrough["error"]["code"], -32001);
+        assert_eq!(passthrough["error"]["data"]["code"], "PASSTHROUGH_REFUSED");
     }
 
     proptest! {

@@ -58,11 +58,15 @@ async function authenticateDaemon(
 // model) could otherwise mint sessions/events whose agent or tag
 // renders REVERSED or with invisible characters in the console and
 // the audit CSV, spoofing the very evidence trail this product sells.
-// Free-content fields (body, sub) are deliberately exempt: daemons
-// capture model output verbatim there and the SPA HTML-escapes them;
+// Free-content fields (body, sub) permit other control/format characters:
+// daemons capture model output verbatim and the SPA HTML-escapes it.
+// PostgreSQL text cannot store NUL, so reject that character before writing;
+// otherwise the same valid-looking batch retries a deterministic 500 forever.
 // identifiers have no legitimate use for invisible characters. Same
 // refusal family as auth.ts noCrlfNul (R211).
 const noControlOrFormatChars = (v: string): boolean => !/[\p{Cc}\p{Cf}]/u.test(v);
+const eventText = (max: number) =>
+  z.string().max(max).refine((v) => !v.includes("\0"), "must not contain NUL");
 const identifier = (max: number) =>
   z
     .string()
@@ -77,7 +81,7 @@ const sessionUpsert = z.object({
   // host's composition form.
   agent: identifier(80).transform((v) => v.normalize("NFC")),
   workflow: z.enum(["signed", "unsigned"]).default("signed"),
-  status: z.enum(["live", "sealed", "blocked"]).default("live"),
+  status: z.enum(["live", "sealed", "blocked", "quarantined_crash_evidence"]).default("live"),
   // R161 F1: cap at 1M policy versions. Prior shape was
   // unbounded — Session.policyVersion is Postgres int4 (max
   // 2^31-1 ≈ 2.1e9), so an attacker or runaway daemon posting
@@ -104,8 +108,8 @@ const eventPayload = z.object({
   seq: z.number().int().min(0).max(100_000_000),
   kind: z.enum(["sys", "user", "llm", "tool", "block", "guard", "audit"]),
   tag: identifier(32),
-  body: z.string().max(8000),
-  sub: z.string().max(2000).optional(),
+  body: eventText(8000),
+  sub: eventText(2000).optional(),
   // Which policy this event fired under, when the daemon attributes
   // one (block verdicts, allowlist hits). Free-form name matched
   // against Policy.name for the console's per-policy 24h counters —
@@ -553,7 +557,9 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
       where: {
         deploymentId: daemon.deploymentId,
         externalId: s.externalId,
-        status: { not: "sealed" },
+        // A recovered capture is permanently incomplete. A retry cannot
+        // relabel it as live or change its identifying metadata.
+        status: { notIn: ["sealed", "quarantined_crash_evidence"] },
       },
       data: {
         agent: s.agent,
@@ -1235,9 +1241,12 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
           externalId: r.sessionExternalId,
         },
       },
-      select: { id: true },
+      select: { id: true, status: true },
     });
     if (!session) return reply.code(404).send({ error: "unknown_session" });
+    if (session.status === "quarantined_crash_evidence") {
+      return reply.code(409).send({ error: "session_evidence_incomplete" });
+    }
     // R93 F4: first-write-wins on the receipt row. Prior shape ran
     // an unconditional upsert, so an ingest-token holder (or an
     // attacker with a leaked token — the same threat model R92 F2
@@ -1381,16 +1390,24 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
               issuedAt: sealIssuedAt,
             },
           });
-          await tx.session.update({
-            where: { id: session.id },
+          const sealed = await tx.session.updateMany({
+            // The guard is checked under the row lock, so a concurrent
+            // quarantine cannot acquire a receipt between this request's
+            // earlier read and this transaction. Roll back receipt.create
+            // if quarantine won the race.
+            where: { id: session.id, status: { not: "quarantined_crash_evidence" } },
             data: {
               status: "sealed",
               stopReasonId: sealStopReasonId,
               stopReason: sealStopReason,
             },
           });
+          if (sealed.count !== 1) throw new Error("session_evidence_incomplete");
         });
       } catch (err) {
+        if (err instanceof Error && err.message === "session_evidence_incomplete") {
+          return reply.code(409).send({ error: "session_evidence_incomplete" });
+        }
         if (
           typeof err !== "object" ||
           err === null ||

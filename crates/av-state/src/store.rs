@@ -113,6 +113,14 @@ pub trait StateStore: Send + Sync {
     /// Add `delta` to `key`, returning the new value.
     fn add(&self, key: &str, delta: u64) -> Result<u64, StateError>;
 
+    /// Atomically retain the greater of the stored value and `value`, returning
+    /// the resulting maximum. Used for monotonic revocation cutoffs.
+    fn fetch_max(&self, _key: &str, _value: u64) -> Result<u64, StateError> {
+        Err(StateError::Backend(
+            "fetch_max is not supported by this state backend".into(),
+        ))
+    }
+
     /// Backend counter TTL in seconds, if the backend expires counters
     /// natively. `None` means counters live for the process lifetime
     /// (in-memory). Exposing it makes the prod/dev divergence
@@ -298,6 +306,21 @@ impl InMemoryStore {
 pub(crate) const COUNTER_MAX: i64 = av_core::error::JCS_SAFE_MAX as i64;
 
 impl StateStore for InMemoryStore {
+    fn fetch_max(&self, key: &str, value: u64) -> Result<u64, StateError> {
+        if value > av_core::error::JCS_SAFE_MAX {
+            return Err(StateError::Overflow(key.to_owned()));
+        }
+        let _transaction = self.transaction_lock.lock();
+        let cell = self.cell(key);
+        let current = cell.load(Ordering::Acquire);
+        if !(0..=COUNTER_MAX).contains(&current) {
+            return Err(StateError::Overflow(key.to_owned()));
+        }
+        let value = i64::try_from(value).map_err(|_| StateError::Overflow(key.to_owned()))?;
+        let prior = cell.fetch_max(value, Ordering::AcqRel);
+        u64::try_from(prior.max(value)).map_err(|_| StateError::Overflow(key.to_owned()))
+    }
+
     fn add(&self, key: &str, delta: u64) -> Result<u64, StateError> {
         let _transaction = self.transaction_lock.lock();
         let delta = i64::try_from(delta).map_err(|_| StateError::Overflow(key.to_owned()))?;
@@ -465,6 +488,52 @@ mod tests {
     /// The ONE shared backend contract, mirrored by
     /// `redis_contract.rs::redis_satisfies_the_shared_state_store_contract`
     /// so the two backends cannot silently drift on semantics again.
+    #[test]
+    fn fetch_max_is_atomic_monotonic_and_bounded() {
+        let store = Arc::new(InMemoryStore::new());
+        let joins: Vec<_> = (0..32)
+            .map(|value| {
+                let store = store.clone();
+                std::thread::spawn(move || store.fetch_max("cutoff", value).unwrap())
+            })
+            .collect();
+        for join in joins {
+            join.join().unwrap();
+        }
+        assert_eq!(store.get("cutoff").unwrap(), 31);
+        assert_eq!(store.fetch_max("cutoff", 10).unwrap(), 31);
+        assert!(matches!(
+            store.fetch_max("cutoff", av_core::error::JCS_SAFE_MAX + 1),
+            Err(StateError::Overflow(_))
+        ));
+        assert_eq!(store.get("cutoff").unwrap(), 31);
+        let cell = store.cell("bad");
+        cell.store(-1, Ordering::Release);
+        assert!(matches!(store.fetch_max("bad", 1), Err(StateError::Overflow(_))));
+        assert_eq!(cell.load(Ordering::Acquire), -1);
+    }
+
+    #[test]
+    fn fetch_max_unsupported_backend_fails_closed() {
+        struct Unsupported;
+        impl StateStore for Unsupported {
+            fn add(&self, _: &str, _: u64) -> Result<u64, StateError> {
+                Ok(0)
+            }
+            fn get(&self, _: &str) -> Result<u64, StateError> {
+                Ok(0)
+            }
+            fn try_spend_many(&self, _: &[Spend]) -> Result<TrySpendOutcome, StateError> {
+                Ok(TrySpendOutcome::Refused { index: 0 })
+            }
+            fn remove(&self, _: &str) {}
+        }
+        assert!(matches!(
+            Unsupported.fetch_max("cutoff", 1),
+            Err(StateError::Backend(_))
+        ));
+    }
+
     #[test]
     fn in_memory_satisfies_the_shared_state_store_contract() {
         let store = InMemoryStore::new();

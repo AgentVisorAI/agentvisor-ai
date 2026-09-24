@@ -111,6 +111,23 @@ return result
     )
 });
 
+static FETCH_MAX_LUA: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        r"
+local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+local value = tonumber(ARGV[1])
+local limit = tonumber(ARGV[2])
+if not current or current < 0 or current > limit then return -1 end
+if value > current or redis.call('EXISTS', KEYS[1]) == 0 then
+    redis.call('SET', KEYS[1], ARGV[1])
+    current = value
+end
+redis.call('EXPIRE', KEYS[1], {BUDGET_COUNTER_TTL_SECS})
+return current
+"
+    )
+});
+
 /// Saturating single-key refund. `EXISTS`-gated to never resurrect
 /// a `remove_prefix`-cleared cell; `SET key 0 EX {BUDGET_COUNTER_TTL_SECS}`
 /// on underflow keeps the counter TTL-aligned; `EXPIRE` on the
@@ -235,16 +252,34 @@ impl r2d2::ManageConnection for RedisConnectionManager {
     }
 }
 
+/// Verify one connection during startup, then grow on demand. r2d2's
+/// default minimum equals the maximum; requiring 32 complete Cluster
+/// connections can exhaust the startup deadline during concurrent TLS setup.
+fn redis_pool_builder<M: r2d2::ManageConnection>() -> r2d2::Builder<M> {
+    r2d2::Pool::builder()
+        .max_size(32)
+        .min_idle(Some(1))
+        .connection_timeout(std::time::Duration::from_secs(2))
+}
+
 impl RedisStore {
-    /// Connect to `url` (e.g. `redis://127.0.0.1:6379`).
-    /// Comma-separated URLs select Redis Cluster mode.
+    /// Connect to `url` (e.g. `rediss://redis.example.com:6379`).
+    /// TLS verifies the server name and the native certificate trust store;
+    /// `SSL_CERT_FILE` can supply a PEM trust bundle for a private CA.
+    /// Comma-separated URLs select Redis Cluster mode. All seeds must use
+    /// the same transport, and disabling TLS verification is never allowed.
     pub fn connect(url: &str) -> Result<Self, StateError> {
+        // Other connectors can enable a second rustls crypto backend through
+        // Cargo feature unification. Select one explicitly before redis-rs
+        // creates its ClientConfig; preserve a provider installed by the host.
+        let _ = rustls_tls::crypto::ring::default_provider().install_default();
         let nodes: Vec<String> = url
             .split(',')
             .map(str::trim)
             .filter(|node| !node.is_empty())
             .map(str::to_owned)
             .collect();
+        validate_transports(&nodes)?;
         if nodes.len() > 1 {
             // Previously one `ClusterConnection` behind a mutex —
             // every quota/budget operation across all sessions serialized on
@@ -257,9 +292,7 @@ impl RedisStore {
                 .response_timeout(std::time::Duration::from_secs(2))
                 .build()
                 .map_err(|e| StateError::Backend(e.to_string()))?;
-            let pool = r2d2::Pool::builder()
-                .max_size(32)
-                .connection_timeout(std::time::Duration::from_secs(2))
+            let pool = redis_pool_builder()
                 .build(client)
                 .map_err(|e| StateError::Backend(e.to_string()))?;
             return Ok(Self {
@@ -271,15 +304,40 @@ impl RedisStore {
             client,
             timeout: std::time::Duration::from_secs(2),
         };
-        let pool = r2d2::Pool::builder()
-            .max_size(32)
-            .connection_timeout(std::time::Duration::from_secs(2))
+        let pool = redis_pool_builder()
             .build(manager)
             .map_err(|e| StateError::Backend(e.to_string()))?;
         Ok(Self {
             backend: RedisBackend::Single(pool),
         })
     }
+}
+
+fn validate_transports(nodes: &[String]) -> Result<(), StateError> {
+    use redis::IntoConnectionInfo as _;
+    let mut previous_tls = None;
+    for node in nodes {
+        let info = node
+            .as_str()
+            .into_connection_info()
+            .map_err(|error| StateError::Backend(error.to_string()))?;
+        let tls = match info.addr {
+            redis::ConnectionAddr::TcpTls { insecure: true, .. } => {
+                return Err(StateError::Backend(
+                    "Redis TLS certificate verification cannot be disabled".into(),
+                ));
+            }
+            redis::ConnectionAddr::TcpTls { .. } => true,
+            _ => false,
+        };
+        if previous_tls.is_some_and(|previous| previous != tls) {
+            return Err(StateError::Backend(
+                "Redis Cluster seeds must all use the same transport".into(),
+            ));
+        }
+        previous_tls = Some(tls);
+    }
+    Ok(())
 }
 
 fn add_on<C: redis::ConnectionLike>(conn: &mut C, key: &str, delta: u64) -> Result<u64, StateError> {
@@ -309,6 +367,19 @@ fn get_on<C: redis::ConnectionLike>(conn: &mut C, key: &str) -> Result<u64, Stat
         return Err(StateError::Overflow(key.to_owned()));
     }
     Ok(value)
+}
+
+fn fetch_max_on<C: redis::ConnectionLike>(conn: &mut C, key: &str, value: u64) -> Result<u64, StateError> {
+    if value > av_core::error::JCS_SAFE_MAX {
+        return Err(StateError::Overflow(key.to_owned()));
+    }
+    let result: i64 = redis::Script::new(&FETCH_MAX_LUA)
+        .key(key)
+        .arg(value)
+        .arg(av_core::error::JCS_SAFE_MAX)
+        .invoke(conn)
+        .map_err(|e| StateError::Backend(e.to_string()))?;
+    u64::try_from(result).map_err(|_| StateError::Overflow(key.to_owned()))
 }
 
 fn spend_many_on<C: redis::ConnectionLike>(
@@ -371,6 +442,20 @@ fn spend_many_on<C: redis::ConnectionLike>(
 }
 
 impl StateStore for RedisStore {
+    fn fetch_max(&self, key: &str, value: u64) -> Result<u64, StateError> {
+        match &self.backend {
+            RedisBackend::Single(pool) => fetch_max_on(
+                &mut pool.get().map_err(|e| StateError::Backend(e.to_string()))?,
+                key,
+                value,
+            ),
+            RedisBackend::Cluster(pool) => fetch_max_on(
+                &mut *pool.get().map_err(|e| StateError::Backend(e.to_string()))?,
+                key,
+                value,
+            ),
+        }
+    }
     fn counter_ttl_secs(&self) -> Option<u64> {
         Some(BUDGET_COUNTER_TTL_SECS)
     }
@@ -851,6 +936,80 @@ mod tests {
 
     use super::*;
 
+    struct StartupManager {
+        attempts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        first_available: bool,
+        additional_available: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl r2d2::ManageConnection for StartupManager {
+        type Connection = usize;
+        type Error = std::io::Error;
+
+        fn connect(&self) -> Result<Self::Connection, Self::Error> {
+            use std::sync::atomic::Ordering;
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+            if (attempt == 0 && self.first_available) || self.additional_available.load(Ordering::SeqCst) {
+                Ok(attempt)
+            } else {
+                Err(std::io::Error::other("additional connection is not ready"))
+            }
+        }
+
+        fn is_valid(&self, _connection: &mut Self::Connection) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn has_broken(&self, _connection: &mut Self::Connection) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn pool_verifies_one_connection_then_grows_on_demand_with_the_same_limits() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let additional_available = Arc::new(AtomicBool::new(false));
+        // Only one connection is initially available. Requiring the default
+        // 32 connections would time out, despite a usable backend connection.
+        let pool = redis_pool_builder()
+            .build(StartupManager {
+                attempts: Arc::clone(&attempts),
+                first_available: true,
+                additional_available: Arc::clone(&additional_available),
+            })
+            .unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(pool.state().connections, 1);
+        assert_eq!(pool.connection_timeout(), Duration::from_secs(2));
+
+        additional_available.store(true, Ordering::SeqCst);
+        let held: Vec<_> = (0..32).map(|_| pool.get().unwrap()).collect();
+        assert_eq!(held.len(), 32);
+        assert_eq!(pool.state().connections, 32);
+        assert!(pool.get_timeout(Duration::from_millis(20)).is_err());
+        drop(held);
+        assert!(pool.get().is_ok());
+    }
+
+    #[test]
+    fn pool_startup_still_refuses_an_unavailable_backend() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let result = redis_pool_builder().build(StartupManager {
+            attempts: Arc::clone(&attempts),
+            first_available: false,
+            additional_available: Arc::new(AtomicBool::new(false)),
+        });
+        assert!(result.is_err());
+        assert!(attempts.load(Ordering::SeqCst) > 0);
+    }
+
     /// Every Lua script that mutates a counter must apply the single
     /// shared TTL constant — a hardcoded-literal drift between the
     /// spend/add/refund paths would make some counters outlive others
@@ -867,6 +1026,7 @@ mod tests {
         for (name, script) in [
             ("TRY_SPEND_LUA", TRY_SPEND_LUA.as_str()),
             ("ADD_LUA", ADD_LUA.as_str()),
+            ("FETCH_MAX_LUA", FETCH_MAX_LUA.as_str()),
             ("REFUND_LUA", REFUND_LUA.as_str()),
             ("REFUND_MANY_LUA", REFUND_MANY_LUA.as_str()),
         ] {
@@ -918,5 +1078,29 @@ mod tests {
              not through a Lua double: {}",
             REFUND_MANY_LUA.as_str()
         );
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::validate_transports;
+
+    #[test]
+    fn tls_is_enabled_and_verification_cannot_be_disabled() {
+        assert!(validate_transports(&["rediss://localhost:6379".into()]).is_ok());
+        let error = validate_transports(&["rediss://localhost:6379/#insecure".into()]);
+        assert!(matches!(error, Err(super::StateError::Backend(message))
+            if message.contains("verification cannot be disabled")));
+    }
+
+    #[test]
+    fn cluster_seeds_cannot_mix_tls_and_plaintext() {
+        for nodes in [
+            ["rediss://one:6379", "redis://two:6379"],
+            ["redis://one:6379", "rediss://two:6379"],
+        ] {
+            assert!(validate_transports(&nodes.map(str::to_owned)).is_err());
+        }
+        assert!(validate_transports(&["rediss://one:6379".into(), "rediss://two:6379".into()]).is_ok());
     }
 }

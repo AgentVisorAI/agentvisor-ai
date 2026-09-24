@@ -230,3 +230,48 @@ fn redis_satisfies_the_shared_state_store_contract() {
     let Some(s) = store() else { return };
     av_state::state_store_contract(&s, &av_core::new_event_uid());
 }
+
+#[test]
+fn redis_fetch_max_is_atomic_bounded_and_refreshes_ttl() {
+    let Some(s) = store() else { return };
+    let key = format!("av-test:{}", av_core::new_event_uid());
+    assert_eq!(s.fetch_max(&key, 1000).unwrap(), 1000);
+    assert_eq!(s.fetch_max(&key, 900).unwrap(), 1000);
+    assert!(matches!(
+        s.fetch_max(&key, av_core::error::JCS_SAFE_MAX + 1),
+        Err(av_state::StateError::Overflow(_))
+    ));
+    assert_eq!(s.get(&key).unwrap(), 1000);
+    let shared = std::sync::Arc::new(s);
+    let joins: Vec<_> = (1001..1017)
+        .map(|value| {
+            let s = shared.clone();
+            let key = key.clone();
+            std::thread::spawn(move || s.fetch_max(&key, value).unwrap())
+        })
+        .collect();
+    for join in joins {
+        join.join().unwrap();
+    }
+    assert_eq!(shared.get(&key).unwrap(), 1016);
+    let url = std::env::var("AV_REDIS_URL").unwrap();
+    let members: Vec<_> = url.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+    let ttl: i64 = if members.len() > 1 {
+        let client = redis::cluster::ClusterClient::new(members).unwrap();
+        redis::cmd("TTL")
+            .arg(&key)
+            .query(&mut client.get_connection().unwrap())
+            .unwrap()
+    } else {
+        let client = redis::Client::open(url.as_str()).unwrap();
+        redis::cmd("TTL")
+            .arg(&key)
+            .query(&mut client.get_connection().unwrap())
+            .unwrap()
+    };
+    assert!(
+        ttl > 0 && ttl <= 86400,
+        "fetch_max must keep the shared counter TTL: {ttl}"
+    );
+    shared.remove(&key);
+}

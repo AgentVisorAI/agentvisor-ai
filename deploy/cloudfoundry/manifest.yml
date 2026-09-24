@@ -1,0 +1,24 @@
+# Cloud Foundry deployment example. See README.md in this directory for setup.
+# Only an internal route is mapped. Authentication is required and the
+# unauthenticated dashboard is disabled by harness.cloudfoundry.toml.
+applications:
+- name: agentvisor-ai
+  docker:
+    image: registry.example.com/agentvisor-ai:cf
+  instances: 1
+  memory: 256M
+  disk_quota: 1G
+  routes:
+  - route: agentvisor-ai.apps.internal
+  health-check-type: http
+  health-check-http-endpoint: /livez
+  # Requires the readiness-capable foundation releases listed in README.md.
+  readiness-health-check-type: http
+  readiness-health-check-http-endpoint: /readyz
+  readiness-health-check-interval: 5
+  readiness-health-check-invocation-timeout: 3
+  env:
+    AV_CONFIG: /app/config/harness.cloudfoundry.toml
+    # Set this required variable using a protected --vars-file.
+    AV_STATE_ENDPOINT: ((redis_url))
+    RUST_LOG: info

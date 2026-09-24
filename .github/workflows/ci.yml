@@ -40,6 +40,60 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
+  introspection-expiry:
+    # Keep this fixture separate from the shared Redis contract service. The
+    # drill owns a password-protected Redis process on an ephemeral loopback port.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Install isolated expiry fixture dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends redis-server
+      - name: Build daemon with shared revocation support
+        run: cargo build --locked -p av-harness --bin agentvisord --features redis
+      - name: Reject tokens that expire during a Redis revocation read
+        timeout-minutes: 3
+        env:
+          AGENTVISORD: ${{ github.workspace }}/target/debug/agentvisord
+        run: python3 scripts/introspection-expiry-test.py --output-dir "${{ runner.temp }}/introspection-expiry"
+      - name: Retain expiry regression evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: introspection-expiry
+          # Explicit public diagnostics only. Never upload the private fixture
+          # directory, signing seeds, Redis password, or request credentials.
+          path: |
+            ${{ runner.temp }}/introspection-expiry/*.log
+            ${{ runner.temp }}/introspection-expiry/result.json
+          if-no-files-found: ignore
+          retention-days: 14
+
+  buildpack-lifecycle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Real CNB lifecycle and classic supply on Linux
+        run: python3 buildpack/tests/lifecycle.py --download-pack
+      - name: Compose secrets work for a non-root daemon
+        run: python3 scripts/compose-secrets-test.py
+      - name: Kubernetes init delivers private non-root secrets
+        run: python3 scripts/kubernetes-secrets-test.py
+
   check:
     runs-on: ubuntu-latest
     steps:
@@ -110,8 +164,56 @@ jobs:
         run: |
           cargo test --workspace
           cargo test --workspace --all-features
+      - name: Security and deployment live checks
+        timeout-minutes: 20
+        env:
+          AV_REDIS_URL: redis://127.0.0.1:6379
+          AGENTVISORD: ${{ github.workspace }}/target/debug/agentvisord
+          AVCTL: ${{ github.workspace }}/target/debug/avctl
+        run: |
+          python3 buildpack/tests/test_buildpack.py
+          python3 scripts/live-pillars-helper.py self-test
+          cargo build -p av-harness --features redis -p av-cli --bins
+          python3 scripts/test-provider-smoke.py
+          ./scripts/live-pillars.sh
+          ./scripts/live-pillars.sh --redis "$AV_REDIS_URL"
+      - name: Redis TLS authentication and trust contracts
+        timeout-minutes: 20
+        run: python3 scripts/redis-tls-test.py --output-dir /tmp/agentvisor-redis-tls-results
+      - name: Retain Redis TLS contract diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: redis-tls-contracts
+          path: /tmp/agentvisor-redis-tls-results
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Redis Cluster with TLS and shared revocation contracts
+        # Covers the 20-minute compilation bound, four 10-minute contract
+        # process bounds and provisioning. Cached builds normally finish much sooner.
+        timeout-minutes: 95
+        env:
+          DOCKER_HOST: unix:///var/run/docker.sock
+        run: |
+          python3 scripts/redis-cluster-tls-test.py self-test
+          python3 scripts/redis-cluster-tls-ci.py --self-test
+          python3 scripts/redis-cluster-tls-ci.py --output-dir /tmp/agentvisor-redis-cluster-tls-results
+      - name: Clean up owned Redis Cluster TLS fixture
+        if: always()
+        timeout-minutes: 3
+        run: python3 scripts/redis-cluster-tls-ci.py --cleanup --output-dir /tmp/agentvisor-redis-cluster-tls-results
+      - name: Retain Redis Cluster TLS contract diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: redis-cluster-tls-contracts
+          # Only redacted logs/provenance; the private fixture directory and
+          # its CA keys, node keys, credentials and environment are excluded.
+          path: /tmp/agentvisor-redis-cluster-tls-results
+          if-no-files-found: ignore
+          retention-days: 14
       - name: Release SLA
-        # The two release-profile SLA builds are the pipeline's most
+        # The release-profile SLA builds are the pipeline's most
         # expensive step (~15-20 min). Gate them to main pushes: PR runs
         # (mostly Dependabot) still get fmt/clippy/tests/feature-matrix/
         # docs/schemas/Harbor, and main re-validates the SLA on merge.
@@ -129,6 +231,7 @@ jobs:
           AV_SLA_STREAMING_P99_US: "12000"
         run: |
           cargo test -p av-harness --release --features full --test sla sla_core_metrics -- --ignored --nocapture
+          cargo test -p av-harness --release --features full --test sla_security -- --ignored --nocapture
           ulimit -n 65536
           RUN_HEAVY_PERF=1 AV_SLA_CONNECTIONS=10000 cargo test -p av-harness --release --features full --test sla sla_10k_streaming_connections -- --ignored --nocapture
       - name: Live-verify (round-51 §11 headline claims end-to-end)
@@ -142,6 +245,27 @@ jobs:
         run: |
           cargo build --release -p av-harness --bin agentvisord -p av-cli --bin avctl
           ./scripts/live-verify.sh
+      - name: MCP uncertain effects survive close and restart
+        id: mcp-uncertainty
+        # The preceding release-binary build is also push-only. Pull requests
+        # exercise the same runtime cases in the all-feature Rust suite.
+        if: github.event_name == 'push'
+        timeout-minutes: 5
+        env:
+          AGENTVISORD: target/release/agentvisord
+        run: python3 scripts/mcp-uncertainty-test.py --output-dir /tmp/agentvisor-mcp-uncertainty-results
+      - name: Retain MCP uncertainty failure diagnostics
+        if: failure() && steps.mcp-uncertainty.outcome == 'failure'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mcp-uncertainty-failure
+          # Explicit files only: never upload the hidden private work directory,
+          # signing seed, HMAC credential, or request token, even after interruption.
+          path: |
+            /tmp/agentvisor-mcp-uncertainty-results/*.log
+            /tmp/agentvisor-mcp-uncertainty-results/result.json
+          if-no-files-found: ignore
+          retention-days: 14
       - name: Feature matrix
         run: |
           cargo check --workspace --no-default-features
@@ -199,6 +323,19 @@ jobs:
         # compose file itself on every run.
         if: github.event_name == 'push'
         run: docker compose -f docker/docker-compose.yml build agentvisor-ai
+      - name: Container requests, receipts, and persistent restart
+        if: github.event_name == 'push'
+        timeout-minutes: 10
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: python3 scripts/container-smoke.py --image agentvisor-ai:local
+      - name: Preserve container verification logs
+        if: always() && github.event_name == 'push'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gateway-container-logs
+          path: ${{ runner.temp }}/av-container-smoke-*/*.log
+          if-no-files-found: ignore
       - name: Stop live contract services
         if: always()
         run: docker compose -f docker/docker-compose.yml down -v

@@ -1,26 +1,44 @@
 # Deploying AgentVisor AI
 
-This backend is designed to run for free at seed-stage, autoscale to millions
-of requests without a rewrite, and stay portable across cloud providers.
+The console API is a Node.js application backed by PostgreSQL. This guide
+describes deployment templates and the local checks performed against them.
+Validate the selected provider's current pricing, limits, and configuration
+before deploying. Local results do not establish capacity on a managed host.
 
-## Free tier one-click deploys
+## Selecting a release image
 
-Pick any of these — the same `server/Dockerfile` runs on every one. Add or
-change providers later with `pg_dump | pg_restore` and a container push.
+The Deploy workflow tests and scans local OCI archives before a separate
+main-only job receives registry write permission. Both amd64 and arm64 must
+pass, and the required console regression workflow must succeed. Pull requests
+publish no registry tags and receive no deployment credentials. The job copies the tested bytes without rebuilding, preserves
+BuildKit SBOM/provenance descriptors, and verifies the final multiarch digest.
+Deploy `ghcr.io/agentvisorai/agentvisor-api@sha256:...` from a successful
+promotion. The optional Fly job uses that exact digest automatically.
 
-| Provider | Free tier | Config file | One-click |
+The `validated-*` tags are internal staging references, not production release
+outputs. Do not select one because it exists in GHCR. Convenience tags
+`latest`, `main`, and `sha-<full revision>` can change; record the approved
+digest for deployment and rollback. Full scan artifacts include unfixed
+findings, which still require review. See [the image lifecycle](../CI-CD.md#container-image-lifecycle)
+for the publication boundary and its limits.
+
+## Deployment options
+
+The repository includes container and static-site configuration for these
+options. Their presence does not mean each provider has been deployed and
+tested. Database migration uses `pg_dump` and `pg_restore`; validate the
+restore and application behavior before directing traffic to a new host.
+
+| Provider | Component | Config file | Setup entry point |
 |---|---|---|---|
-| **Cloudflare Pages** (frontend) | Unlimited bandwidth, HTTP/3, global edge | `docs/_headers`, `docs/_redirects` | [Deploy](https://dash.cloudflare.com/?to=/:account/pages/new/provider/github) |
-| **Fly.io** (API) | 3 × shared-cpu-1x, 256 MB, auto-stop | `server/fly.toml` | `fly launch --copy-config` |
-| **Render** (API + Postgres) | 750 hrs/mo web + 90-day free 1 GB PG | `render.yaml` | [Deploy](https://render.com/deploy?repo=https://github.com/AgentVisorAI/agentvisor-ai) |
-| **Railway** (API + Postgres) | $5/mo credit, no card | `railway.json` | [Deploy](https://railway.app/new/template?template=https://github.com/AgentVisorAI/agentvisor-ai) |
-| **Koyeb** (API) | 2 nano services, scale-to-zero | `koyeb.yaml` | [Deploy](https://app.koyeb.com/deploy?type=git&repository=github.com/AgentVisorAI/agentvisor-ai&branch=main&name=agentvisor-api&dockerfile=server/Dockerfile) |
-| **Google Cloud Run** (API) | 2M requests/mo, scale-to-zero | `server/Dockerfile` | [Deploy](https://deploy.cloud.run/?git_repo=https://github.com/AgentVisorAI/agentvisor-ai&dir=server) |
-| **Neon** (Postgres) | 0.5 GB, auto-scale, autosuspend | `postgres://…` env var | [Sign up](https://neon.tech) |
-| **Supabase** (Postgres) | 500 MB, unlimited API | `postgres://…` env var | [Sign up](https://supabase.com) |
-
-Total cost to run the whole demo: **$0**. Total time to move to any other
-provider: ~10 minutes.
+| **Cloudflare Pages** | Frontend | `docs/_headers`, `docs/_redirects` | [Deploy](https://dash.cloudflare.com/?to=/:account/pages/new/provider/github) |
+| **Fly.io** | API | `server/fly.toml` | `fly launch --copy-config` |
+| **Render** | API + Postgres | `render.yaml` | [Deploy](https://render.com/deploy?repo=https://github.com/AgentVisorAI/agentvisor-ai) |
+| **Railway** | API + Postgres | `railway.json` | [Deploy](https://railway.app/new/template?template=https://github.com/AgentVisorAI/agentvisor-ai) |
+| **Koyeb** | API | `koyeb.yaml` | [Deploy](https://app.koyeb.com/deploy?type=git&repository=github.com/AgentVisorAI/agentvisor-ai&branch=main&name=agentvisor-api&dockerfile=server/Dockerfile) |
+| **Google Cloud Run** | API | `server/Dockerfile` | [Deploy](https://deploy.cloud.run/?git_repo=https://github.com/AgentVisorAI/agentvisor-ai&dir=server) |
+| **Neon** | Postgres | `DATABASE_URL` | [Provider](https://neon.tech) |
+| **Supabase** | Postgres | `DATABASE_URL` | [Provider](https://supabase.com) |
 
 ## Architecture
 
@@ -60,12 +78,11 @@ Nothing above is provider-specific:
 
 Swap any of the three without touching the other two.
 
-## Free tier: full walkthrough (frontend + backend + database)
+## Deployment walkthrough (frontend + backend + database)
 
 ### 1. Frontend — Cloudflare Pages (recommended)
 
-`docs/` is a static SPA + landing page. The recommended free host is
-**Cloudflare Pages** (unlimited bandwidth, HTTP/3, Argo edge routing).
+`docs/` is a static SPA + landing page. **Cloudflare Pages** is one option:
 
 ```bash
 npx wrangler pages deploy docs --project-name agentvisor-console
@@ -82,39 +99,36 @@ Bundled with the SPA:
   cookies stay same-origin (skips a CORS preflight).
 - `docs/.well-known/security.txt` — RFC 9116 disclosure contact.
 
-Alternative free hosts (identical files, no code changes):
+Alternative static hosts:
 
-| Host | Command | Free tier |
-|---|---|---|
-| GitHub Pages | (already wired via `.github/workflows/pages.yml`) | 100 GB/mo bandwidth |
-| Netlify | `netlify deploy --dir=docs --prod` | 100 GB/mo bandwidth |
-| Vercel | `vercel --cwd docs --prod` | 100 GB/mo bandwidth |
-| S3 + CloudFront | `aws s3 sync docs/ s3://bucket/` | 12 mo trial |
+| Host | Command or configuration |
+|---|---|
+| GitHub Pages | `.github/workflows/pages.yml` |
+| Netlify | `netlify deploy --dir=docs --prod` |
+| Vercel | `vercel --cwd docs --prod` |
+| S3 + CloudFront | `aws s3 sync docs/ s3://bucket/`, plus CDN configuration |
 
 ### 2. Database — Neon Postgres (recommended)
 
-1. Sign up at [neon.tech](https://neon.tech) — no credit card.
-2. Create a project → grab the connection string. It looks like:
-   `******ep-xxxxxx-pooler.us-east-2.aws.neon.tech/agentvisor?sslmode=require`
-3. Free tier includes:
-   - 0.5 GB storage (~250k sessions with signed receipts)
-   - Auto-scale compute from 0.25 vCPU
-   - 7-day point-in-time recovery
-   - Auto-pause when idle → **$0 while nobody's using the app**
-
-Alternatives (all free-tier, all `pg_dump`-compatible, all portable):
-
-- **Supabase** — 500 MB, unlimited API calls, built-in row-level security
-- **Fly Postgres** — 3 GB free with a Fly VM
-- **Railway** — $5/mo credit, includes Postgres
-- **CockroachDB Serverless** — 5 GB, wire-compatible with Postgres
+1. Create a project at [neon.tech](https://neon.tech), or use another PostgreSQL service.
+2. Configure its connection string as `DATABASE_URL` and require TLS for a
+   remote database according to the provider's instructions.
+3. Choose an endpoint that supports persistent `LISTEN` connections. Confirm
+   that `/readyz` reports `checks.bus: "ok"` on every API instance before
+   relying on cross-instance SSE updates.
+4. Select storage, connection limits, backups, and recovery retention for the
+   actual workload. Test restoration; a provider plan alone does not verify it.
 
 The API auto-detects several PG env-var names — no code tweak needed:
 `DATABASE_URL`, `POSTGRES_URL`, `POSTGRES_PRISMA_URL`, `NETLIFY_DATABASE_URL`,
-`NEON_DATABASE_URL`, `PGURL`, `DATABASE_URL_POOLED`. Whatever your platform
-injects, it works out of the box.
+`NEON_DATABASE_URL`, `PGURL`, `DATABASE_URL_POOLED`. Variable-name detection
+does not establish that the endpoint supports the required connection behavior.
 
 ### 3. Backend — Fly.io (recommended)
+
+Configure a Resend API key or an SMTP URL before the first deployment.
+Production refuses to boot without a mailer; see the provider setup in
+[Mailer + SSO](#4-mailer--sso-required-for-a-real-launch).
 
 ```bash
 brew install flyctl && fly auth signup
@@ -125,7 +139,10 @@ fly launch --copy-config --no-deploy    # picks up fly.toml
 # Set secrets (Fly encrypts these at rest; they never appear in the image)
 fly secrets set \
   DATABASE_URL="postgres://…your neon url…" \
-  JWT_SECRET="$(openssl rand -hex 48)"
+  JWT_SECRET="$(openssl rand -hex 48)" \
+  RESEND_API_KEY="re_…your verified-domain API key…"
+# For SMTP instead, replace RESEND_API_KEY above with:
+#   SMTP_URL="smtps://user:pass@host:465"
 
 fly deploy
 
@@ -133,13 +150,9 @@ fly deploy
 fly certs add api.agentvisorai.me
 ```
 
-Free tier gives you:
-
-- 3 shared-cpu-1x machines (256 MB each)
-- Auto-stop when idle → wakes in ~250 ms on next request
-- 160 GB egress/month
-- Automatic Let's Encrypt certificates
-- Global anycast — one deploy, seven+ regions
+Choose machine memory, minimum running instances, regions, and idle behavior
+using measurements on the target deployment. Cold starts, proxy buffering,
+database latency, and memory limits were not represented by the local workload.
 
 To flip the frontend to live mode, append `?live=1` to the console URL
 (sticky via `localStorage`; `?live=0` reverts), or edit `docs/app/config.js`:
@@ -153,12 +166,12 @@ Commit + push → Pages redeploys in ~30 s.
 
 ### 4. Mailer + SSO (required for a real launch)
 
-Beyond the `$0` demo, two things must be wired before customers can
+Two things must be wired before customers can
 sign up in production:
 
 **Mailer** (password reset + welcome emails):
 
-- **Resend** (recommended) — 10k emails/mo free, easiest setup. Sign
+- **Resend** — sign
   up at [resend.com](https://resend.com), verify your domain, grab the
   API key. Set `RESEND_API_KEY=re_…` as a secret. Prod refuses to boot
   without either this or `SMTP_URL`.
@@ -227,17 +240,32 @@ env vars are populated. No frontend flag to flip. Users signing in via
 OIDC land in a new org named after their email domain on first login;
 subsequent logins land in their existing org.
 
-**SAML / Okta**: not shipped. The login page's SAML button opens a
-`mailto:sales@` for enterprise inquiries — honest about the roadmap
-rather than presenting a fake button.
+**SAML 2.0** is implemented. Workspace owners configure the IdP issuer,
+sign-in URL, signing certificate, and allowed email domains in Settings > SSO.
+Use the displayed SP entity ID, assertion-consumer URL, and metadata endpoint
+when configuring the identity provider. Login starts through the application;
+unsolicited IdP-initiated responses are refused. The assertion must pass
+signature, issuer, audience, time-window, replay, and browser-binding checks.
+Verify the complete flow with the selected identity provider before rollout.
+The SAML logout route revokes the local application session; it does not
+implement the IdP's SAML Single Logout protocol.
+
+Apply migration `20260924140000_shared_saml_authn_requests` before routing
+traffic to updated replicas. All updated replicas share request state through
+PostgreSQL and must use the same cookie-signing secret and public API origin.
+The initial upgrade cannot transfer pending logins from an older process's
+memory. Drain older replicas and have users restart any interrupted sign-in;
+a mixture of old and new replicas does not share pending ceremonies. Once all
+replicas are updated, a login can complete on another replica or after a
+process restart without sticky routing.
 
 ### Alternative backend: Render, Railway, Koyeb, Cloud Run
 
 Each provider has a first-class config file already committed:
 
-- `render.yaml` — Render blueprint (web + Postgres, both on free plans).
+- `render.yaml` — Render blueprint (web + Postgres; review the selected plans).
 - `railway.json` — Railway spec (attach a Postgres plugin in the dashboard).
-- `koyeb.yaml` — Koyeb app spec (2 nano services, scale-to-zero).
+- `koyeb.yaml` — Koyeb app spec.
 - `server/fly.toml` — Fly.io machines config.
 
 All four consume the same `server/Dockerfile`. Environment variables
@@ -262,24 +290,27 @@ public IP — and confirm an 11th rapid login attempt returns 429.
 Caddy or nginx reverse proxy for HTTPS, or put Cloudflare Tunnel in
 front. No public IP needed.
 
-## Scaling path (100 → 1,000,000 users)
+## Measured workload and capacity planning
 
-The stack was chosen so the same code and container run at every scale.
-No rewrite when demand grows.
+The 2026-09-24 local operational drill used two production-mode API processes,
+two tenants, and 100,000 seeded events. A 60-second mixed workload completed
+3,000 authenticated requests at an offered 50 requests/second, with zero
+unexpected errors or tenant leaks. The four endpoint groups had p95 latency
+between 23.97 and 66.20 ms. The restored database contained 115,322 events and
+1,006 sessions; every public table matched its pre-backup content fingerprint.
+See [the validation record](VALIDATION.md#authenticated-workload-and-database-restoration)
+for commands, query plans, resource limits, and measurements.
 
-| Traffic | Fly.io config | Neon plan | Real-time bus | Monthly cost |
-|---|---|---|---|---|
-| Pitch demo → 100 users | 1 × shared-cpu-1x, 256 MB, auto-stop | Free | in-process | **$0** |
-| 1,000 daily users | 1 × shared-cpu-1x, min_machines=1 | Free | in-process | **$0** |
-| 10,000 daily users | `fly autoscale set min=1 max=5` | Launch ($19) | Postgres LISTEN/NOTIFY | **~$29** |
-| 100,000 daily users | Multi-region (`fly scale count 3`), shared-cpu-2x | Scale ($69) | Postgres LISTEN/NOTIFY | **~$150** |
-| 1,000,000 daily users | Autoscale max=20 across 5 regions, shared-cpu-4x | Business (~$500) | Postgres LISTEN/NOTIFY + optional Redis | **~$1,200** |
+These results describe one workload on a local host, not maximum capacity,
+an availability SLA, or a supported number of daily users. The cross-instance
+SSE check used two subscribers; thousands of subscribers were not tested.
+The application currently uses PostgreSQL LISTEN/NOTIFY and an in-process
+event bus; it does not ship a selectable Redis bus backend.
 
-The real-time bus scales **without adding a new service** all the way to
-~5,000 concurrent SSE subscribers per instance and ~500 events/sec cross-
-instance (Postgres LISTEN/NOTIFY comfort zone). Beyond that, drop in
-Upstash Redis (free 10k cmd/day → $10/mo → $50/mo tiers) — the same
-`bus.ts` module can toggle backends without any route changes.
+Before choosing instance counts, test the actual request mix, event payload
+sizes, dataset growth, concurrent subscribers, database connection limits,
+network latency, and failure recovery in the target environment. Repeat the
+workload for a sustained period and measure CPU, memory, latency, and cost.
 
 ## Portability & escape hatches
 
@@ -289,16 +320,21 @@ in the stack requires a proprietary service.
 **Move off Fly.io** → Cloud Run / Render / Railway / Koyeb / Kubernetes / VPS
 
 ```bash
-docker build -t agentvisor-api server/
-docker push $REG/agentvisor-api
+docker build -t "$REG/agentvisor-api" server/
+docker push "$REG/agentvisor-api"
 
-# On the new host — env names below match every platform we tested.
-docker run -p 8080:8080 \
-  -e DATABASE_URL="postgres://…" \
-  -e JWT_SECRET="…" \
-  -e ALLOWED_ORIGINS="https://agentvisorai.me" \
-  $REG/agentvisor-api
+# On the new host, supply the production settings through a private env file.
+docker run --read-only --tmpfs /tmp:uid=65532,gid=65532,mode=0700 \
+  --cap-drop ALL --security-opt no-new-privileges \
+  --env-file /secure/path/agentvisor-api.env -p 8080:8080 \
+  "$REG/agentvisor-api"
 ```
+
+The environment file must include `DATABASE_URL`, `JWT_SECRET`, the allowed
+origin and public URLs, and a configured mailer (`SMTP_URL` or `RESEND_API_KEY`).
+Keep the image's default entrypoint so migrations complete before traffic is
+served. See [the runtime instructions](README.md#production-container) for
+diagnostics that work without a shell inside the container.
 
 **Move off Neon** → any other Postgres
 
@@ -332,7 +368,9 @@ Every path off every platform is a single command.
 - **Password hashing.** Argon2id via the `argon2` native module. Cost:
   19 MiB × 2 iterations × 1 lane — meets OWASP 2024 recommendation.
 - **Rate limits.**
-  - Global: 300 req/min per authenticated user or IP.
+  - Global: 300 req/min per client IP on each API instance. Buckets live in
+    process memory, reset on restart, and are not shared between replicas.
+    Configure a fleet-wide ingress limit if the deployment requires one.
   - `/login`: 10/min per IP (credential stuffing).
   - `/signup`: 5/min per IP (registration spam).
   - `/reset-request`: 3/hour per IP (mailbox spam / mailer cost).
@@ -350,11 +388,15 @@ Every path off every platform is a single command.
   boundaries are enforced by the database via foreign keys and by the
   application via the session claim.
 - **Container hardening.**
-  - Runs as `node` (uid 1000), never root.
-  - `dumb-init` as PID 1 → fast, correct SIGTERM handling.
-  - Multi-stage build, no shell in the runtime CMD.
-  - Prisma migrations run on startup — a fresh DB is bootstrapped in
-    ~2 s before the API serves the first request.
+  - The pinned Debian 13 Distroless runtime runs as UID 65532 and contains
+    Node 22 with its shared libraries, without a shell or package manager.
+  - A Node entrypoint forwards SIGTERM and SIGINT to the active child process
+    group and preserves its exit status. Keep the image's default command.
+  - Prisma migrations must succeed before the API starts. Migration duration
+    depends on the database and pending schema changes.
+  - The runtime supports a read-only root filesystem with writable `/tmp`.
+    See [the container instructions](README.md#production-container) for the
+    exact mounts, diagnostics, and executable validation commands.
 - **Signed receipts.** Every session ends with an Ed25519-signed receipt
   posted by the daemon. The `deployment.publicKeyHex` is stored so the
   console can verify signatures client-side without trusting the API.

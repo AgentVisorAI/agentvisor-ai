@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":18446744073709551616,"method":"tools/call","params":{"name":"lookup","arguments":{"amount":1e999}}}

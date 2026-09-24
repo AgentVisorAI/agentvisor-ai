@@ -7,6 +7,50 @@ every tick, and how to reason about incidents that touch it.
 For the operator's *day-to-day* view (metrics, alerts, backup), see
 [OPERATIONS.md](OPERATIONS.md).
 
+An incomplete capture cannot support a complete signed receipt. Close and
+recovery publish an authenticated, retryable `agent.session` notification
+with `action: "quarantined"` and `evidence_complete: false`. Console sync
+turns this into the terminal `quarantined_crash_evidence` status and refuses
+receipt upload for that session. Already captured bridge events remain
+available as partial evidence; private journal files are never treated as
+a complete public event stream. Previously accepted signed receipts are
+not retroactively replaced by quarantine metadata.
+
+If a tool may have executed but its result cannot be captured, the live session
+also refuses close and promotion. Its authenticated primary `.intent.json`
+remains in `tool-executions`, with any partial outcome, so another restart
+retains the quarantine and cannot repeat that execution. Only completed triples
+with authenticated outcome and audit records move to `.capturefailed-<uid>`.
+A refused connection whose intent is successfully released remains retryable.
+
+Unresolved evidence intentionally occupies the active recovery directory. The
+100,000-entry recovery limit fails closed when that directory exceeds its cap;
+quarantine does not create unlimited recovery capacity. Monitor and investigate
+these incidents. Archive unresolved evidence only as an explicit operator
+recovery action, with the affected session IDs retired from further traffic and
+a consistent backup preserved. Removing the active intent removes the durable
+barrier that prevents replay of an uncertain tool execution.
+
+Close and fresh unsigned promotion also read the authenticated execution evidence
+after draining admitted work. This check remains effective if an in-memory
+quarantine entry was evicted. Unresolved or unreadable evidence returns a
+retryable 503 without deleting it. A valid outcome whose audit marker is pending
+can finish through the existing MCP replay path and then finalize; this check
+does not permanently quarantine that recoverable audit failure.
+Each close or fresh unsigned promotion scans the full active tool directory on a
+blocking worker, authenticating primary intents, with the same 100,000-entry cap.
+This adds work proportional to the active directory size. A concurrent unrelated
+intent that disappears or is still being written can cause a safe, retryable 503;
+the read-only check preserves all evidence and a later attempt can succeed.
+
+Startup refuses an authenticated unresolved intent that has no recoverable
+session metadata. This can occur if a crash precedes the authorization worker's
+first metadata commit. Restore a consistent backup or investigate the retained
+intent; recovery does not invent an identity or a clean session for it. Valid
+authenticated metadata waiting beyond a recovery pass's work limit is allowed to
+remain deferred, and the independent finalization check still prevents a receipt
+that omits the uncertain tool effect.
+
 ## What "the spool" is
 
 `atif_spool_dir` (default `spool/atif`, relative to the working
@@ -27,14 +71,15 @@ inventory:
 | `receipts/{stem}.json` | Signed receipt (signed workflow) | finalizer at close (`persist_receipt`) | never (audit evidence; manage retention externally) |
 | `receipts/{stem}.archived-<receipt-id>.json` | Prior incarnation's receipt after a recycled session id | `archive_conflicting_receipt` at the collision | never (preserved collision evidence) |
 | `{stem}.archived-<trajectory-id>` (+ `.atif-auth`, `.close-complete`) | Prior incarnation's ATIF evidence after a recycled session id | `archive_conflicting_atif` at the collision | never (preserved collision evidence) |
-| `outbox/{stem}.{kind}.json` where `kind` ∈ `{receipt, session-close}` | Bridge lifecycle events queued when the bus was unavailable at close time | close_session_locked | outbox drain after successful bridge emit |
+| `outbox/{stem}.{kind}.json` where `kind` ∈ `{receipt, session-close, session-quarantine}` | Authenticated lifecycle publication intents, persisted before publishing | close or recovery | acknowledged close/receipt intents are drained; quarantine intents move to `quarantine-notices` |
+| `quarantine-notices/{stem}.json` | Authenticated acknowledged quarantine notification, preserving notification identity across restarts | close, recovery, or outbox cleanup | retained with incident evidence, outside the bounded active replay scan |
 | `{stem}.acks.ndjson` | Sealed broker acks, one line per published event: proves an event we tried to publish actually landed | worker after successful emit (appended; one `sync_data` per ack — round-51 §7.3) | `remove_step_journal` at close, with the other journals |
 | `broker-acks/{stem}/{event_uid}.json` | Legacy pre-round-51 per-event ack layout; still read as a fallback so mid-session upgrades see their earlier acks | (no longer written) | `remove_step_journal` at close |
 | `inflight-responses/{digest}.json` | Response-attempt markers (`digest = sha256(session_id:attempt_id)[..32]`) proving the client's response was durably captured before the last chunk left the socket | worker (`persist_response_marker`) at capture commit | worker at capture retirement; recovery reaps stranded markers |
 | `tool-executions/{key}.intent.json` | JCS-canonicalized, MAC-sealed tool invocation intent; underpins the at-most-once tool-execution state machine | mcp route handler at admission | `remove_tool_executions` at successful close |
 | `tool-executions/{key}.outcome.json` | Sealed tool execution outcome (upstream response + status) | worker after tool call returns | `remove_tool_executions` at successful close |
 | `tool-executions/{key}.audited` | Marker: the tool call's audit event has landed on the broker | worker after the ack lands | `remove_tool_executions` at successful close |
-| `tool-executions/{key}.{suffix}.capturefailed-<uid>` | Quarantined tool triple (intent/outcome/audited) after `quarantine_tool_executions` fired on a capture-failed session | reconciler (`quarantine_tool_executions`) | never (preserved incident evidence) |
+| `tool-executions/{key}.{suffix}.capturefailed-<uid>` | Authenticated completed tool triple (intent/outcome/audited) archived when its session is capture-failed | reconciler (`quarantine_tool_executions`) | never (preserved incident evidence) |
 
 Every one of these files carries a `{stem}` derived as
 `sha256_hex(session_id.as_bytes())[..32]` — a 128-bit fixed-width
@@ -55,6 +100,15 @@ would sit above the same POSIX primitives — its atomicity is our
 recovery log is our journal replay.
 
 ## Recovery: what runs every tick
+
+A completed signed session is not a permanent entry in the daemon's active
+session registry. After its receipt and close event are durable, the daemon
+removes its recovery journal and may evict the session. After a restart,
+`POST /v1/sessions/{id}/promote` can therefore return `404` for that completed
+session. Its receipt remains under `receipts/` and in the event bridge; use
+the persisted receipt or the synchronized console for historical evidence.
+Restart verification must read that persisted artifact rather than assume
+the session control endpoint is a history API.
 
 `Finalizer::recover_spooled_sessions` runs at process start and every
 `reconcile_tick_s` seconds. It walks the spool and does five things,
@@ -182,11 +236,16 @@ comfortably inside any reasonable retention window.
 
 ## Backup and disaster recovery
 
-The spool is safe to `rsync` while the harness is running (POSIX
-guarantees on `.ndjson` append semantics), but not safe to
-partial-restore: a spool where some sessions are complete and some
-are half-migrated will cause the reconciler to emit truncated
-receipts. Snapshot the entire directory or nothing.
+Back up the entire spool using a consistent filesystem snapshot, or stop
+writes before making a file-by-file copy. An `rsync` taken during active writes
+is not guaranteed to contain a consistent set of journals, acknowledgments,
+and execution intents. Retain the matching signing and journal keys through
+your secret backup process.
+
+Restore the complete snapshot. Partial restoration can lose the evidence that
+prevents duplicate tool execution or proves incomplete capture. Recovery
+refuses detected inconsistencies; it cannot reconstruct files absent from the
+backup. Verify the restored instance in isolation before accepting traffic.
 
 Rebuild the audit chain from a fresh disk:
 

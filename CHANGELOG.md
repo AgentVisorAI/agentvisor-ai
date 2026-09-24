@@ -29,8 +29,117 @@ exercised against release binaries in CI on every push
   Kubernetes manifest are renamed accordingly. `find_server_binary`
   still falls back to the legacy binary names for source-built installs.
 - **Minimum supported Rust version raised to 1.94.**
+- Exchanged tokens now bind each revocation ancestor to its issuer. Reissue
+  exchanged tokens created by older builds: tokens without issuer ancestry
+  are refused because their revocation identity is ambiguous.
 
 ### Security
+
+- Console notification connections now have query deadlines, a listener
+  heartbeat, and a bounded publication queue. Recovery resets client streams
+  so they refetch committed changes. The readiness report marks the notification
+  bridge healthy only after PostgreSQL acknowledges the reset notification.
+- The authenticated full-stack Compose configuration disables the unauthenticated
+  dashboard, including access from peer containers. Cloud Foundry now declares
+  HTTP readiness checks and documents the foundation shutdown grace required
+  to finish request draining and audit finalization.
+- Pull-request CI now runs the real Redis token-expiry regression, and the
+  release workflow pins its Trivy scanner by multi-platform image digest.
+- Token introspection checks expiry again after shared revocation reads, so a
+  slow lookup cannot report an expired token as active. Storage failures retain
+  their unavailable response.
+- Console startup normalizes supported database aliases before migrations and
+  validates public URL settings. Production requires absolute HTTPS URLs.
+- Audit pagination preserves errors and retry state. Browser stream recovery
+  schedules one replacement connection and cancels it on unsubscribe, while
+  non-object JSON error responses retain authentication and rate-limit handling.
+- Telemetry rejects NUL characters before writing PostgreSQL text fields,
+  returning a validation error instead of a server error that retries cannot fix.
+- Uncertain MCP executions retain their authenticated intent across close and
+  restart, preventing duplicate remote effects. Finalization and fresh receipt
+  promotion check durable tool evidence even after session eviction. Startup
+  refuses unresolved executions whose session metadata cannot be recovered.
+- Tool-evidence lookup failures leave finalization retryable and preserve the
+  evidence. Missing completion audits can be completed through the existing
+  replay path before finalization succeeds.
+- SAML login state now lives in PostgreSQL, so callbacks can reach another
+  API replica or survive a process restart. Browser, tenant, configuration,
+  and expiry checks are consumed atomically; concurrent callbacks cannot mint
+  multiple sessions. Apply the new migration before updating API replicas.
+- SAML discovery failures remain visible in the browser instead of appearing
+  as missing workspace configuration. The login button now describes the
+  implemented sign-in flow, and unavailable request state prompts a retry.
+- Outbound MCP calls have a configurable total network deadline, including
+  response-body reads, with a 60-second default. Slow streams cannot retain a
+  tool admission slot indefinitely. Cancellation preserves the audit owner,
+  and budget refunds run outside the asynchronous request executor.
+- SAML logout reports a retryable failure when durable revocation fails. OIDC
+  discovery failures return through the login error page. Password-reset
+  requests cannot install a token for an address changed during hashing.
+- Console releases validate and scan local OCI artifacts before a separate
+  main-only job publishes them. Promotion preserves the tested image bytes and
+  attestations; Fly deploys the verified immutable digest. Pull request jobs
+  have no registry publication credentials.
+- Redis pools verify one connection at startup and grow on demand, preserving
+  the 32-connection cap and two-second checkout deadline. This fixes startup
+  failures caused by opening 32 complete TLS Cluster connections at once.
+- Console logout returns a retryable failure when durable revocation cannot
+  be written. The browser keeps its retry path and restores its live stream.
+  PostgreSQL notification recovery makes clients reconnect and refetch state;
+  failed handshakes and graceful shutdown release pending sockets and SSE clients.
+- The encrypted PostgreSQL backup validates and decrypts each archive before
+  publication, keeps credentials out of command arguments, and enforces bounded
+  execution with private temporary files and cleanup on handled cancellation.
+  CI now exercises encryption refusal, complete restore, and fixture cleanup.
+- Redis connections now support certificate-verified TLS, including private
+  certificate authorities through `SSL_CERT_FILE`. Insecure TLS URLs and
+  mixed encrypted/plaintext cluster seeds are refused. Live CI contracts
+  exercise trusted and untrusted certificates, hostname checks, credentials,
+  budget operations, and shared revocation over TLS.
+- Atomic audit writes now propagate directory synchronization failures after
+  rename. The complete visible file remains available for recovery, while
+  callers fail closed instead of claiming that the write is durable.
+- Holder-initiated revocation is scoped to the token issuer, preventing one
+  trusted issuer from revoking another issuer's token with the same JTI.
+  Operator revocations by JTI or agent instance remain deployment-wide.
+  Identity validation also rejects unsupported JOSE critical extensions,
+  unencoded payloads, reserved credential types, and unusable revocation IDs.
+- Holder revocation now validates trusted external tokens even when their key
+  identifier matches the gateway's identifier. An actual gateway signature
+  prevents malformed exchanged credentials from falling back to inbound
+  identity validation. Unknown delegation-parent keys remain retryable.
+- The TLS dependency is patched to rustls 0.23.45 for RUSTSEC-2026-0285.
+- Small chat requests without token quotas avoid the blocking-worker queue
+  after identity validation. Configured authentication, quota checks, and
+  large requests remain offloaded. This fixes a concurrency regression in
+  which durable filesystem work delayed otherwise inexpensive admission.
+- Incomplete captures produce a durable quarantine notification. Console
+  synchronization preserves the terminal `quarantined_crash_evidence` status
+  across restarts and refuses receipt upload for those sessions. The console
+  displays partial-evidence warnings and disables receipt actions.
+- Console synchronization refuses HTTP redirects and ambiguous destination
+  URLs, preventing redirects from forwarding captured evidence to another
+  endpoint. Full Compose installs private secrets with ownership readable
+  by the non-root daemon while preserving restrictive file permissions.
+- Revocation now covers the expiry tolerance, parent identities, and exchanged
+  tokens checked through authenticated introspection. Operators can revoke a
+  token by identifier or all existing tokens for one agent instance. New
+  revocations create signed audit records, with explicit metrics for audit
+  capacity or capture failures. Redis revocation reads now use a circuit
+  breaker and a bounded cache of known revocations, with health metrics
+  and refusal preserved during storage outages.
+- MCP requests validate identity once, bind sessions and cached results to
+  the human principal, and audit exchange refusals before charging budget.
+  Tool credentials, public exchanges, and intent proofs use distinct JWT
+  types; backend verifiers must enforce the documented profile.
+- Redaction bounds card-number scanning, detects current API-key alphabets,
+  handles numeric tool arguments, and redacts ATIF copies before journaling.
+- Cloud Foundry deployment requires identity and uses an internal route by
+  default. The classic buildpack and Cloud Native Buildpack both have
+  executable lifecycle checks. `scripts/live-pillars.sh` exercises the real
+  daemon, including optional Redis sharing, restart, and outage checks.
+- Tenant OTLP traces and their owner-only authentication file are now wired
+  to an exporter that does not inherit operational collector credentials.
 
 - Receipt verification uses Ed25519 `verify_strict` everywhere, and key
   registration refuses small-order and known-weak public keys — closing
@@ -89,6 +198,40 @@ exercised against release binaries in CI on every push
 
 ### Added
 
+- **Per-agent identity, authorization, and credential isolation for tool
+  calls.**
+  - `[[backends]]` routes each tool to its own MCP server with its own
+    credential (`none`, `static_env`, `static_file`, or `exchange`). The
+    caller's `Authorization` header is never forwarded. With no
+    `[[backends]]`, `tool_upstream_url` and its `tool_upstream_bearer_*`
+    credential behave exactly as before.
+  - `auth = "exchange"` performs an RFC 8693 token exchange on every call.
+    The backend receives a short-lived EdDSA token with `aud` set to the
+    backend name and `tool:<called tool>` as its only scope; `sub` stays
+    the human principal, and `act.sub` names the calling agent.
+  - `POST /v1/token` exposes the same exchange (opt-in). It signs only for
+    configured backend names and answers `invalid_target` otherwise.
+    `GET /.well-known/jwks.json` publishes the verification key.
+  - `[intent_map]`, `require_intent_mapping`, and `[mission]` define a
+    policy decision point that runs before the budget is charged, in every
+    mode. A denial costs no budget and is audited with its code
+    (`UNMAPPED_TOOL`, `MISSION_EXPIRED`, `MISSION_DENIED`).
+  - Forwarded calls carry a signed intent token (`x-av-intent-token`,
+    `typ: av-intent+jwt`) bound to the receiving backend and the calling
+    agent.
+  - `POST /v1/revoke` implements RFC 7009 for NHI tokens. Revoking a token
+    also refuses every token delegated from it, and with
+    `state_backend = "redis"` a revocation applies to every replica. An
+    unreadable revocation list fails closed with `503`, not `401`.
+  - Every JSON-RPC denial now carries its machine-readable code in
+    `error.data.code` (`av_sandbox::rpc::denial_error`).
+  - Boot validation refuses token exchange without a signing seed, an
+    identity source, and at least one backend, and refuses exchange
+    backends without `require_identity = true`.
+  - `redaction_patterns` and `redaction_paths` strip secrets (API keys,
+    bearer tokens, emails, card numbers, SSNs, non-RFC1918 IPv4 addresses, and
+    custom patterns) from event payloads and from ATIF step text before
+    anything is written to the journal or published.
 - **Daemon-side policy attribution.** `ToolVerdict::Blocked` now carries
   the name of the policy engine that denied (`stage: "policy"` chain
   denials and the built-in `workflow.signed_required` consequential-tool

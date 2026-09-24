@@ -18,10 +18,12 @@
 //! Every verdict is returned with machine-readable context so the harness can
 //! emit the per-call OCSF event (allowed or blocked, with budget consumption).
 
+pub mod denial_code;
 pub mod policy;
 pub mod rpc;
 pub mod sandbox;
 
+pub use denial_code::DenialCode;
 pub use policy::{NativePolicy, PolicyDecision, PolicyEngine};
 pub use rpc::{parse_tool_call, refuse_duplicate_json_keys, RpcError, ToolCallRequest};
 pub use sandbox::{Sandbox, SandboxConfig, ToolVerdict};

@@ -22,7 +22,9 @@
  * Failure mode: if the LISTEN connection ever drops we log, back off,
  * and reconnect. During the reconnect window each instance falls back
  * to in-process delivery — no messages lost within an instance, only
- * cross-instance until the LISTEN comes back.
+ * cross-instance until the LISTEN comes back. Recovery resets open SSE
+ * streams locally and on other instances so clients refetch any missed
+ * changes from the database.
  */
 
 import { EventEmitter } from "node:events";
@@ -47,21 +49,87 @@ export type EventPayload =
 // payload deserializes with originId=undefined, doesn't match
 // PROCESS_ORIGIN_ID, so a new receiver still re-emits it.
 // Symmetric in both directions across the rolling window.
-type WirePayload = EventPayload & { originId?: string };
-
-const PROCESS_ORIGIN_ID = randomBytes(8).toString("hex");
+type WirePayload = (EventPayload | { type: "bridge.reset" }) & { originId?: string };
 
 const NOTIFY_CHANNEL = "av_bus";
 // Postgres NOTIFY payload cap is 8000 bytes. Our payloads are small
 // (~200-400 bytes) but we guard against a runaway anyway.
 const MAX_PAYLOAD_BYTES = 7500;
+const QUERY_TIMEOUT_MS = 5000;
+const LISTENER_HEARTBEAT_MS = 15_000;
+// Bound retained payloads/promises when PostgreSQL stops answering. Overflow
+// preserves local delivery, then reconnects and resets peers so they refetch
+// committed changes from the database instead of retaining an unbounded queue.
+const MAX_PENDING_PUBLICATIONS = 256;
 
-class Bus extends EventEmitter {
+function bridgeQuery(client: PgClient, text: string, values?: string[]) {
+  // pg accepts per-query timeouts, but its current QueryConfig typings omit
+  // that field. A structurally compatible object preserves all normal types.
+  // These deadlines take precedence over DATABASE_URL query_timeout options.
+  const query = { text, values, query_timeout: QUERY_TIMEOUT_MS };
+  return client.query(query);
+}
+
+export class Bus extends EventEmitter {
+  private readonly originId = randomBytes(8).toString("hex");
   private pgListener: PgClient | null = null;
   private pgPublisher: PgClient | null = null;
+  private bridgeReady = false;
+  private pendingPublications = 0;
   private reconnecting = false;
   private reconnectDelayMs = 500;
   private closed = false;
+  private reconnectTimer: NodeJS.Timeout | undefined;
+  private listenerHeartbeatTimer: NodeJS.Timeout | undefined;
+  private connectionGeneration = 0;
+  private readonly openingClients = new Set<PgClient>();
+  private readonly pendingConnects = new Map<PgClient, () => void>();
+  private readonly closingClients = new WeakMap<PgClient, Promise<void>>();
+
+  private async connectClient(client: PgClient): Promise<void> {
+    const cancelled = new Promise<never>((_resolve, reject) => {
+      this.pendingConnects.set(client, () => reject(new Error("bus_connect_cancelled")));
+    });
+    try {
+      // pg.end() does not settle pg.connect() during authentication.
+      // Race an explicit cancellation so shutdown also settles callers.
+      await Promise.race([client.connect(), cancelled]);
+    } finally {
+      this.pendingConnects.delete(client);
+    }
+  }
+
+  private closeClient(client: PgClient): Promise<void> {
+    const closing = this.closingClients.get(client);
+    if (closing) return closing;
+    client.removeAllListeners();
+    client.on("error", () => {});
+    // Share the same close between shutdown and a failed opening attempt.
+    // Weak keys retain no finished client solely for this bookkeeping.
+    const ended = Promise.resolve().then(() => client.end()).catch(() => {});
+    this.closingClients.set(client, ended);
+    return ended;
+  }
+
+  private scheduleListenerHeartbeat(listener: PgClient, generation: number): void {
+    const current = (): boolean => !this.closed
+      && generation === this.connectionGeneration && this.pgListener === listener;
+    if (!current()) return;
+    // LISTEN is otherwise idle indefinitely. TCP can stay established while
+    // all incoming data disappears, even when the separate publisher works.
+    // Keep only one liveness query/timer, with the same query deadline as setup.
+    const timer = setTimeout(() => {
+      if (this.listenerHeartbeatTimer === timer) this.listenerHeartbeatTimer = undefined;
+      if (!current()) return;
+      bridgeQuery(listener, "SELECT 1 /* av_bus listener heartbeat */").then(() => {
+        if (current()) this.scheduleListenerHeartbeat(listener, generation);
+      }, () => {
+        if (current()) this.scheduleReconnect();
+      });
+    }, LISTENER_HEARTBEAT_MS);
+    this.listenerHeartbeatTimer = timer;
+    timer.unref();
+  }
 
   publish(ev: EventPayload): void {
     // Always deliver locally first so single-instance and same-node tabs
@@ -77,7 +145,7 @@ class Bus extends EventEmitter {
       // + originId sibling. Pre-R110 receivers reading `payload.orgId`
       // still work; R110+ receivers use `payload.originId` to skip
       // self-delivery. See WirePayload type comment.
-      const wire: WirePayload = { ...ev, originId: PROCESS_ORIGIN_ID };
+      const wire: WirePayload = { ...ev, originId: this.originId };
       const payload = JSON.stringify(wire);
       if (Buffer.byteLength(payload) > MAX_PAYLOAD_BYTES) {
         // Skip cross-instance for oversized payloads; local delivery
@@ -102,10 +170,22 @@ class Bus extends EventEmitter {
         });
         return;
       }
-      this.pgPublisher
-        .query("SELECT pg_notify($1::text, $2::text)", [NOTIFY_CHANNEL, payload])
-        .catch(() => {
-          // Publisher gone — the reconnect loop will replace it.
+      const publisher = this.pgPublisher;
+      if (this.pendingPublications >= MAX_PENDING_PUBLICATIONS) {
+        this.scheduleReconnect();
+        return;
+      }
+      this.pendingPublications++;
+      bridgeQuery(publisher, "SELECT pg_notify($1::text, $2::text)", [NOTIFY_CHANNEL, payload])
+        .then(() => {
+          if (this.pgPublisher === publisher) this.pendingPublications--;
+        }, () => {
+          // Query failures need not emit a Client error. A failed
+          // publication lost an update for other instances: reconnect
+          // and broadcast a reset before resuming normal delivery. In pg,
+          // query_timeout alone does not close a non-pipelined active query;
+          // reconnect also closes that socket and rejects its queued work.
+          if (this.pgPublisher === publisher) this.scheduleReconnect();
         });
     }
   }
@@ -116,6 +196,11 @@ class Bus extends EventEmitter {
     return () => this.off(key, listener);
   }
 
+  subscribeReset(listener: () => void): () => void {
+    this.on("bridge:reset", listener);
+    return () => this.off("bridge:reset", listener);
+  }
+
   /**
    * Connect the LISTEN + NOTIFY sidecar. Safe to call once at boot.
    * Silent no-op when DATABASE_URL is unavailable — the in-process bus
@@ -123,6 +208,7 @@ class Bus extends EventEmitter {
    */
   async connectPgBridge(): Promise<boolean> {
     if (!env.DATABASE_URL || !isPostgresUrl(env.DATABASE_URL)) return false;
+    const generation = this.connectionGeneration;
     try {
       await this.openConnections();
       return true;
@@ -130,13 +216,20 @@ class Bus extends EventEmitter {
       // Log once — the reconnect loop retries silently on cadence.
       // eslint-disable-next-line no-console
       console.warn("bus: pg bridge unavailable at boot, falling back to in-process only", err instanceof Error ? err.message : err);
-      this.scheduleReconnect();
+      if (generation === this.connectionGeneration) this.scheduleReconnect();
       return false;
     }
   }
 
   private async openConnections(): Promise<void> {
-    const listener = new PgClient({ connectionString: env.DATABASE_URL });
+    const generation = this.connectionGeneration;
+    const current = (): boolean => !this.closed && generation === this.connectionGeneration;
+    const listener = new PgClient({
+      connectionString: env.DATABASE_URL, connectionTimeoutMillis: 5000,
+      query_timeout: QUERY_TIMEOUT_MS,
+    });
+    this.openingClients.add(listener);
+    let publisher: PgClient | undefined;
     // R233 F1: attach the drain/reconnect handlers IMMEDIATELY, before
     // `.connect()`. Prior shape wired them at lines 180+ after
     // connect + LISTEN succeeded, leaving a race window where an
@@ -148,17 +241,17 @@ class Bus extends EventEmitter {
     // handlers pre-connect so the first byte of any error path is
     // always caught. `scheduleReconnect()` is re-entrant-safe.
     const listenerErr = (err: Error) => {
+      if (!current()) return;
       // eslint-disable-next-line no-console
       console.warn("bus: pg listener error, reconnecting", err.message);
       this.scheduleReconnect();
     };
     const listenerEnd = () => {
-      if (!this.closed) this.scheduleReconnect();
+      if (current()) this.scheduleReconnect();
     };
     listener.on("error", listenerErr);
     listener.on("end", listenerEnd);
-    await listener.connect();
-    // R145 F2: wrap everything after listener.connect() in try/catch
+    // R145 F2: wrap both connections and LISTEN in try/catch
     // so a partial-connect failure (Postgres briefly at
     // max_connections, TLS renegotiation, transient DNS on the
     // publisher's connect, .on wiring throwing synchronously)
@@ -169,7 +262,9 @@ class Bus extends EventEmitter {
     // flaps dripped permanent Postgres connections until the
     // pool ceiling was hit.
     try {
-      await listener.query(`LISTEN ${NOTIFY_CHANNEL}`);
+      await this.connectClient(listener);
+      await bridgeQuery(listener, `LISTEN ${NOTIFY_CHANNEL}`);
+      if (!current()) throw new Error("bus_disconnected_during_connect");
       listener.on("notification", (msg) => {
         if (msg.channel !== NOTIFY_CHANNEL || !msg.payload) return;
         try {
@@ -182,7 +277,14 @@ class Bus extends EventEmitter {
           // delivered locally). Symmetric backward-compat across a
           // rolling deploy.
           const parsed = JSON.parse(msg.payload) as WirePayload;
-          if (parsed.originId === PROCESS_ORIGIN_ID) return;
+          if (parsed.originId === this.originId) return;
+          if (parsed.type === "bridge.reset") {
+            // This contains no tenant data. Any publisher could have
+            // missed notifications for any connected tenant while its
+            // bridge was down, including tenants on healthy instances.
+            this.emit("bridge:reset");
+            return;
+          }
           // Re-emit locally so any SSE subscribers on THIS node see the
           // cross-instance update. Skip the fan-out back to pg by not
           // going through publish() — we're already inside a NOTIFY.
@@ -198,47 +300,65 @@ class Bus extends EventEmitter {
         }
       });
 
-      const publisher = new PgClient({ connectionString: env.DATABASE_URL });
+      publisher = new PgClient({
+        connectionString: env.DATABASE_URL, connectionTimeoutMillis: 5000,
+        query_timeout: QUERY_TIMEOUT_MS,
+      });
+      this.openingClients.add(publisher);
       // R233 F1: same pre-connect error-listener discipline as the
       // listener above.
       publisher.on("error", (err) => {
+        if (!current()) return;
         // eslint-disable-next-line no-console
         console.warn("bus: pg publisher error, reconnecting", err.message);
         this.scheduleReconnect();
       });
       publisher.on("end", () => {
-        if (!this.closed) this.scheduleReconnect();
+        if (current()) this.scheduleReconnect();
       });
-      await publisher.connect();
+      await this.connectClient(publisher);
 
-      // close() may have run while the connects above were in flight:
-      // it swept this.pgListener/pgPublisher (both still null at that
-      // point) and resolved — assigning here would resurrect two live
-      // PG sockets on a closed bus (isReady() flips back to true and
-      // the connections leak until process exit). Tear down instead.
-      if (this.closed) {
-        publisher.removeAllListeners();
-        publisher.on("error", () => {});
-        await publisher.end().catch(() => void 0);
-        throw new Error("bus_closed_during_connect");
-      }
+      // A close or reconnect may have invalidated this attempt while
+      // either connection was pending. Never resurrect its sockets or
+      // let its later errors tear down a newer, healthy bridge.
+      if (!current()) throw new Error("bus_disconnected_during_connect");
       this.pgListener = listener;
       this.pgPublisher = publisher;
+      await bridgeQuery(publisher, "SELECT pg_notify($1::text, $2::text)", [
+        NOTIFY_CHANNEL, JSON.stringify({ type: "bridge.reset", originId: this.originId }),
+      ]);
+      if (!current() || this.pgListener !== listener || this.pgPublisher !== publisher) {
+        throw new Error("bus_disconnected_during_connect");
+      }
+      this.bridgeReady = true;
+      this.emit("bridge:reset");
       this.reconnectDelayMs = 500; // reset backoff after a successful open
+      this.scheduleListenerHeartbeat(listener, generation);
     } catch (err) {
       // Drain the already-connected listener socket before rethrowing
       // so the caller can retry cleanly.
-      listener.removeAllListeners();
-      // Re-add a passthrough noop so `end()`'s finalizing error (if the
-      // socket is already half-dead) doesn't crash node.
-      listener.on("error", () => {});
-      await listener.end().catch(() => void 0);
+      if (this.pgListener === listener) {
+        this.pgListener = null;
+        this.bridgeReady = false;
+      }
+      if (this.pgPublisher === publisher) {
+        this.pgPublisher = null;
+        this.pendingPublications = 0;
+        this.bridgeReady = false;
+      }
+      await Promise.all([this.closeClient(listener), publisher ? this.closeClient(publisher) : undefined]);
       throw err;
+    } finally {
+      this.openingClients.delete(listener);
+      if (publisher) this.openingClients.delete(publisher);
     }
   }
 
   private scheduleReconnect(): void {
     if (this.reconnecting || this.closed) return;
+    this.connectionGeneration++;
+    if (this.listenerHeartbeatTimer !== undefined) clearTimeout(this.listenerHeartbeatTimer);
+    this.listenerHeartbeatTimer = undefined;
     // R213 F1: increment the previously-dead Prometheus counter.
     // Counter is declared at lib/metrics.ts:44 with the comment
     // "useful signal that Neon or whichever managed PG we're on
@@ -254,6 +374,8 @@ class Bus extends EventEmitter {
     const publisher = this.pgPublisher;
     this.pgListener = null;
     this.pgPublisher = null;
+    this.bridgeReady = false;
+    this.pendingPublications = 0;
     // Drain any lingering handlers before we open new sockets.
     // R233 F1: `removeAllListeners()` also strips the `error` handler
     // we wired at openConnections(). If the server-side connection is
@@ -264,18 +386,18 @@ class Bus extends EventEmitter {
     // Postgres-chaos scenario. Re-add a passthrough noop handler so
     // any error that races the drain gets swallowed, then let
     // scheduleReconnect() spin up fresh sockets on the backoff timer.
-    listener?.removeAllListeners();
-    publisher?.removeAllListeners();
-    listener?.on("error", () => { /* drained; reconnect in flight */ });
-    publisher?.on("error", () => { /* drained; reconnect in flight */ });
-    listener?.end().catch(() => {});
-    publisher?.end().catch(() => {});
+    for (const cancel of this.pendingConnects.values()) cancel();
+    for (const client of new Set([...this.openingClients, listener, publisher])) {
+      if (client) void this.closeClient(client);
+    }
 
     const delay = this.reconnectDelayMs;
     this.reconnectDelayMs = Math.min(this.reconnectDelayMs * 2, 30_000);
-    setTimeout(async () => {
+    this.reconnectTimer = setTimeout(async () => {
+      this.reconnectTimer = undefined;
       this.reconnecting = false;
       if (this.closed) return;
+      const generation = this.connectionGeneration;
       try {
         await this.openConnections();
       } catch (err) {
@@ -284,7 +406,7 @@ class Bus extends EventEmitter {
           "bus: reconnect failed, retrying",
           err instanceof Error ? err.message : err,
         );
-        this.scheduleReconnect();
+        if (generation === this.connectionGeneration) this.scheduleReconnect();
       }
     }, delay);
   }
@@ -296,19 +418,26 @@ class Bus extends EventEmitter {
    * "degraded but serving".
    */
   isReady(): boolean {
-    return this.pgListener !== null && this.pgPublisher !== null;
+    return this.bridgeReady;
   }
 
   /** Close both pg sockets. Fastify graceful shutdown hook calls this. */
   async close(): Promise<void> {
     this.closed = true;
+    this.connectionGeneration++;
+    if (this.reconnectTimer !== undefined) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = undefined;
+    if (this.listenerHeartbeatTimer !== undefined) clearTimeout(this.listenerHeartbeatTimer);
+    this.listenerHeartbeatTimer = undefined;
     const listener = this.pgListener;
     const publisher = this.pgPublisher;
     this.pgListener = null;
     this.pgPublisher = null;
-    listener?.removeAllListeners();
-    publisher?.removeAllListeners();
-    await Promise.allSettled([listener?.end(), publisher?.end()]);
+    this.bridgeReady = false;
+    this.pendingPublications = 0;
+    for (const cancel of this.pendingConnects.values()) cancel();
+    await Promise.all([...new Set([...this.openingClients, listener, publisher])]
+      .map((client) => client ? this.closeClient(client) : undefined));
   }
 }
 

@@ -63,6 +63,7 @@ pub struct Session {
     pub identity: AgentIdentity,
     /// Most recently validated identity, including current TTL.
     latest_identity: Mutex<AgentIdentity>,
+    principal_binding: Mutex<Option<Option<String>>>,
     /// Monotonic per-session event sequence (authoritative order).
     seq: AtomicU64,
     /// Monotonic authenticated-journal record index.
@@ -189,6 +190,23 @@ pub struct Totals {
 }
 
 impl Session {
+    /// Digest of the authenticated issuer and human principal, if any.
+    pub(crate) fn principal_binding(&self) -> Option<String> {
+        self.principal_binding.lock().clone().flatten()
+    }
+
+    /// Bind a fresh session once, and refuse a different principal thereafter.
+    pub(crate) fn bind_principal(&self, principal: Option<&str>) -> bool {
+        let mut binding = self.principal_binding.lock();
+        match binding.as_ref() {
+            Some(current) => current.as_deref() == principal,
+            None => {
+                *binding = Some(principal.map(str::to_owned));
+                true
+            }
+        }
+    }
+
     /// Open a session.
     pub fn new(
         id: String,
@@ -217,6 +235,7 @@ impl Session {
             workflow,
             identity: identity.clone(),
             latest_identity: Mutex::new(identity.clone()),
+            principal_binding: Mutex::new(None),
             seq: AtomicU64::new(0),
             journal_index: AtomicU64::new(0),
             loop_state: av_loopdetect::SessionLoopState::new(breaker),
@@ -513,7 +532,23 @@ impl Session {
         metrics: Option<&av_atif::FinalMetrics>,
         next_seq: u64,
     ) -> Result<Self, String> {
+        Self::recover_unsigned_with_principal(id, identity, breaker, path, metrics, next_seq, None)
+    }
+
+    /// Recover an authenticated ATIF artifact with its persisted owner. Legacy
+    /// artifacts without an owner bind anonymously, so a later authenticated
+    /// caller cannot claim them merely by sharing an agent instance id.
+    pub(crate) fn recover_unsigned_with_principal(
+        id: String,
+        identity: AgentIdentity,
+        breaker: av_loopdetect::BreakerConfig,
+        path: PathBuf,
+        metrics: Option<&av_atif::FinalMetrics>,
+        next_seq: u64,
+        principal: Option<&str>,
+    ) -> Result<Self, String> {
         let session = Self::new(id, Workflow::Unsigned, identity, breaker);
+        session.bind_principal(principal);
         session.restore_next_seq(next_seq);
         // A recovered artifact is by definition past close: claim the
         // close (fresh session — the claim cannot fail) and seal, so
@@ -631,11 +666,28 @@ impl Session {
         };
         let replacement = av_atif::TrajectoryBuilder::new(agent, Some(self.id.clone()));
         let builder = std::mem::replace(&mut *self.atif.lock(), replacement);
-        builder.finish()
+        let mut trajectory = builder.finish();
+        self.stamp_trajectory_principal(&mut trajectory);
+        trajectory
     }
 
     pub(crate) fn snapshot_trajectory(&self) -> av_atif::Trajectory {
-        self.atif.lock().clone().finish()
+        let mut trajectory = self.atif.lock().clone().finish();
+        self.stamp_trajectory_principal(&mut trajectory);
+        trajectory
+    }
+
+    fn stamp_trajectory_principal(&self, trajectory: &mut av_atif::Trajectory) {
+        let extra = trajectory
+            .agent
+            .extra
+            .get_or_insert_with(|| serde_json::json!({}));
+        if let Some(extra) = extra.as_object_mut() {
+            extra.insert(
+                "principal_binding".into(),
+                serde_json::json!(self.principal_binding()),
+            );
+        }
     }
 
     /// Release the trajectory builder's memory after a durable close.
@@ -1102,7 +1154,15 @@ impl SessionRegistry {
             .map(|entry| Arc::clone(&entry))
             .collect();
         if latched.len() > MAX_LATCHED_RETAINED {
-            latched.sort_by_key(|session| std::cmp::Reverse(session.idle_duration()));
+            let mut with_idle: Vec<_> = latched
+                .into_iter()
+                .map(|s| {
+                    let d = s.idle_duration();
+                    (s, d)
+                })
+                .collect();
+            with_idle.sort_by_key(|(_, d)| std::cmp::Reverse(*d));
+            latched = with_idle.into_iter().map(|(s, _)| s).collect();
             let excess = latched.len() - MAX_LATCHED_RETAINED;
             tracing::warn!(
                 excess,
@@ -1149,7 +1209,15 @@ impl SessionRegistry {
             .map(|entry| Arc::clone(&entry))
             .collect();
         if capture_failed.len() > MAX_CAPTURE_FAILED_RETAINED {
-            capture_failed.sort_by_key(|session| std::cmp::Reverse(session.idle_duration()));
+            let mut with_idle: Vec<_> = capture_failed
+                .into_iter()
+                .map(|s| {
+                    let d = s.idle_duration();
+                    (s, d)
+                })
+                .collect();
+            with_idle.sort_by_key(|(_, d)| std::cmp::Reverse(*d));
+            capture_failed = with_idle.into_iter().map(|(s, _)| s).collect();
             let excess = capture_failed.len() - MAX_CAPTURE_FAILED_RETAINED;
             tracing::warn!(
                 excess,
@@ -1187,7 +1255,15 @@ impl SessionRegistry {
             .map(|entry| Arc::clone(&entry))
             .collect();
         if empty_quarantined.len() > MAX_EMPTY_UNSIGNED_RETAINED {
-            empty_quarantined.sort_by_key(|session| std::cmp::Reverse(session.idle_duration()));
+            let mut with_idle: Vec<_> = empty_quarantined
+                .into_iter()
+                .map(|s| {
+                    let d = s.idle_duration();
+                    (s, d)
+                })
+                .collect();
+            with_idle.sort_by_key(|(_, d)| std::cmp::Reverse(*d));
+            empty_quarantined = with_idle.into_iter().map(|(s, _)| s).collect();
             let excess = empty_quarantined.len() - MAX_EMPTY_UNSIGNED_RETAINED;
             tracing::warn!(
                 excess,
@@ -1298,6 +1374,38 @@ mod tests {
             instance_uid: "i".into(),
             ttl_remaining_s: None,
         }
+    }
+
+    #[test]
+    fn trajectory_snapshots_capture_a_principal_bound_after_construction() {
+        let session = Session::new(
+            "snapshot-owner".into(),
+            Workflow::Unsigned,
+            identity(),
+            Default::default(),
+        );
+        assert!(session.bind_principal(Some("principal-a")));
+        assert_eq!(
+            session
+                .snapshot_trajectory()
+                .agent
+                .extra
+                .unwrap()
+                .get("principal_binding")
+                .unwrap(),
+            "principal-a"
+        );
+        assert_eq!(
+            session
+                .take_trajectory()
+                .agent
+                .extra
+                .unwrap()
+                .get("principal_binding")
+                .unwrap(),
+            "principal-a"
+        );
+        assert!(!session.bind_principal(Some("principal-b")));
     }
 
     /// Mutation-run hardening (round 10): `restore_journal_index` had a

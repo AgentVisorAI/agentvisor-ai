@@ -63,8 +63,9 @@ source. All are optional.
 | `upstream_authorization_passthrough` | `false` | Forward the client's `Authorization` header verbatim to the upstream. **Incompatible with `require_identity = true`** (the header carries the NHI identity token there, not an upstream credential) and with the static upstream key options — boot refuses those combinations. |
 | `ignore_client_authorization` | `false` | Accept and DISCARD a client `Authorization` bearer when no identity validator is configured (stock OpenAI SDKs always send a placeholder key; without this a keyless dev upstream 401s the documented quickstart on request one). The header never reaches the upstream. Refused in combination with `require_identity = true` or `upstream_authorization_passthrough = true`. |
 | `upstream_http2_prior_knowledge` | `false` | Skip HTTP/1 → HTTP/2 upgrade negotiation on the outbound connection. |
-| `upstream_read_timeout_s` | `60` | Per-request read timeout. Left unset, a 60 s default applies — it also feeds the `shutdown_drain_timeout_s` derivation below, preserving the "one in-flight request cannot outlive the drain window" invariant. |
-| `shutdown_drain_timeout_s` | `max(30, upstream_read_timeout_s + 5)` | Graceful-shutdown drain budget. |
+| `upstream_read_timeout_s` | `60` | Read-idle timeout for upstream requests. Each successful read restarts it; this does not limit total streamed-chat duration. The allowed range is 1–86400 seconds. |
+| `mcp_request_timeout_s` | `60` | Total deadline for each outbound MCP HTTP request, from connection establishment through response-body completion, including after caller cancellation. The allowed range is 1–86400 seconds. It does not bound admission, audit work, or streamed chat. A timeout after response headers is recorded and audited as a replayable 502; a timeout before response headers leaves the execution uncertain, so a retry cannot repeat possible tool effects. |
+| `shutdown_drain_timeout_s` | `max(30, max(upstream_read_timeout_s, mcp_request_timeout_s) + 5)` | Graceful-shutdown drain budget, using the network settings' defaults when unset. Long chat streams and audit work can exceed this budget; an explicit value overrides the derivation. |
 | `shutdown_ready_drain_s` | `0` | Readiness-controlled pre-drain window: on SIGTERM, `/readyz` serves 503 while the listener keeps accepting for this long before the drain begins. Needed for every deployment target where the LB polls `/readyz` — this includes Kubernetes distroless images (no `/bin/sh` for a `preStop` sleep hook), docker-compose, systemd, and bare-VM LBs. The shipped k8s manifest sets this to `5`. |
 | `upstream_api_key_env` / `upstream_api_key_file` | none | Where to pull the outbound API key from. `_file` wins over `_env` when both are set. |
 | `upstream_auth_header` | `authorization` | Header carrying the upstream API key — `authorization` (OpenAI), `api-key` (Azure), `x-api-key` (Anthropic). |
@@ -136,6 +137,236 @@ max_payout_usd_micros }`).
 | `vector_backend` | `memory` | Reasoning-vector persistence: `memory` or `qdrant` (build with `--features qdrant`). |
 | `qdrant_url` | none | Qdrant base URL; required when `vector_backend = "qdrant"`. |
 | `qdrant_collection` | `agent_steps` | Qdrant collection receiving reasoning vectors. |
+
+## Delegation and token exchange
+
+| Key | Default | Notes |
+| --- | --- | --- |
+| `max_delegation_depth` | `4` | Maximum combined depth of `parent_token` chain links and `act` claim nesting. Tokens exceeding this depth are rejected. |
+| `token_exchange_enabled` | `false` | Enable the RFC 8693 token exchange endpoint at `/v1/token`. Boot refuses it unless `token_exchange_seed_file`, an identity source (`identity_jwks_url` or `identity_hmac_secret_file`), and at least one `[[backends]]` entry are configured. |
+| `token_exchange_seed_file` | none | Ed25519 signing seed file for exchanged tokens and intent tokens (owner-only permissions enforced; must be distinct from the receipt signing seed). Its public key is served at `/.well-known/jwks.json` so backends can verify both kinds of token. |
+| `token_exchange_ttl_s` | `300` | TTL in seconds for exchanged tokens. Capped at 900 to prevent indefinite delegation. |
+
+The exchange signs tokens only for audiences that name a configured
+backend. A request for any other audience, or any request while no
+backends exist, is refused with the RFC 8693 `invalid_target` error. A
+subject token that fails validation is refused with `invalid_request`, and
+the description is deliberately generic: it never names key ids, issuers,
+or algorithms. When the revocation list cannot be read, the endpoint
+answers `503` with `temporarily_unavailable` and `Retry-After`.
+
+## Token revocation (`POST /v1/revoke`)
+
+Send a form field `token=<jwt>` to revoke an inbound NHI token or a token
+issued by this gateway. The optional `token_type_hint` is ignored. The
+route is available when an identity validator is configured. Possession
+of the token permits its revocation; invalid and already revoked tokens
+receive the same empty `200` response with `Cache-Control: no-store`.
+The gateway verifies the signature before writing any revocation entry.
+Inbound delegation chains embed complete parent bearer tokens. A delegate
+can therefore extract and use or revoke its parent token, which also
+revokes sibling chains. Use this format only between mutually trusted
+delegates; it does not isolate a parent credential from its delegates.
+Exchanged tokens embed ancestor identifiers instead of parent credentials.
+A correctly signed token scheduled to become valid within the bounded
+15-minute scheduling window can also be revoked before activation.
+An unknown signing key receives `503` so the caller can retry after key
+rotation, rather than being told that a revocation succeeded.
+
+An NHI revocation covers the token's full expiry tolerance. It also blocks
+every child that includes the token in its delegation chain. Exchanged
+tokens carry signed identifiers of their original ancestors, without
+embedding their bearer credentials. Revoking an ancestor makes its
+exchanged tokens inactive when a backend checks introspection.
+
+With `state_backend = "redis"`, revocation entries and instance cutoffs
+are shared across replicas and retained for 24 hours. With `"memory"`,
+they belong to one process and are lost on restart. Memory entries are
+swept after their final acceptance time. A storage failure returns `503`
+with `Retry-After`; it never silently treats an unreadable list as empty.
+
+Use a `rediss://` endpoint for certificate-verified Redis TLS. The hostname
+must match the server certificate. The native trust store is used by default;
+set `SSL_CERT_FILE` to a readable PEM CA bundle when Redis uses a private CA.
+Include public roots needed by other clients that honor this environment
+variable. Insecure TLS URLs are refused. All comma-separated Redis Cluster
+seeds must use the same transport. The `redis` Cargo feature includes TLS
+support; the production container enables it.
+
+Redis revocation reads allow at most 32 concurrent calls per token namespace.
+After three consecutive storage errors, a circuit breaker refuses reads
+immediately for one second. One caller then checks whether storage has
+recovered. A bounded local cache holds up to 100,000 known revocations per
+namespace; it never caches permission to use a token. Known revoked tokens
+remain refused during an outage. A locally requested revocation enters this
+cache before the shared write, but a failed write still returns `503` and
+must be retried to reach other replicas.
+
+Monitor `av_revocation_lookups_total{namespace,outcome}`,
+`av_revocation_breaker_opened_total{namespace}`,
+`av_revocation_list_available{namespace}`, and
+`av_revocation_local_entries{namespace}`. The `/readyz` response reports
+`checks.revocation_available` and `checks.revocation_local_entries` without
+changing its HTTP status for a revocation outage. Requests still fail
+closed while storage is unavailable; reporting the outage does not remove
+all replicas from service at once.
+
+Each new holder revocation creates an `agent.identity` event and an
+ordinary signed receipt. The event records the action, token identifier,
+issuer, subject, and lifetime, but never the token or its parent tokens.
+Repeated holder revocations do not create duplicate receipts. The receipt
+can be checked with `avctl receipt-verify` and the independent receipt
+public key. The revocation takes effect even if audit capacity is
+exhausted. Alert on `av_tokens_revoked_unaudited_total{reason=...}` and
+`av_revocation_audit_close_failures_total`; these identify missing capture
+and delayed receipt finalization. There is no atomic transaction between
+the revocation store and the journal, so a process failure between those
+writes can leave a revocation without a receipt.
+
+| Key | Default | Notes |
+| --- | --- | --- |
+| `revocation_audit_per_minute` | `600` | Maximum revocation audit records per process per minute, from 1 to 100000. This budget is separate from rejected-identity sampling. |
+| `operator_tokens` | `[]` | Named SHA-256 digests of independent operator bearer secrets. Enables the administrative route described below. |
+| `introspection_tokens` | `[]` | SHA-256 digests of independent backend bearer secrets, each bound to one configured backend name. Enables introspection. |
+
+### Backend introspection (`POST /v1/introspect`)
+
+A backend sends `token=<jwt>` as a form body and authenticates with its
+own bearer secret. Store only the secret's SHA-256 digest in config:
+
+```toml
+[[introspection_tokens]]
+backend = "customer-service"
+sha256 = "<64 hexadecimal characters: SHA-256 of a random backend secret>"
+```
+
+The response follows [RFC 7662](https://www.rfc-editor.org/rfc/rfc7662.html).
+It returns `active: false` for a revoked, expired, forged, or wrong-audience
+token. Only a token addressed to the authenticated backend may expose
+claims. An unavailable revocation store returns `503`, which the backend
+must treat as a refusal until it can retry. Use TLS for this endpoint
+outside loopback, including when TLS terminates at an ingress proxy.
+
+Backends that verify JWTs offline still accept a revoked token until its
+expiry. Immediate revocation requires introspection on every call; caching
+an active answer delays revocation by the cache duration. Backends must
+also validate their intended token profile and the requested tool scope.
+Forwarded MCP credentials use JWT header `typ = "av-tool+jwt"`. Tokens
+from the optional public exchange endpoint use `typ = "JWT"`; intent
+proofs use `typ = "av-intent+jwt"`. A tool backend must require the first
+profile and must reject the other two as tool credentials. Checking only
+the signature and audience is insufficient. Restrict network access to
+tool backends to the gateway as an additional control.
+
+### Operator revocation (`POST /admin/v1/revocations`)
+
+The route exists only when `operator_tokens` is nonempty. Each operator
+uses a separate random bearer secret of at least 32 characters. Agent
+credentials and introspection credentials do not authorize this route.
+
+```toml
+[[operator_tokens]]
+name = "incident-response"
+sha256 = "<64 hexadecimal characters: SHA-256 of a random operator secret>"
+```
+
+Send exactly one target in a JSON body: `{"jti":"token-id"}` to revoke an
+NHI token by identifier, `{"jti":"token-id","token_kind":"exchanged"}` to
+revoke a gateway token, or `{"instance_uid":"agent-instance"}` to revoke
+all tokens issued for that instance at or before the current time plus
+the validator's clock tolerance. The cutoff only moves forward. Tokens
+issued later remain usable. The operator does not need the original JWT. Identifier revocations are retained
+for 24 hours; an issuer must never reuse a token identifier.
+An instance cutoff also invalidates exchanged descendants through
+introspection.
+
+A successful response contains `revoked: true` and `audited`. If `audited`
+is false, the revocation still took effect but its signed receipt was not
+completed; inspect the audit metrics and logs. Every operator action, including a repeat of an earlier command, identifies
+the configured operator in its signed event. There is no undo operation.
+
+The CLI exposes `avctl token-revoke` and `avctl instance-revoke`. It reads
+an owner-only credential file from `--operator-token-file` or
+`AV_OPERATOR_TOKEN_FILE`, or falls back to `AV_OPERATOR_TOKEN`. It trims
+surrounding whitespace before hashing the bearer; configure the digest of
+the secret itself, without a trailing newline.
+
+```sh
+avctl token-revoke --jti token-id --operator-token-file /run/secrets/operator-token \
+  --url https://gateway.example.com
+avctl token-revoke --jti exchanged-token-id --token-kind exchanged \
+  --operator-token-file /run/secrets/operator-token --url https://gateway.example.com
+avctl instance-revoke --instance-uid agent-instance \
+  --operator-token-file /run/secrets/operator-token --url https://gateway.example.com
+```
+
+The CLI refuses redirects and HTTP destinations outside loopback. Repeat
+`--url` to contact each independent memory-backed replica; one failed
+replica makes the command fail even if others succeeded. A Redis-backed
+fleet shares its revocation state, so one healthy replica suffices. Use
+TLS outside loopback and keep the administrative route behind the
+operator network. Never pass the bearer itself as a command-line argument.
+
+## Intent mapping and missions
+
+| Key | Default | Notes |
+| --- | --- | --- |
+| `intent_map` | `{}` | Maps tool names to business intents (TOML `[intent_map]`, e.g. `db_write = "data.mutate"`). When `require_intent_mapping` is true, tools not in the map are denied with `UNMAPPED_TOOL`. |
+| `require_intent_mapping` | `false` | When true, every tool call must have a configured intent mapping. |
+| `mission` | none | Active mission constraint (TOML `[mission]`). Contains `id`, `allowed_intents`, and `expires_at`. Only narrows static policy, never widens. |
+| `intent_token_ttl_s` | `60` | TTL in seconds for per-call intent tokens issued by the local PDP. |
+
+The policy decision point runs before the tool budget is charged, in every
+mode, including verdict-only mode (no `tool_upstream_url` and no
+`[[backends]]`). A denied call consumes no budget, and its audit event
+records `allowed: false` with the denial code and a `policy` name of
+`pdp.intent_map` or `pdp.mission`. The JSON-RPC error echoes the request
+`id` and carries the machine-readable code in `error.data.code` (for
+example `UNMAPPED_TOOL`, `MISSION_EXPIRED`, `MISSION_DENIED`).
+
+When `token_exchange_seed_file` is set, every forwarded tool call carries a
+signed intent token in the `x-av-intent-token` header. It is an EdDSA JWT
+with the header `typ: av-intent+jwt`, so a backend can tell it apart from
+an access token signed by the same key. Its claims are `iss` (the harness
+`audience`), `aud` (the receiving backend's `name`, or `default` for
+`tool_upstream_url`), `sub` (the calling agent's `instance_uid`), `tool`,
+`intent`, `iat`, `exp`, and a unique `jti`. Backends should check `typ`,
+`aud`, and `exp`, and may reject a repeated `jti`.
+
+## Backend routing
+
+| Key | Default | Notes |
+| --- | --- | --- |
+| `backends` | `[]` | Per-backend MCP server routing (TOML `[[backends]]`). Each entry has `name`, `url`, `auth`, and `tools`. An entry with an empty `tools` list is the default for unmapped tools (at most one). When `backends` is empty, `tool_upstream_url` becomes an implicit backend named `default`, and it carries the `tool_upstream_bearer_env` / `tool_upstream_bearer_file` credential. |
+
+A tool that maps to no backend, when there is no default backend, is sent
+to `tool_upstream_url` with its bearer if that is set. Otherwise the call
+is decided (allowed or denied, and audited) but not forwarded. The
+caller's own `Authorization` header is never forwarded to any backend.
+
+### Backend `auth` modes
+
+Each `[[backends]]` entry accepts an `auth` field selecting how the harness authenticates
+to that MCP server:
+
+| `auth` value | Description |
+| --- | --- |
+| `"none"` (default) | No credential is sent. |
+| `{ static_env = "VAR" }` | Bearer token read from the named environment variable at boot. Surrounding whitespace is trimmed; an unset or empty variable refuses boot. |
+| `{ static_file = "path" }` | Bearer token read from a file at boot (owner-only permissions and no symlinks, enforced on Unix). Surrounding whitespace is trimmed; an empty file refuses boot. |
+| `"exchange"` | On-the-fly RFC 8693 token exchange for every call: the caller's NHI bearer is exchanged for a short-lived token whose `aud` is this backend's `name` and whose only scope is `tool:<called tool>`. The caller's token must hold that scope (directly or through a wildcard such as `tool:*`); otherwise the call is refused with `403` before anything reaches the backend or charges the budget. `sub` stays the human principal, and `azp` and `act.sub` carry the caller's `instance_uid`. Requires `require_identity = true` and `token_exchange_seed_file`; boot refuses the combination otherwise. |
+
+Static credentials are marked as sensitive header values, so they are kept
+out of debug output and HTTP/2 header compression tables.
+
+## Tenant observability and redaction
+
+| Key | Default | Notes |
+| --- | --- | --- |
+| `otel_tenant_endpoint` | none | Tenant OTLP/HTTP trace endpoint (including `/v1/traces`), exported alongside any operational collector. Requires the `otel` build feature. Operational authentication headers are not forwarded to this endpoint. |
+| `otel_tenant_auth_file` | none | Bearer token file for the tenant OTEL endpoint (owner-only permissions enforced). |
+| `redaction_patterns` | `[]` | Regex patterns for sensitive-data stripping. Applied to event payloads and ATIF step fields before journal write. Setting either patterns or pointer paths also enables the builtin patterns (API keys, email, SSN, cards, and IPv4 addresses). |
+| `redaction_paths` | `[]` | JSON pointer paths to always redact in event payloads and their ATIF observation copies. Configuring paths also enables builtins. |
 
 ## Performance
 

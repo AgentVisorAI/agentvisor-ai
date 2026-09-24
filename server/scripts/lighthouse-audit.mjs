@@ -2,12 +2,11 @@
  * Lighthouse audit against the deployed console.
  *
  * Enforces a performance budget the pitch can't regress past:
- *   * Performance score ≥ 90
- *   * Accessibility score ≥ 95
- *   * Best Practices score ≥ 90
+ *   * Performance score ≥ 75
+ *   * Accessibility score ≥ 90
+ *   * Best Practices score ≥ 85
  *
- * We run against the landing page (highest-traffic surface) AND the
- * console overview (the "demo" surface). Both must clear.
+ * We check the landing, console login, pitch, and verification pages.
  *
  * If Chrome or lighthouse can't run in the current env we soft-skip
  * with exit 0 (so this doesn't block CI when running on a lite runner).

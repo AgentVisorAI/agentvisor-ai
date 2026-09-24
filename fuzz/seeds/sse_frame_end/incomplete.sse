@@ -1,0 +1,2 @@
+event: message
+data: {"text":"partial"}

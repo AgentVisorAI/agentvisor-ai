@@ -1,0 +1,27 @@
+#!/bin/sh
+# CNB API 0.9: create a launch-only environment layer.
+set -eu
+layers_dir=${CNB_LAYERS_DIR:-${1:-}}
+[ -n "$layers_dir" ] || { printf 'error: CNB_LAYERS_DIR is required\n' >&2; exit 1; }
+CNB_PLATFORM_DIR=${CNB_PLATFORM_DIR:-${2:-/platform}}
+export CNB_PLATFORM_DIR
+buildpack_dir=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+# shellcheck source=buildpack/lib/binding.sh
+. "$buildpack_dir/lib/binding.sh"
+binding=$(read_binding)
+[ "$binding" != null ] || { printf 'error: no agentvisor binding found\n' >&2; exit 1; }
+layer=$layers_dir/agentvisor
+mkdir -p "$layer/env.launch"
+for pair in AV_GATEWAY_URL:gateway_url AV_AUDIENCE:audience AV_IDENTITY_JWKS_URL:identity_jwks_url; do
+    name=${pair%%:*}
+    key=${pair#*:}
+    # jq -j deliberately omits a trailing newline from environment values.
+    printf '%s' "$binding" | jq -j --arg key "$key" '.[$key] // ""' > "$layer/env.launch/$name.override"
+done
+cat > "$layers_dir/agentvisor.toml" <<'TOML'
+[types]
+build = false
+launch = true
+cache = false
+TOML
+printf 'agentvisor: wrote launch environment layer\n'

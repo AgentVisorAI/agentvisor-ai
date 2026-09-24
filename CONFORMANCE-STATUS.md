@@ -6,18 +6,23 @@ this document is the compliance / MVP **verdict record** against the brief.
 
 Verified against `AgentBridge.docx` v2.0 on 2026-08-11 with Rust 1.97.1 on Apple Silicon macOS.
 
+For the subsequent daemon, console, identity, and packaging changes, see the
+[2026-09-24 validation record](docs/PRODUCTION-VALIDATION.md). Historical figures
+below retain their original measurement dates; the latency and concurrency
+rows link to the updated measurements and their narrower fixture scope.
+
 ## Verdict
 
-The functional MVP is implemented and the executable local correctness gates pass. The production route uses bounded nonblocking audit reservation and authenticates request/terminal response attempt pairs in the active journal, so crash recovery quarantines incomplete sessions without adding journal or broker fsync to admission.
+The functional MVP is implemented and the executable local correctness gates pass. The production route uses bounded nonblocking audit reservation and authenticates request/terminal response attempt pairs in the active journal. It also persists a response marker before upstream dispatch. The admission timer excludes that persistence step, so admission measurements must not be presented as complete request overhead.
 
 ## Requirement Status
 
 | Surface | Status | Evidence or limitation |
 | --- | --- | --- |
-| Signed 5 ms latency | Pass | Actual production wrapper p95 33 us, p99 62 us; 10k p95 0.865 ms, p99 1.742 ms |
+| Signed 5 ms latency | Limited measurement | Current unauthenticated admission tests meet the 5/8 ms p95/p99 limits. They exclude full HTTP processing and persistence before upstream dispatch. The authenticated Redis diagnostic is a separate measurement with higher latency. See [benchmarks](BENCHMARKS.md) for current results and boundaries. |
 | Heavy work isolation | Pass | 16 session-ordered shards, global capacity, blocking-pool ONNX/broker work, async stream budget state |
 | Loop detection | Pass | 20/20 loop families trip within three cycles; 0/10 progressing sessions trip; response-side analysis and Qdrant search are wired |
-| MCP sandbox and effects | Pass | HTTP denial p99 54 us; parse/schema/WASM/budget gates, exact-request HMAC intent, no redirects, at-most-once outcome cache |
+| MCP sandbox and effects | Pass | Parse/schema/WASM/budget gates, exact-request HMAC intent, no redirects, and at-most-once outcome cache. Current HTTP denial latency is recorded in the [benchmarks](BENCHMARKS.md). |
 | Context compression | Pass | >=30% tests at >=50k estimated tokens; first system and tail invariants |
 | NHI identity | Pass | Adversarial JWT/delegation suite, issuer/scope/TTL binding, retired JWKS removal |
 | OCSF event profile | Pass | Every class validates; identity and normalized stop state are present |
@@ -28,8 +33,8 @@ The functional MVP is implemented and the executable local correctness gates pas
 | ATIF v1.7 | Pass | Strict/golden tests, retry-safe parent-fsynced writer, recovered accounting/TTL, real HTTP trajectory accepted by Harbor |
 | Required runtime stack | Pass locally | Pinned MiniLM runs in tract, passes loop SLA, and feeds live Qdrant; live Redis/Kafka/NATS contracts pass, including a 3-master Redis Cluster (multi-key atomic budget spend on a real slot map) |
 | OTLP/Vector | Pass locally | Real server emitted a nonempty 1,244-byte OTLP trace batch and flushed on SIGTERM |
-| 10,000 connections | Pass | 10,000 active client/upstream streams; p95 0.865 ms, p99 1.742 ms; details in BENCHMARKS.md |
-| Non-goals | Pass | No UI, multi-region consensus, model training, or general SFT/RL consumer |
+| 10,000 connections | Final local run passed | Every exact response completed, admission p95/p99 were 0.727/1.286 ms, and audit work drained with zero pending jobs and zero worker errors. Backing service records were healthy and unchanged before and after. See [benchmarks](BENCHMARKS.md) for timing, preserved failures, and scope. |
+| Original brief non-goals | Scope note | Multi-region consensus, model training, and general SFT/RL consumers remain outside the brief. A console UI has since been added and is tested separately. |
 
 ## Executed Gates
 
@@ -42,9 +47,9 @@ The functional MVP is implemented and the executable local correctness gates pas
 - Compose rendering: pass.
 - Harbor pinned reference validator over a real HTTP harness trajectory: pass.
 - Live crash-recovery (2026-08-16): release daemon on live Kafka + Redis SIGKILLed mid-load (300 sessions in flight); restart quarantined all 300 incomplete sessions, served fresh traffic with zero failures, and a second SIGKILL + restart re-quarantined the same set idempotently (no duplication, no re-execution, zero ERROR lines). Reproducible artifact (round-51 §11 — attestations need pointers): the same SIGKILL→restart→SIGKILL→restart idempotence property is now pinned in CI by `crates/av-harness/tests/e2e_process_restart.rs` (`sigkill_restart_recovers_and_is_idempotent`, plus the spool-outage and two-daemon-lock siblings), which spawns the real `agentvisord` binary; the live-brokers variant remains an operator attestation.
-- Offline receipt verification (2026-08-16): a receipt produced by the crash-recovered daemon, consumed from the live Kafka `agent.receipt` topic, verified offline via `avctl receipt-verify` with the independently extracted public key; a single-byte tamper was rejected. Reproducible artifact (round-51 §11): `scripts/live-verify.sh` runs the same chain — hero snippet → close → promote → `avctl pubkey` extraction → offline verify → tamper refusal — plus the §3.1 forgery PoC (identity-point public key + small-order signature refused at `add_key_bytes`), against release binaries with a scripted mock upstream, in ~2 seconds. Six live checks; no live broker required.
-- Release core SLA: pass using production-route and HTTP-level timing; optional durable admission reported separately.
-- Release 10,000-stream production-feature gate with live Kafka/Redis environment: pass.
+- Offline receipt verification (2026-08-16): a receipt produced by the crash-recovered daemon, consumed from the live Kafka `agent.receipt` topic, verified offline via `avctl receipt-verify` with the independently extracted public key; a single-byte tamper was rejected. Reproducible artifact (round-51 §11): `scripts/live-verify.sh` runs the same chain — hero snippet → close → promote → `avctl pubkey` extraction → offline verify → tamper refusal — plus the §3.1 forgery PoC (identity-point public key + small-order signature refused at `add_key_bytes`), against release binaries with a scripted mock upstream. Six live checks; no live broker required.
+- Release core SLA: pass using direct admission-wrapper and HTTP MCP-denial timing; explicit durable admission is reported separately.
+- Release 10,000-request gate with live Kafka/Redis: the final source passed on 2026-09-24, including every complete response and zero-error audit drain. Earlier watchdog-interrupted failures remain recorded separately.
 
 ## Environment Limits
 
@@ -55,12 +60,14 @@ Closed on 2026-08-15 (previously listed here as untested):
 Round-51 §11 (attestations need pointers): the S3 cold-tier row runs
 in CI on every push (`cold_store_live.rs` against the compose MinIO —
 see the CI workflow's contract step), so its evidence is the CI run
-for any given commit. The Redis Cluster and broker TLS/SASL rows
-remain point-in-time operator attestations: their gated contract
-suites (`redis_contract.rs` under a cluster `AV_REDIS_URL`;
-`live_contract.rs` under TLS/SASL env) are in-tree and re-runnable,
-but CI provisions single-node/plaintext services, so re-attestation
-requires the topology described in each row.
+for any given commit. As of the 2026-09-24 follow-up, CI also provisions an
+isolated six-node Redis Cluster with TLS through
+`scripts/redis-cluster-tls-ci.py`. Its 17 Rust storage, certificate, and shared
+revocation contracts and six transport/topology groups passed locally. This
+fixture shares one container network namespace and does not establish
+independent-host failover. The broker TLS/SASL results below remain dated local
+attestations; their gated `live_contract.rs` suites and secure fixture helper
+are in the repository and can be rerun.
 
 - **Redis Cluster topology** — a live 3-master cluster (redis 8, ports 7000-7002) passed the `AV_REDIS_URL` contract suite, including a new multi-key `try_spend_many` test using the production `budget:{hash-tag}:` key shape (proves CROSSSLOT safety on a real slot map, plus cross-key atomicity of a refused spend).
 - **S3-compatible cold tier** — the two-phase cold export (staged intent → conditional `PutMode::Create` put → idempotent re-put) passed live against MinIO via the new `AV_COLD_S3_URL`-gated contract; the object landed with the deterministic `topic/pN/offset.json` key. Standard `AWS_*` env credentials are now honored (keys are lowercased before `object_store::parse_url_opts`, which only parses lowercase config names).

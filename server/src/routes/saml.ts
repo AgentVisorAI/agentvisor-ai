@@ -5,7 +5,9 @@
  *   • GET  /api/v1/auth/saml/:configId/metadata.xml
  *   • GET  /api/v1/auth/saml/:configId/login   — SP-initiated: redirect to IdP
  *   • POST /api/v1/auth/saml/:configId/acs     — Assertion Consumer
- *   • POST /api/v1/auth/saml/:configId/slo     — Single Logout (best-effort)
+ *
+ * Cookie-session protected endpoint:
+ *   • POST /api/v1/auth/saml/:configId/slo     — local session logout
  *
  * Owner/admin CRUD (session-cookie protected):
  *   • GET    /api/v1/auth/saml                 — list configs on the caller's org
@@ -32,7 +34,7 @@ import { requireSession } from "../lib/session-middleware.js";
 import { truncateWellFormed } from "../lib/strings.js";
 
 // Browser-binding transaction cookie for SP-initiated SAML logins —
-// see lib/saml.ts txnNonceByRequestId.
+// see lib/saml.ts and the shared saml_authn_requests table.
 const SAML_TXN_COOKIE = "av_saml_txn";
 import {
   buildLoginUrl,
@@ -241,9 +243,15 @@ export async function samlRoutes(app: FastifyInstance): Promise<void> {
     const relayState = typeof req.query.RelayState === "string"
       ? truncateWellFormed(req.query.RelayState, 1024)
       : null;
-    const { url, txnNonce } = await buildLoginUrl(cfg, relayState);
+    let login: Awaited<ReturnType<typeof buildLoginUrl>>;
+    try { login = await buildLoginUrl(cfg, relayState); }
+    catch (error) {
+      req.log.warn({ err: error, orgId: cfg.orgId, configId: cfg.id }, "saml_request_state_unavailable");
+      return errRedirect("saml_request_unavailable");
+    }
+    const { url, txnNonce } = login;
     // Browser-binding transaction cookie (see lib/saml.ts
-    // txnNonceByRequestId): the ACS requires the consumed
+    // shared request table): the ACS requires the consumed
     // InResponseTo to map back to THIS browser's nonce, so an
     // attacker cannot relay their own valid SAMLResponse through a
     // victim's browser (login CSRF). SameSite=None because the ACS
@@ -549,19 +557,20 @@ export async function samlRoutes(app: FastifyInstance): Promise<void> {
       // valid for the whole 7-day exp, so the attacker held
       // the user's session for a week after SLO. Sibling of
       // /logout's own sessionRevokedAt bump (auth.ts) which
-      // R79 established. Catch is defensive — a user row that
-      // was already removed shouldn't fail the SLO response.
-      await db.user
-        .update({
+      // R79 established. A failed write cannot claim successful logout:
+      // preserve the cookie so the caller can retry the durable fence.
+      try {
+        await db.user.update({
           where: { id: claims.sub },
           data: { sessionRevokedAt: new Date() },
-        })
-        .catch((err) => {
-          req.log.warn(
-            { err, userId: claims.sub },
-            "saml_slo_session_revoke_failed",
-          );
         });
+      } catch (err) {
+        req.log.warn(
+          { err, userId: claims.sub },
+          "saml_slo_session_revoke_failed",
+        );
+        return reply.code(503).send({ error: "session_revocation_unavailable" });
+      }
       writeAudit(
         {
           orgId: claims.orgId,

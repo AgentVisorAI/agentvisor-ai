@@ -1,0 +1,2 @@
+data: {"id":"chat-1","choices":[{"index":0,"delta":{"content":"Hello é"},"finish_reason":null}]}
+

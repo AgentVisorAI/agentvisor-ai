@@ -14,10 +14,11 @@ pub const TOOL_INTENT_DOMAIN: &str = "tool-intent";
 pub const TOOL_OUTCOME_DOMAIN: &str = "tool-outcome";
 pub const TOOL_AUDITED_DOMAIN: &str = "tool-audited";
 
-/// Lifecycle-outbox kinds (`receipt`, `session-close`) that appear in the
+/// Lifecycle-outbox kinds that appear in the
 /// on-disk file name and in the outbox filter.
 pub const RECEIPT_OUTBOX_KIND: &str = "receipt";
 pub const SESSION_CLOSE_OUTBOX_KIND: &str = "session-close";
+pub const SESSION_QUARANTINE_OUTBOX_KIND: &str = "session-quarantine";
 
 #[derive(Serialize, Deserialize)]
 struct Envelope {

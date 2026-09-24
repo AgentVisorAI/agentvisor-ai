@@ -28,7 +28,8 @@ qdrant = ["av-loopdetect/qdrant"]
 # object_store-internal feature instead of a cargo feature an operator
 # could act on.
 cold-store-aws = ["av-bridge/cold-store-aws"]
-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
+service-binding = []
+otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:opentelemetry-http", "dep:async-trait", "dep:tracing-opentelemetry", "reqwest/blocking"]
 full = ["redis", "nats", "kafka", "onnx", "qdrant", "cold-store-aws", "otel"]
 # Compiles the permissive `HarnessConfig::for_tests` constructor
 # (config_testkit.rs). NEVER part of `full` or `default`: production
@@ -47,6 +48,7 @@ av-bridge = { workspace = true }
 av-identity = { workspace = true }
 av-compress = { workspace = true }
 av-loopdetect = { workspace = true }
+av-redact = { workspace = true }
 av-sandbox = { workspace = true, features = ["wasm"] }
 tokio = { workspace = true }
 axum = { workspace = true }
@@ -68,6 +70,9 @@ hex = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }
 zeroize = { workspace = true }
+jsonwebtoken = { workspace = true }
+base64 = { workspace = true }
+serde_urlencoded = "0.7"
 
 [dependencies.opentelemetry]
 version = "0.32"
@@ -86,6 +91,15 @@ version = "0.32"
 optional = true
 default-features = false
 features = ["trace", "http-proto", "reqwest-blocking-client", "reqwest-rustls"]
+
+[dependencies.opentelemetry-http]
+version = "0.32"
+optional = true
+default-features = false
+
+[dependencies.async-trait]
+version = "0.1"
+optional = true
 
 [dependencies.tracing-opentelemetry]
 version = "0.33"

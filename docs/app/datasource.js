@@ -2260,6 +2260,9 @@
       catch (e) { data = {}; }
     }
     if (!res.ok) {
+      // A proxy may also return valid JSON that is not a problem object.
+      // Keep HTTP status handling intact for null, arrays, and primitives.
+      if (!data || typeof data !== "object" || Array.isArray(data)) data = {};
       var msg = data.detail || data.title || data.error || ("http_" + res.status);
       var err = new Error(msg);
       err.status = res.status;
@@ -2388,11 +2391,7 @@
     // { ssoConfig: null }. Anonymous. The login page calls this after
     // the user types their email but before they enter a password.
     async discoverSaml(email) {
-      try {
-        return await apiFetch("/api/v1/auth/saml/discover?email=" + encodeURIComponent(email));
-      } catch (e) {
-        return { ssoConfig: null };
-      }
+      return apiFetch("/api/v1/auth/saml/discover?email=" + encodeURIComponent(email));
     },
     // SAML config CRUD. Owner/admin only. Consumed by the Settings > SSO tab.
     async listSamlConfigs() {
@@ -2521,8 +2520,6 @@
       var sessions = r.sessions || [];
       var llmCents = parseInt(stats.costUsdMicros || "0", 10) / 1e6;
       var blockedDollars = parseInt(stats.blockedPayoutUsdMicros || "0", 10) / 1e6;
-      var deps = {};
-      sessions.forEach(function (s) { if (s.deployment) deps[s.deployment.id] = s.deployment; });
       // Map the server's UTC buckets onto the mock series shape so
       // renderOverview charts both modes through one code path. Labels
       // are formatted here, in the browser's local timezone (3.10).
@@ -2546,8 +2543,8 @@
         toolsBlocked: stats.toolsBlocked || 0,
         llmSpendUsd: llmCents.toFixed(2),
         blockedSpendUsd: blockedDollars.toFixed(0),
-        deployments: Object.keys(deps).length,
-        deploymentsHealthy: Object.keys(deps).length,
+        deployments: stats.deployments || 0,
+        deploymentsHealthy: stats.deploymentsHealthy || 0,
         series: series.length ? series : null,
       };
     },
@@ -2708,9 +2705,10 @@
       // Real programmatic API keys. The console POSTs a name and gets
       // back a plaintext token exactly once; we surface a hint like
       // "av_srv_a091…" the operator can use to identify the row later.
-      try {
-        var res = await apiFetch("/api/v1/keys");
-        return (res.keys || []).map(function (k) {
+      // Loading failure must reach the page's error state. Returning
+      // an empty list would falsely claim that no active keys exist.
+      var res = await apiFetch("/api/v1/keys");
+      return (res.keys || []).map(function (k) {
           return {
             id: k.id,
             name: k.name,
@@ -2720,10 +2718,7 @@
             createdAt: k.createdAt,
             lastUsedAt: k.lastUsedAt,
           };
-        });
-      } catch (e) {
-        return [];
-      }
+      });
     },
     async createApiKey(name) {
       var res = await apiFetch("/api/v1/keys", { method: "POST", body: { name: name } });
@@ -2737,10 +2732,8 @@
       return r.key;
     },
     async listWebhooks() {
-      try {
-        var res = await apiFetch("/api/v1/webhooks");
-        return res.endpoints || [];
-      } catch (e) { return []; }
+      var res = await apiFetch("/api/v1/webhooks");
+      return res.endpoints || [];
     },
     async createWebhook(body) {
       var res = await apiFetch("/api/v1/webhooks", { method: "POST", body: body });
@@ -2834,25 +2827,21 @@
     async listAudit(opts) {
       // Real audit log with cursor pagination. Returns
       // { entries, nextCursor } — nextCursor null at the end of
-      // history. On 4xx/5xx fall through to an empty page so the
-      // settings tab doesn't crash.
+      // history. Let the page display failures and retain its cursor
+      // so a temporary outage cannot look like the end of history.
       opts = opts || {};
       var q = [];
       if (opts.cursor) q.push("cursor=" + encodeURIComponent(opts.cursor));
       if (opts.limit) q.push("limit=" + encodeURIComponent(opts.limit));
       if (opts.event) q.push("event=" + encodeURIComponent(opts.event));
       var qs = q.length ? ("?" + q.join("&")) : "";
-      try {
-        var res = await apiFetch("/api/v1/audit" + qs);
-        return {
-          entries: (res.entries || []).map(function (e) {
-            return { at: e.at, actor: e.actor, event: e.event, target: e.target, note: e.note };
-          }),
-          nextCursor: res.nextCursor || null,
-        };
-      } catch (e) {
-        return { entries: [], nextCursor: null };
-      }
+      var res = await apiFetch("/api/v1/audit" + qs);
+      return {
+        entries: (res.entries || []).map(function (e) {
+          return { at: e.at, actor: e.actor, event: e.event, target: e.target, note: e.note };
+        }),
+        nextCursor: res.nextCursor || null,
+      };
     },
     subscribe(callback) {
       // EventSource has built-in reconnect on clean close, but silently
@@ -2863,15 +2852,16 @@
       // Chromium quirk: when the server process is killed and no TCP FIN
       // makes it out (some OS/socket configs), EventSource holds
       // readyState=OPEN for tens of seconds. We defend with a freshness
-      // watchdog: the server emits a named `keepalive` event every 25s,
-      // and if we go >45s without ANY inbound message we force-close and
-      // reconnect. This bounds worst-case "stale Live pill" to 45 seconds.
+      // watchdog: the server emits a named `keepalive` event every 15s,
+      // and if we go >30s without ANY inbound message we force-close and
+      // reconnect at the next five-second watchdog check.
       var url = apiUrl("/api/v1/stream");
       var closed = false;
       var es = null;
       var backoff = 1500;
       var lastSeen = 0;
       var watchdog = null;
+      var reconnectTimer = null;
       var STALE_MS = 30_000;
       function bumpSeen() { lastSeen = Date.now(); }
       function startWatchdog() {
@@ -2882,8 +2872,6 @@
           if (Date.now() - lastSeen > STALE_MS) {
             // Force close and reconnect. EventSource is holding a dead socket.
             callback({ type: "stream.closed", data: { willRetry: true, reason: "stale" } });
-            if (es) { try { es.close(); } catch (e) {} }
-            lastSeen = 0;
             scheduleReconnect();
           }
         }, 5_000);
@@ -2893,36 +2881,40 @@
       }
       function connect() {
         if (closed) return;
-        try { es = new EventSource(url, { withCredentials: true }); }
+        var source;
+        try { source = new EventSource(url, { withCredentials: true }); es = source; }
         catch (e) { scheduleReconnect(); return; }
         var opened = false;
-        es.addEventListener("open", function () {
+        function isCurrent() { return !closed && es === source; }
+        source.addEventListener("open", function () {
+          if (!isCurrent()) return;
           opened = true;
           backoff = 1500;
           bumpSeen();
           startWatchdog();
           callback({ type: "stream.open", data: {} });
         });
-        es.addEventListener("keepalive", function () { bumpSeen(); });
+        source.addEventListener("keepalive", function () { if (isCurrent()) bumpSeen(); });
         ["hello", "session.upsert", "events.appended", "receipt.finalized"].forEach(function (name) {
-          es.addEventListener(name, function (msg) {
+          source.addEventListener(name, function (msg) {
+            if (!isCurrent()) return;
             bumpSeen();
             try { callback({ type: name, data: JSON.parse(msg.data) }); }
             catch (e) { /* malformed frame from a proxy */ }
           });
         });
-        es.addEventListener("error", function () {
+        source.addEventListener("error", function () {
+          if (!isCurrent()) return;
           // EventSource has three readyStates: 0=connecting, 1=open, 2=closed.
           // Any error means we're no longer OPEN. Show "reconnecting" whether
           // EventSource is auto-retrying (readyState 0 or 1) or fully closed.
           callback({ type: "stream.closed", data: { willRetry: !closed } });
-          if (es && es.readyState === 2) {
+          if (source.readyState === 2) {
             // EventSource gave up. Kick off our own retry loop.
             scheduleReconnect();
           } else if (!opened) {
             // Never got past the handshake. Probably a 401. Force close
             // and retry with a fresh EventSource.
-            try { es.close(); } catch (e) {}
             scheduleReconnect();
           }
           // If we opened once and readyState is now 0/1, EventSource is
@@ -2930,14 +2922,26 @@
         });
       }
       function scheduleReconnect() {
-        if (closed) return;
-        setTimeout(function () {
+        if (closed || reconnectTimer !== null) return;
+        // Retire the old source before queuing a replacement. Terminal
+        // errors and the freshness watchdog can arrive in the same tick.
+        var retired = es;
+        es = null;
+        lastSeen = 0;
+        if (retired) { try { retired.close(); } catch (e) {} }
+        reconnectTimer = setTimeout(function () {
+          reconnectTimer = null;
           backoff = Math.min(backoff * 2, 30000);
           connect();
         }, backoff);
       }
       connect();
-      return function () { closed = true; stopWatchdog(); if (es) { try { es.close(); } catch (e) {} } };
+      return function () {
+        closed = true;
+        stopWatchdog();
+        if (reconnectTimer !== null) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+        if (es) { try { es.close(); } catch (e) {} es = null; }
+      };
     },
   };
 
@@ -2954,7 +2958,9 @@
       status: s.status === "sealed" ? "completed" : (s.status === "live" ? "in_progress" : s.status),
       startedAt: s.openedAt || s.startedAt,
       endedAt: s.closedAt || s.endedAt,
-      events: (s.events && s.events.length) || 0,
+      // List rows contain a count, while detail pages contain only one
+      // page of events. Neither absence nor page length is the total.
+      events: typeof s.eventCount === "number" ? s.eventCount : ((s.events && s.events.length) || 0),
       toolsAllowed: s.toolsAllowed || 0,
       toolsBlocked: s.toolsBlocked || 0,
       costUsdMicros: (s.costUsdMicros != null) ? String(s.costUsdMicros) : "0",

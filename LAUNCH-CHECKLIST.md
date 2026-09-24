@@ -1,8 +1,10 @@
 # AgentVisor AI — Launch Checklist
 
-Every item below has been implemented and drill-verified on the current
-branch. Links point either to the file where the code lives or to the
-runbook entry that documents how it was verified.
+This checklist records the implementation and local drills from the rounds
+below. It does not establish that a selected production deployment is ready.
+The [current validation record](docs/PRODUCTION-VALIDATION.md) documents the
+2026-09-24 checks, remaining findings, and external services still to validate.
+Links identify the implementation or the associated runbook entry.
 
 Legend: **✅ verified** · **🟢 configured** · **📋 documented**
 
@@ -31,8 +33,8 @@ Legend: **✅ verified** · **🟢 configured** · **📋 documented**
 | 1.17 | Deployment ingest token rotation flow with one-time-view modal | ✅ | [docs/app/app.js](docs/app/app.js) |
 | 1.18 | Role enforcement (owner-only for destructive endpoints) | ✅ | [server/src/routes/auth.ts](server/src/routes/auth.ts) |
 | 1.19 | Secrets never committed (grep of repo, .env in gitignore) | ✅ | [.gitignore](.gitignore) |
-| 1.20 | Trivy scan in CI (blocks on HIGH/CRITICAL) | ✅ | [.github/workflows/deploy.yml](.github/workflows/deploy.yml) |
-| 1.21 | SBOM + SLSA attestation attached to every image | ✅ | [.github/workflows/deploy.yml](.github/workflows/deploy.yml) |
+| 1.20 | Trivy scan in CI (blocks on fixable HIGH/CRITICAL findings) | ✅ | [.github/workflows/deploy.yml](.github/workflows/deploy.yml) · [Container security review](docs/PRODUCTION-VALIDATION.md#container-security-review) |
+| 1.21 | SBOM and provenance generation configured; GitHub-signed attestations run only for public repositories | 🟢 | [.github/workflows/deploy.yml](.github/workflows/deploy.yml) |
 | 1.22 | Dependabot with automatic patch-level merges | ✅ | [.github/workflows/dependabot-automerge.yml](.github/workflows/dependabot-automerge.yml) |
 
 ## 2. Operations
@@ -48,12 +50,12 @@ Legend: **✅ verified** · **🟢 configured** · **📋 documented**
 | 2.7 | Backup restore drill run + documented | ✅ | [docs/RUNBOOK.md](docs/RUNBOOK.md) |
 | 2.8 | Postgres LISTEN/NOTIFY bus with auto-reconnect | ✅ | [server/src/lib/bus.ts](server/src/lib/bus.ts) |
 | 2.9 | SSE reconnect with exponential backoff | ✅ | [docs/app/datasource.js](docs/app/datasource.js) |
-| 2.10 | Autocannon load-test job in CI (100k row bench) | ✅ | [.github/workflows/console-api.yml](.github/workflows/console-api.yml) |
+| 2.10 | Autocannon load test in CI (15 seconds against `/healthz` only) | ✅ | [.github/workflows/console-api.yml](.github/workflows/console-api.yml) |
 | 2.11 | Cursor pagination on `/sessions` (O(log N)) | ✅ | [server/src/routes/read.ts](server/src/routes/read.ts) |
 | 2.12 | Streaming NDJSON export (bounded memory on huge orgs) | ✅ | [server/src/routes/auth.ts](server/src/routes/auth.ts) |
 | 2.13 | Session.orgId denormalized + compound indexes | ✅ | [server/prisma/schema.prisma](server/prisma/schema.prisma) |
 | 2.14 | Fly.io + Render + Koyeb deploy manifests keyed off `/readyz` | ✅ | [server/fly.toml](server/fly.toml) · [render.yaml](render.yaml) |
-| 2.15 | GHCR image push + PR preview comment | ✅ | [.github/workflows/deploy.yml](.github/workflows/deploy.yml) |
+| 2.15 | Console image validation, main-only GHCR promotion, and deployment by digest | 🟢 | [.github/workflows/deploy.yml](.github/workflows/deploy.yml) · [Validation scope](docs/PRODUCTION-VALIDATION.md#container-security-review) |
 | 2.16 | Runbook covers 7 pre-launch drills | ✅ | [docs/RUNBOOK.md](docs/RUNBOOK.md) |
 
 ## 3. Product
@@ -79,7 +81,7 @@ Legend: **✅ verified** · **🟢 configured** · **📋 documented**
 | 3.16 | Two-line table cells preserved after truncation fix | ✅ | This round · [docs/app/styles.css](docs/app/styles.css) |
 | 3.17 | Session persistence across reload and new tabs | ✅ | [docs/RUNBOOK.md](docs/RUNBOOK.md) |
 | 3.18 | Zero axe accessibility violations on core surfaces | ✅ | [docs/app/styles.css](docs/app/styles.css) |
-| 3.19 | SPA gzip payload ≤ 28KB | ✅ | [.github/workflows/pages.yml](.github/workflows/pages.yml) |
+| 3.19 | SPA gzip payload ≤ 28KB | ⚠️ | The three minified application JavaScript files total about 82KB with gzip. Pages minifies them but does not enforce this budget. |
 
 ## 4. Legal & Trust
 

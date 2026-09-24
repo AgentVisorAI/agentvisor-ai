@@ -286,10 +286,30 @@ model SamlConfig {
   updatedAt                DateTime @updatedAt
 
   org Org @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  authnRequests SamlAuthnRequest[]
 
   @@unique([orgId, displayName])
   @@index([orgId])
   @@map("saml_configs")
+}
+
+// Shared, short-lived SP-initiated SAML ceremony state. A conditional DELETE
+// atomically consumes request + browser binding across replicas and restarts.
+// Store only the nonce digest, never the browser's plaintext nonce.
+model SamlAuthnRequest {
+  id               String   @id @db.VarChar(256)
+  configId         String
+  orgId            String
+  requestTimestamp String   @db.VarChar(64)
+  nonceHash        String   @db.VarChar(64)
+  createdAt        DateTime @default(now()) @db.Timestamptz(3)
+  expiresAt        DateTime @db.Timestamptz(3)
+
+  config SamlConfig @relation(fields: [configId], references: [id], onDelete: Cascade)
+
+  @@index([expiresAt, id])
+  @@index([configId])
+  @@map("saml_authn_requests")
 }
 
 // One row per successfully consumed SAML Response ID. Prevents replay by
@@ -370,7 +390,7 @@ model Session {
   externalId             String // the daemon's own session id
   agent                  String // charter.name
   workflow               String    @default("signed") // "signed" | "unsigned"
-  status                 String    @default("live") // "live" | "sealed" | "blocked"
+  status                 String    @default("live") // "live" | "sealed" | "blocked" | "quarantined_crash_evidence"
   policyVersion          Int       @default(1)
   openedAt               DateTime
   closedAt               DateTime?

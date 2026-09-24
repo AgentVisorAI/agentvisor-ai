@@ -59,13 +59,12 @@ async fn main() {
 }
 
 async fn run(config_override: Option<PathBuf>) -> Result<()> {
-    #[cfg(feature = "otel")]
-    let telemetry_provider = init_tracing()?;
-    #[cfg(not(feature = "otel"))]
-    init_tracing()?;
-
     let (config, config_source) =
         av_harness::config::load_config_with_override(config_override).map_err(anyhow::Error::msg)?;
+    #[cfg(feature = "otel")]
+    let telemetry_provider = init_tracing(&config)?;
+    #[cfg(not(feature = "otel"))]
+    init_tracing()?;
     // Refuse the whole configuration up front, with the
     // complete list, when it selects backends this binary was compiled
     // without. The individual build_* sites keep their own bails as
@@ -108,7 +107,9 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
     // and a silently-stale key set would
     // remain unalertable.
     let metrics = Arc::new(av_core::metrics::Registry::new());
-    let (identity, jwks_refresh) = build_identity(&config, Arc::clone(&metrics)).await?;
+    let revocation = build_revocation_store(&config, &store, &metrics)?;
+    let (identity, jwks_refresh) =
+        build_identity(&config, Arc::clone(&metrics), Arc::clone(&revocation)).await?;
     let signer_path = std::env::var_os("AV_SIGNING_SEED_FILE")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("config/signing.seed"));
@@ -170,6 +171,10 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
         Arc::clone(&metrics),
     )
     .map_err(anyhow::Error::new)?;
+    let revocation_sweeper = state
+        .identity
+        .as_ref()
+        .map(|_| spawn_revocation_sweeper(vec![revocation, Arc::clone(&state.exchanged_revocations)]));
     // Two daemons on one spool silently split the audit
     // trail (interleaved journals, racing reconcilers, torn ATIF
     // artifacts). The exclusive advisory spool lock enforcing
@@ -580,6 +585,9 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
     if let Some(handle) = jwks_refresh.as_ref() {
         handle.abort();
     }
+    if let Some(handle) = revocation_sweeper.as_ref() {
+        handle.abort();
+    }
     // Silence the expected cancellation; log everything else (panic).
     // The reconciler now uses cooperative shutdown (R69 F1) so a
     // clean stop returns `Ok(())`, not `Err(is_cancelled)`. Retain
@@ -927,27 +935,117 @@ fn init_tracing() -> Result<()> {
 }
 
 #[cfg(feature = "otel")]
-fn init_tracing() -> Result<Option<opentelemetry_sdk::trace::SdkTracerProvider>> {
+#[derive(Debug)]
+struct TenantOtelClient {
+    client: reqwest::blocking::Client,
+    authorization: Option<axum::http::HeaderValue>,
+}
+
+#[cfg(feature = "otel")]
+impl TenantOtelClient {
+    fn new(authorization: Option<axum::http::HeaderValue>) -> Result<Self> {
+        // Construct the blocking client outside Tokio, as required by reqwest.
+        let client = std::thread::spawn(|| {
+            reqwest::blocking::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+        })
+        .join()
+        .map_err(|_| anyhow::anyhow!("tenant OTLP client construction failed"))??;
+        Ok(Self {
+            client,
+            authorization,
+        })
+    }
+
+    fn request_headers(&self, inherited: &axum::http::HeaderMap) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        for name in [
+            axum::http::header::CONTENT_TYPE,
+            axum::http::header::CONTENT_ENCODING,
+        ] {
+            if let Some(value) = inherited.get(&name) {
+                headers.insert(name, value.clone());
+            }
+        }
+        if let Some(authorization) = &self.authorization {
+            headers.insert(axum::http::header::AUTHORIZATION, authorization.clone());
+        }
+        headers
+    }
+}
+
+#[cfg(feature = "otel")]
+#[async_trait::async_trait]
+impl opentelemetry_http::HttpClient for TenantOtelClient {
+    async fn send_bytes(
+        &self,
+        request: axum::http::Request<axum::body::Bytes>,
+    ) -> std::result::Result<axum::http::Response<axum::body::Bytes>, opentelemetry_http::HttpError> {
+        use std::io::Read as _;
+        let response = self
+            .client
+            .request(request.method().clone(), request.uri().to_string())
+            .headers(self.request_headers(request.headers()))
+            .body(request.body().to_vec())
+            .send()?;
+        let status = response.status();
+        let headers = response.headers().clone();
+        // Preserve exporter acknowledgement/error handling while bounding
+        // the body returned by a misbehaving collector.
+        const MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
+        let mut body = Vec::new();
+        response.take(MAX_RESPONSE_BYTES + 1).read_to_end(&mut body)?;
+        if body.len() as u64 > MAX_RESPONSE_BYTES {
+            return Err(std::io::Error::other("tenant OTLP response exceeds 1 MiB").into());
+        }
+        let mut response = axum::http::Response::builder().status(status).body(body.into())?;
+        *response.headers_mut() = headers;
+        Ok(response)
+    }
+}
+
+#[cfg(feature = "otel")]
+fn init_tracing(config: &HarnessConfig) -> Result<Option<opentelemetry_sdk::trace::SdkTracerProvider>> {
     use opentelemetry::trace::TracerProvider as _;
     use opentelemetry_otlp::WithExportConfig as _;
 
-    let provider = if std::env::var_os("OTEL_EXPORTER_OTLP_ENDPOINT").is_some()
-        || std::env::var_os("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT").is_some()
-    {
-        let exporter = opentelemetry_otlp::SpanExporter::builder()
-            .with_http()
-            .with_protocol(opentelemetry_otlp::Protocol::HttpBinary)
-            .build()
-            .map_err(|error| anyhow::anyhow!("build OTLP exporter: {error}"))?;
-        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
-            .with_resource(
-                opentelemetry_sdk::Resource::builder()
-                    .with_service_name("agentvisor-ai")
-                    .build(),
-            )
-            .with_batch_exporter(exporter)
-            .build();
-        Some(provider)
+    let operational_endpoint = std::env::var_os("OTEL_EXPORTER_OTLP_ENDPOINT").is_some()
+        || std::env::var_os("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT").is_some();
+    let provider = if operational_endpoint || config.otel_tenant_endpoint.is_some() {
+        let mut builder = opentelemetry_sdk::trace::SdkTracerProvider::builder().with_resource(
+            opentelemetry_sdk::Resource::builder()
+                .with_service_name("agentvisor-ai")
+                .build(),
+        );
+        if operational_endpoint {
+            let exporter = opentelemetry_otlp::SpanExporter::builder()
+                .with_http()
+                .with_protocol(opentelemetry_otlp::Protocol::HttpBinary)
+                .build()
+                .map_err(|error| anyhow::anyhow!("build OTLP exporter: {error}"))?;
+            builder = builder.with_batch_exporter(exporter);
+        }
+        if let Some(endpoint) = &config.otel_tenant_endpoint {
+            use opentelemetry_otlp::WithHttpConfig as _;
+            let authorization = config.tenant_otel_authorization().map_err(anyhow::Error::msg)?;
+            // The SDK merges operational OTEL_* headers after explicit
+            // headers. The dedicated client removes those inherited secrets
+            // and applies only this tenant's authorization at send time.
+            let client = TenantOtelClient::new(authorization)?;
+            let exporter = opentelemetry_otlp::SpanExporter::builder()
+                .with_http()
+                .with_protocol(opentelemetry_otlp::Protocol::HttpBinary)
+                .with_endpoint(endpoint.clone())
+                .with_http_client(client)
+                .build()
+                .map_err(|error| anyhow::anyhow!("build tenant OTLP exporter: {error}"))?;
+            builder = builder
+                .with_batch_exporter(exporter)
+                .with_sampler(opentelemetry_sdk::trace::Sampler::AlwaysOn);
+        }
+        Some(builder.build())
     } else {
         None
     };
@@ -1019,9 +1117,9 @@ fn load_sandbox(config: &HarnessConfig) -> Result<Sandbox> {
         // Only a hard error when tool forwarding is actually in use:
         // without a tool upstream no /v1/mcp call can be forwarded anyway,
         // and the sandbox rejects everything unmatched (fail-closed).
-        if config.tool_upstream_url.is_some() {
+        if config.tool_upstream_url.is_some() || !config.backends.is_empty() {
             anyhow::bail!(
-                "require_tool_schema=true and tool_upstream_url is set, but no tool schemas were loaded from {:?}",
+                "require_tool_schema=true and tool forwarding is configured, but no tool schemas were loaded from {:?}",
                 config.tool_schema_dir
             );
         }
@@ -1288,9 +1386,45 @@ fn spawn_bridge_maintenance(
     })
 }
 
+/// The upstream revocation list. Redis uses an availability guard; the
+/// single-process memory backend remains direct and cannot suffer network outages.
+fn build_revocation_store(
+    config: &HarnessConfig,
+    store: &Arc<dyn StateStore>,
+    metrics: &av_core::metrics::Registry,
+) -> Result<Arc<dyn av_identity::RevocationStore>> {
+    match config.state().map_err(anyhow::Error::msg)? {
+        StateBackend::Redis { .. } => Ok(Arc::new(av_harness::revocation::GuardedRevocationStore::new(
+            Arc::new(av_harness::revocation::StateRevocationStore::new(Arc::clone(
+                store,
+            ))),
+            metrics,
+            "nhi",
+        ))),
+        StateBackend::Memory => Ok(Arc::new(av_identity::InMemoryRevocationStore::new())),
+    }
+}
+
+fn spawn_revocation_sweeper(
+    lists: Vec<Arc<dyn av_identity::RevocationStore>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let now_s = av_core::time::now_ms() / 1000;
+            for list in &lists {
+                list.sweep_expired(now_s);
+            }
+        }
+    })
+}
+
 async fn build_identity(
     config: &HarnessConfig,
     metrics: Arc<av_core::metrics::Registry>,
+    revocation: Arc<dyn av_identity::RevocationStore>,
 ) -> Result<(
     Option<Arc<IdentityValidator>>,
     Option<tokio::task::JoinHandle<()>>,
@@ -1308,6 +1442,8 @@ async fn build_identity(
     }
 
     let mut validator = IdentityValidator::new(&config.audience);
+    validator.set_max_chain_depth(config.max_delegation_depth);
+    validator.set_revocation_store(revocation);
     if !config.identity_allowed_issuers.is_empty() {
         validator.allow_issuers(config.identity_allowed_issuers.clone());
     }
@@ -2333,11 +2469,15 @@ mod tests {
         let mut config = HarnessConfig::for_tests("http://upstream", "/tmp", "/tmp");
         config.require_identity = true;
         config.identity_hmac_secret_file = Some(secret.to_string_lossy().into_owned());
-        let err = build_identity(&config, Arc::new(av_core::metrics::Registry::new()))
-            .await
-            .err()
-            .map(|error| error.to_string())
-            .unwrap_or_default();
+        let err = build_identity(
+            &config,
+            Arc::new(av_core::metrics::Registry::new()),
+            Arc::new(av_identity::InMemoryRevocationStore::new()),
+        )
+        .await
+        .err()
+        .map(|error| error.to_string())
+        .unwrap_or_default();
         assert!(
             err.contains("known-weak pattern"),
             "all-identical-byte HMAC secret must be refused at boot, got: {err}"
@@ -2357,9 +2497,13 @@ mod tests {
         let mut config = HarnessConfig::for_tests("http://upstream", "/tmp", "/tmp");
         config.require_identity = true;
         config.identity_hmac_secret_file = Some(secret.to_string_lossy().into_owned());
-        let (validator, _refresh) = build_identity(&config, Arc::new(av_core::metrics::Registry::new()))
-            .await
-            .unwrap();
+        let (validator, _refresh) = build_identity(
+            &config,
+            Arc::new(av_core::metrics::Registry::new()),
+            Arc::new(av_identity::InMemoryRevocationStore::new()),
+        )
+        .await
+        .unwrap();
         let validator = validator.unwrap();
         assert_eq!(validator.key_count(), 1);
     }
@@ -2410,11 +2554,13 @@ mod tests {
         let mut config = HarnessConfig::for_tests("http://upstream", "/tmp", "/tmp");
         config.require_identity = true;
         config.identity_hmac_secret_file = Some(secret.to_string_lossy().into_owned());
-        assert!(
-            build_identity(&config, Arc::new(av_core::metrics::Registry::new()))
-                .await
-                .is_err()
-        );
+        assert!(build_identity(
+            &config,
+            Arc::new(av_core::metrics::Registry::new()),
+            Arc::new(av_identity::InMemoryRevocationStore::new()),
+        )
+        .await
+        .is_err());
     }
 
     /// Regression: `identity_hmac_secret_file = ""` means "unset" for the
@@ -2452,9 +2598,13 @@ mod tests {
         let mut config = HarnessConfig::for_tests("http://upstream", "/tmp", "/tmp");
         config.identity_jwks_url = Some(format!("http://{addr}/jwks"));
         config.identity_hmac_secret_file = Some(String::new());
-        let (validator, refresh) = build_identity(&config, Arc::new(av_core::metrics::Registry::new()))
-            .await
-            .expect("empty HMAC path must be treated as unset, not stat'ed");
+        let (validator, refresh) = build_identity(
+            &config,
+            Arc::new(av_core::metrics::Registry::new()),
+            Arc::new(av_identity::InMemoryRevocationStore::new()),
+        )
+        .await
+        .expect("empty HMAC path must be treated as unset, not stat'ed");
         assert!(validator.is_some(), "JWKS-only identity must be enabled");
         if let Some(handle) = refresh {
             handle.abort();
@@ -2511,7 +2661,12 @@ mod tests {
         let mut config = HarnessConfig::for_tests("http://upstream", "/tmp", "/tmp");
         config.require_identity = true;
         config.identity_hmac_secret_file = Some(secret.to_string_lossy().into_owned());
-        let result = build_identity(&config, Arc::new(av_core::metrics::Registry::new())).await;
+        let result = build_identity(
+            &config,
+            Arc::new(av_core::metrics::Registry::new()),
+            Arc::new(av_identity::InMemoryRevocationStore::new()),
+        )
+        .await;
         let err = result.err().map(|error| error.to_string()).unwrap_or_default();
         assert!(
             err.contains("symbolic link"),
@@ -2826,5 +2981,129 @@ mod tests {
                 &serde_json::json!({"content": "x".repeat(4_300_000)}),
             )
             .is_err());
+    }
+
+    #[test]
+    fn configured_backends_require_tool_schemas_at_boot() {
+        let mut config = HarnessConfig::for_tests("http://upstream", "/tmp/spool", "/tmp/bridge");
+        config.require_tool_schema = true;
+        config.backends = vec![av_harness::config::BackendConfig {
+            name: "db".into(),
+            url: "http://db".into(),
+            auth: av_harness::config::BackendAuth::None,
+            tools: vec!["read".into()],
+        }];
+        let error = load_sandbox(&config).err().unwrap();
+        assert!(error.to_string().contains("no tool schemas"));
+    }
+
+    #[cfg(feature = "otel")]
+    #[test]
+    fn tenant_otel_headers_do_not_inherit_operational_credentials() {
+        let mut token = axum::http::HeaderValue::from_static("Bearer tenant-secret");
+        token.set_sensitive(true);
+        let client = TenantOtelClient::new(Some(token)).unwrap();
+        let mut inherited = axum::http::HeaderMap::new();
+        inherited.insert("authorization", "Bearer operational-secret".parse().unwrap());
+        inherited.insert("x-api-key", "operational-api-key".parse().unwrap());
+        inherited.insert("content-type", "application/x-protobuf".parse().unwrap());
+        let headers = client.request_headers(&inherited);
+        assert_eq!(headers.get("authorization").unwrap(), "Bearer tenant-secret");
+        assert!(headers.get("authorization").unwrap().is_sensitive());
+        assert!(!headers.contains_key("x-api-key"));
+        assert_eq!(headers.get("content-type").unwrap(), "application/x-protobuf");
+        let anonymous = TenantOtelClient::new(None).unwrap();
+        assert!(!anonymous
+            .request_headers(&inherited)
+            .contains_key("authorization"));
+    }
+
+    #[cfg(feature = "otel")]
+    #[test]
+    fn tenant_otel_exporter_delivers_a_span_and_only_tenant_credentials() {
+        use opentelemetry::trace::{Span as _, Tracer as _, TracerProvider as _};
+        use opentelemetry_otlp::{WithExportConfig as _, WithHttpConfig as _};
+        use std::io::{BufRead as _, Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}/v1/traces", listener.local_addr().unwrap());
+        let collector = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "tenant collector received no export"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("collector accept failed: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = std::io::BufReader::new(&mut stream);
+            let mut headers = String::new();
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                headers.push_str(&line);
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            let length: usize = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|value| value.trim().parse().unwrap())
+                })
+                .unwrap();
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            drop(reader);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            (headers, body)
+        });
+        let mut authorization = axum::http::HeaderValue::from_static("Bearer tenant-secret");
+        authorization.set_sensitive(true);
+        let exporter = opentelemetry_otlp::SpanExporter::builder()
+            .with_http()
+            .with_protocol(opentelemetry_otlp::Protocol::HttpBinary)
+            .with_endpoint(endpoint)
+            .with_headers(std::collections::HashMap::from([
+                ("authorization".into(), "Bearer operational-secret".into()),
+                ("x-api-key".into(), "operational-secret".into()),
+            ]))
+            .with_http_client(TenantOtelClient::new(Some(authorization)).unwrap())
+            .build()
+            .unwrap();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_sampler(opentelemetry_sdk::trace::Sampler::AlwaysOn)
+            .with_batch_exporter(exporter)
+            .build();
+        provider
+            .tracer("tenant-test")
+            .start("tenant-export-regression")
+            .end();
+        provider.force_flush().unwrap();
+        provider.shutdown().unwrap();
+        let (headers, body) = collector.join().unwrap();
+        assert!(headers.starts_with("POST /v1/traces HTTP/1.1"));
+        assert!(headers
+            .to_ascii_lowercase()
+            .contains("authorization: bearer tenant-secret"));
+        assert!(!headers.contains("operational-secret"));
+        assert!(!headers.to_ascii_lowercase().contains("x-api-key"));
+        assert!(body
+            .windows(b"tenant-export-regression".len())
+            .any(|bytes| bytes == b"tenant-export-regression"));
     }
 }

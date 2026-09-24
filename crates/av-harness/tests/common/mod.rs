@@ -3,7 +3,13 @@
 //! Each file under `tests/` compiles to its own binary and pulls in only
 //! the pieces it uses; the remainder is dead code from that binary's
 //! point of view, hence the file-level allow.
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use av_bridge::{BusError, EventBus, PublishAck, StoredEvent};
 use av_events::EventClass;
@@ -130,6 +136,22 @@ pub fn ring(signers: &[&Ed25519Signer]) -> Keyring {
     r
 }
 
+/// Sandbox built from the harness config the way `agentvisord` builds it
+/// (`load_sandbox`), so budget and schema settings in `config` are the ones
+/// actually enforced. `SandboxConfig::default()` ignores them.
+pub fn sandbox_for(config: &HarnessConfig) -> Sandbox {
+    Sandbox::new(
+        av_sandbox::SandboxConfig {
+            schemas: HashMap::new(),
+            budget: config.budget.clone(),
+            payout_field: config.payout_field.clone(),
+            require_schema: config.require_tool_schema,
+        },
+        Vec::new(),
+    )
+    .unwrap()
+}
+
 /// Tempdir-backed test config pointing at an unreachable upstream. The
 /// tempdir is leaked so its paths stay valid for the life of the process
 /// (the AppState built from the config holds paths into it).
@@ -160,6 +182,63 @@ pub fn app_state(
             Arc::new(sandbox),
             bus,
             None,
+            Arc::new(signer(signer_seed)),
+        )
+        .unwrap(),
+    )
+}
+
+/// Assemble an `AppState` with a real identity validator (HMAC shared
+/// secret) and an in-memory revocation list, as `agentvisord` wires it
+/// for `state_backend = "memory"`.
+pub fn app_state_with_identity(
+    config: HarnessConfig,
+    sandbox: Sandbox,
+    bus: Arc<dyn EventBus>,
+    signer_seed: u8,
+    hmac_secret: &[u8],
+    hmac_kid: &str,
+) -> Arc<AppState> {
+    app_state_with_revocation(
+        config,
+        sandbox,
+        bus,
+        signer_seed,
+        hmac_secret,
+        hmac_kid,
+        Arc::new(av_identity::InMemoryRevocationStore::new()),
+    )
+}
+
+/// [`app_state_with_identity`] with a caller-chosen revocation list.
+pub fn app_state_with_revocation(
+    config: HarnessConfig,
+    sandbox: Sandbox,
+    bus: Arc<dyn EventBus>,
+    signer_seed: u8,
+    hmac_secret: &[u8],
+    hmac_kid: &str,
+    revocation: Arc<dyn av_identity::RevocationStore>,
+) -> Arc<AppState> {
+    let mut validator = av_identity::IdentityValidator::new(&config.audience);
+    validator.set_max_chain_depth(config.max_delegation_depth);
+    if !config.identity_allowed_issuers.is_empty() {
+        validator.allow_issuers(config.identity_allowed_issuers.clone());
+    }
+    validator
+        .add_key(
+            hmac_kid,
+            av_identity::KeyMaterial::HmacSecret(hmac_secret.to_vec()),
+        )
+        .unwrap();
+    validator.set_revocation_store(revocation);
+    Arc::new(
+        AppState::new(
+            config,
+            Arc::new(InMemoryStore::new()),
+            Arc::new(sandbox),
+            bus,
+            Some(Arc::new(validator)),
             Arc::new(signer(signer_seed)),
         )
         .unwrap(),
@@ -198,4 +277,170 @@ pub fn chat(content: &str) -> Value {
 /// Minimal single-message chat payload.
 pub fn chat_payload() -> Value {
     chat("hi")
+}
+
+/// One HTTP request captured by [`MockBackend`].
+#[derive(Debug, Clone)]
+pub struct CapturedRequest {
+    /// Request path.
+    pub path: String,
+    /// `(lower-cased name, value)` pairs in arrival order.
+    pub headers: Vec<(String, String)>,
+    /// Raw request body.
+    pub body: Vec<u8>,
+}
+
+impl CapturedRequest {
+    /// First value of header `name` (case-insensitive).
+    pub fn header(&self, name: &str) -> Option<&str> {
+        let name = name.to_ascii_lowercase();
+        self.headers
+            .iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| value.as_str())
+    }
+
+    /// Every header and the body as text, for "this secret never left
+    /// the gateway" assertions.
+    pub fn everything(&self) -> String {
+        let mut text = String::new();
+        for (key, value) in &self.headers {
+            text.push_str(key);
+            text.push_str(": ");
+            text.push_str(value);
+            text.push('\n');
+        }
+        text.push_str(&String::from_utf8_lossy(&self.body));
+        text
+    }
+}
+
+/// Tool backend on 127.0.0.1 that records every request and answers each
+/// with a JSON-RPC success echoing the request id.
+pub struct MockBackend {
+    /// URL to put in `[[backends]].url` or `tool_upstream_url`.
+    pub url: String,
+    requests: Arc<Mutex<Vec<CapturedRequest>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl MockBackend {
+    /// Bind an ephemeral port and start serving.
+    pub async fn start() -> Self {
+        let requests: Arc<Mutex<Vec<CapturedRequest>>> = Arc::default();
+        let recorded = Arc::clone(&requests);
+        let app = axum::Router::new().fallback(
+            move |uri: axum::http::Uri, headers: HeaderMap, body: axum::body::Bytes| {
+                let recorded = Arc::clone(&recorded);
+                async move {
+                    recorded.lock().push(CapturedRequest {
+                        path: uri.path().to_owned(),
+                        headers: headers
+                            .iter()
+                            .map(|(key, value)| {
+                                (
+                                    key.as_str().to_owned(),
+                                    value.to_str().unwrap_or("<non-text>").to_owned(),
+                                )
+                            })
+                            .collect(),
+                        body: body.to_vec(),
+                    });
+                    let id = serde_json::from_slice::<Value>(&body)
+                        .ok()
+                        .and_then(|request| request.get("id").cloned())
+                        .unwrap_or(Value::Null);
+                    axum::Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {"content": [{"type": "text", "text": "ok"}]}
+                    }))
+                }
+            },
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        Self { url, requests, task }
+    }
+
+    /// Requests received so far, in arrival order.
+    pub fn requests(&self) -> Vec<CapturedRequest> {
+        self.requests.lock().clone()
+    }
+}
+
+impl Drop for MockBackend {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Claims that vary between the NHI tokens a test mints.
+pub struct NhiSpec<'a> {
+    /// Human principal (`sub`).
+    pub sub: &'a str,
+    /// Calling agent (`instance_uid`).
+    pub instance_uid: &'a str,
+    /// Granted scopes.
+    pub scopes: &'a [&'a str],
+    /// Token id.
+    pub jti: &'a str,
+}
+
+/// Mint an HS256 NHI token that a harness built with
+/// [`app_state_with_identity`] (same secret and kid) accepts.
+pub fn mint_nhi_token(secret: &[u8], kid: &str, audience: &str, spec: &NhiSpec<'_>) -> String {
+    let now_s = av_core::time::now_ms() / 1000;
+    let claims = av_identity::NhiClaims {
+        sub: spec.sub.to_owned(),
+        iss: "test-issuer".to_owned(),
+        aud: av_identity::Audience::Single(audience.to_owned()),
+        iat: now_s,
+        nbf: None,
+        exp: now_s + 300,
+        jti: spec.jti.to_owned(),
+        azp: Some("caller-app".to_owned()),
+        act: None,
+        instance_uid: spec.instance_uid.to_owned(),
+        charter: "support-agent".to_owned(),
+        version: "1.0".to_owned(),
+        scopes: spec.scopes.iter().map(|scope| (*scope).to_owned()).collect(),
+        parent_token: None,
+    };
+    let header = jsonwebtoken::Header {
+        alg: jsonwebtoken::Algorithm::HS256,
+        kid: Some(kid.to_owned()),
+        ..Default::default()
+    };
+    jsonwebtoken::encode(&header, &claims, &jsonwebtoken::EncodingKey::from_secret(secret)).unwrap()
+}
+
+/// Write `contents` to `dir/name` with owner-only permissions and return
+/// the path as a config string.
+pub fn owner_only_file(dir: &std::path::Path, name: &str, contents: &str) -> String {
+    let path = dir.join(name);
+    std::fs::write(&path, contents).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    path.to_string_lossy().into_owned()
+}
+
+/// Verify an EdDSA token against the first key of a JWKS document, the
+/// way a backend would after fetching `/.well-known/jwks.json`.
+pub fn verify_with_jwks<T: serde::de::DeserializeOwned>(
+    jwks: &Value,
+    token: &str,
+) -> jsonwebtoken::TokenData<T> {
+    let x = jwks["keys"][0]["x"].as_str().unwrap();
+    let key = jsonwebtoken::DecodingKey::from_ed_components(x).unwrap();
+    let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::EdDSA);
+    validation.validate_aud = false;
+    validation.required_spec_claims.clear();
+    jsonwebtoken::decode::<T>(token, &key, &validation).unwrap()
 }

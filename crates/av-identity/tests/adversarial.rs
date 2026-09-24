@@ -59,6 +59,8 @@ fn claims(scopes: &[&str], ttl: u64, parent_token: Option<String>) -> NhiClaims 
         nbf: None,
         exp: iat + ttl,
         jti: av_core::new_event_uid(),
+        azp: None,
+        act: None,
         instance_uid: "inst-1".into(),
         charter: "support".into(),
         version: "1.2.3".into(),
@@ -1249,4 +1251,32 @@ fn jwks_bomb_is_refused_before_the_key_walk() {
         .add_jwks(&serde_json::json!({ "keys": at_cap }))
         .unwrap();
     assert_eq!(added, 1, "the single real key among 255 decoys must install");
+}
+
+#[test]
+fn jwks_declared_operations_and_metadata_types_cannot_be_ignored() {
+    let donor = ed25519_keys("donor");
+    let v = IdentityValidator::new("harness-prod");
+    for operations in [
+        serde_json::json!(["sign"]),
+        serde_json::json!(["encrypt"]),
+        serde_json::json!([]),
+        serde_json::json!(["verify", "verify"]),
+        serde_json::json!(["verify", 7]),
+        serde_json::json!("verify"),
+        serde_json::Value::Null,
+    ] {
+        let document = serde_json::json!({"keys":[{"kty":"OKP", "crv":"Ed25519", "kid":"ops", "x":donor.public_x, "key_ops":operations}]});
+        assert!(matches!(v.add_jwks(&document), Err(IdentityError::Jwks(_))));
+    }
+    for (field, value) in [("use", serde_json::json!(7)), ("alg", serde_json::json!(null))] {
+        let mut key = serde_json::json!({"kty":"OKP", "crv":"Ed25519", "kid":"ops", "x":donor.public_x});
+        key.as_object_mut().unwrap().insert(field.into(), value);
+        assert!(matches!(
+            v.add_jwks(&serde_json::json!({"keys":[key]})),
+            Err(IdentityError::Jwks(_))
+        ));
+    }
+    let permitted = serde_json::json!({"keys":[{"kty":"OKP", "crv":"Ed25519", "kid":"ops", "x":donor.public_x, "key_ops":["verify"], "use":"sig", "alg":"EdDSA"}]});
+    assert_eq!(v.add_jwks(&permitted).unwrap(), 1);
 }

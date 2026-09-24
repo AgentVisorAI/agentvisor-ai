@@ -501,6 +501,7 @@ const PROBLEM_DETAIL_COPY: Record<string, string> = {
   webhook_paused: "This webhook is paused — resume it first.",
   invalid_token: "That link is invalid or has expired.",
   unknown_session: "That session doesn't exist.",
+  session_evidence_incomplete: "This session contains incomplete crash evidence and cannot receive a signed receipt.",
 };
 
 function problemDetail(slug: string): string {

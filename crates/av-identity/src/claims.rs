@@ -133,14 +133,44 @@ impl From<String> for Audience {
     }
 }
 
+/// RFC 8693 §4.1 actor claim: identifies the party that is acting on behalf
+/// of the subject. In a delegation chain, `sub` stays the human principal
+/// and `act` holds the agent identity. Nested `act` claims represent
+/// multi-hop delegation (agent A delegates to agent B: A is in `act`, B is
+/// in `act.act`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActorClaim {
+    /// The acting party's identifier (e.g. `agent:billing-support`).
+    pub sub: String,
+    /// Nested actor for multi-hop delegation. Bounded by
+    /// `IdentityValidator::max_chain_depth` at validation time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub act: Option<Box<ActorClaim>>,
+}
+
+impl ActorClaim {
+    /// Count the nesting depth (0 = leaf, 1 = one nested act, etc.).
+    pub fn depth(&self) -> usize {
+        match &self.act {
+            None => 0,
+            Some(inner) => 1 + inner.depth(),
+        }
+    }
+}
+
 /// Claims carried by an AgentVisor AI NHI token.
 ///
 /// Standard claims (`sub`, `iss`, `aud`, `iat`, `nbf`, `exp`, `jti`) plus the
 /// agent identity block and scopes. `parent_token` embeds the parent's full
 /// JWT for delegation-chain verification.
+///
+/// RFC 8693 additions: `azp` (authorized party — the client that obtained the
+/// token) and `act` (actor — the agent acting on behalf of `sub`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NhiClaims {
-    /// Subject: the agent principal (e.g. `agent:billing-support`).
+    /// Subject: the human principal (e.g. `user:alice@corp.com`). Under
+    /// RFC 8693 semantics, `sub` stays the human and agent identity
+    /// moves to `act.sub`.
     pub sub: String,
     /// Issuer (corporate IdP or the harness's own token service).
     pub iss: String,
@@ -158,6 +188,16 @@ pub struct NhiClaims {
     pub exp: u64,
     /// Unique token id (revocation hook).
     pub jti: String,
+    /// Authorized party (RFC 7519): the OAuth 2.0 client_id that obtained
+    /// this token. Used in token-exchange flows to track which client
+    /// requested the exchange.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub azp: Option<String>,
+    /// RFC 8693 actor claim. When present, `sub` identifies the human
+    /// principal and `act.sub` identifies the agent acting on their behalf.
+    /// Nested `act.act` represents further delegation hops.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub act: Option<ActorClaim>,
     /// Agent instance uid bound into every emitted event.
     pub instance_uid: String,
     /// Agent charter.
@@ -196,6 +236,8 @@ mod tests {
             nbf: None,
             exp: 60,
             jti: "j1".into(),
+            azp: None,
+            act: None,
             instance_uid: "i1".into(),
             charter: "c".into(),
             version: "1".into(),

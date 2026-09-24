@@ -4,9 +4,8 @@
 //! operating system supports it (Unix `fsync` on a directory file descriptor).
 //! On Windows there is no supported way to flush a directory handle
 //! (`FlushFileBuffers` requires a file, and opening a directory for `File::open`
-//! yields `PermissionDenied`), so this is a no-op there — NTFS journals
-//! metadata changes so a rename is durable once the containing file has been
-//! `sync_all`'d.
+//! yields `PermissionDenied`), so this is a no-op there. These helpers do not
+//! establish an equivalent power-loss durability guarantee on Windows.
 
 use std::io;
 use std::path::Path;
@@ -151,68 +150,71 @@ pub fn sync_directory(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Create `path` and any missing ancestors, then fsync the parent of every
-/// directory that was newly created so the dirents naming them survive a
-/// crash. A bare `create_dir_all` + `sync_directory(leaf)` leaves newly
-/// created *ancestor* entries volatile: a power loss can drop the whole
-/// subtree even though the leaf's own contents were fsynced.
+/// Create `path` and any missing ancestors, then confirm every parent entry
+/// in the resolved directory hierarchy with fsync. Existing directories need
+/// the same confirmation: they can remain visible after an earlier failed
+/// synchronization or a concurrent creator that has not synchronized yet.
+/// An empty path is a no-op. Symbolic links are resolved before synchronizing
+/// so the actual target hierarchy is confirmed, including relative paths.
 pub fn create_dir_all_synced(path: &Path) -> io::Result<()> {
-    let mut missing: Vec<std::path::PathBuf> = Vec::new();
-    let mut current = Some(path);
-    while let Some(dir) = current {
-        // `is_dir` (not `exists`): a regular FILE squatting on the path
-        // must fall through to `create_dir_all`, which reports the
-        // collision as an error — the existing-directory fast path below must
-        // only skip the mkdir when the path truly is a directory.
-        if dir.as_os_str().is_empty() || dir.is_dir() {
-            break;
-        }
-        missing.push(dir.to_path_buf());
-        current = dir.parent();
-    }
-    // Steady state is "every directory already exists" —
-    // the walk above proved it with one stat, so skip the mkdir
-    // entirely. `create_dir_all` on an existing path still issues an
-    // mkdir syscall that returns EEXIST; at 5 call sites per request
-    // that was ~500 pointless mkdirs/s at 100 req/s, a measurable slice
-    // of the per-request metadata-op bill on network filesystems.
-    if missing.is_empty() {
+    create_dir_all_synced_with_directory_sync(path, sync_directory)
+}
+
+fn create_dir_all_synced_with_directory_sync(
+    path: &Path,
+    synchronize_parent: impl FnMut(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    if path.as_os_str().is_empty() {
         return Ok(());
     }
-    // Same posture as `write_atomic`: pin the directory bit to 0700
-    // on Unix so the spool tree's confidentiality doesn't ride on
-    // the operator's umask. All spool contents (ATIF trajectories,
-    // receipts, journal envelopes) are already 0o600, but a 0755
-    // parent lets a co-tenant enumerate the deterministic
-    // `sha256(session-id)[..32]` file stems for probing / brute
-    // force even when they cannot read the contents.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt as _;
-        let mut builder = std::fs::DirBuilder::new();
-        builder.recursive(true).mode(0o700);
-        builder.create(path)?;
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::create_dir_all(path)?;
-    }
-    // Highest new ancestor first, so each synced parent already exists.
-    for dir in missing.iter().rev() {
-        if let Some(parent) = dir.parent() {
-            // A single-component relative path (`Path::new("newdir")`)
-            // has `Some("")` as its parent, not `None`; skipping the
-            // sync there left the directory entry naming `newdir`
-            // un-fsynced (fsyncing `newdir` itself does not make the
-            // entry in `.` durable). Normalize to `.` the same way
-            // `write_atomic` does for files.
-            let parent = if parent.as_os_str().is_empty() {
-                std::path::Path::new(".")
-            } else {
-                parent
-            };
-            sync_directory(parent)?;
+    // Skip redundant mkdir syscalls for an existing directory, but never its
+    // durability check. A regular file or dangling symlink must still reach
+    // mkdir and report the collision instead of succeeding silently.
+    if !path.is_dir() {
+        // Pin new directories to 0700, independently of the operator's umask.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(true).mode(0o700);
+            builder.create(path)?;
         }
+        #[cfg(not(unix))]
+        {
+            std::fs::create_dir_all(path)?;
+        }
+    }
+    sync_directory_ancestors_with_directory_sync(path, synchronize_parent)
+}
+
+/// Confirm the parent entries of an existing directory without creating it.
+/// This includes every ancestor of the resolved target, highest parent first.
+/// The directory itself is not synchronized; callers persisting its contents
+/// must also call `sync_directory(path)`. Missing or non-directory paths fail.
+pub fn sync_directory_ancestors(path: &Path) -> io::Result<()> {
+    sync_directory_ancestors_with_directory_sync(path, sync_directory)
+}
+
+fn sync_directory_ancestors_with_directory_sync(
+    path: &Path,
+    mut synchronize_parent: impl FnMut(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    // Resolving the existing target handles relative paths, `..`, and existing
+    // symlinked ancestors such as macOS /tmp -> /private/tmp. Synchronizing
+    // only the lexical parents could miss the actual newly-created entries.
+    let resolved = std::fs::canonicalize(path)?;
+    if !std::fs::metadata(&resolved)?.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            "directory path no longer names a directory",
+        ));
+    }
+    let parents: Vec<_> = resolved.ancestors().skip(1).collect();
+    // Highest parent first. Do not cache success or infer it from existence:
+    // after a partial failure, every caller must confirm the chain itself.
+    // Retain all complete directories on error so a retry can repair them.
+    for parent in parents.into_iter().rev() {
+        synchronize_parent(parent)?;
     }
     Ok(())
 }
@@ -338,28 +340,22 @@ pub fn read_capped_string(path: &Path, max_bytes: u64) -> io::Result<String> {
 /// table on ext4/xfs long before the disk is full — an operational silent
 /// death.
 ///
-/// **Semantics of `Ok(())` vs `Err(...)` after `rename`:** once the tmp file
-/// has been atomically renamed onto `path`, the caller can consider the
-/// data durably visible. A post-rename `sync_directory` failure means the
-/// dirent may not survive an *immediate* power loss on POSIX-conformant
-/// filesystems (xfs, btrfs, ext4 with `data=ordered`), but the file is
-/// present and readable for every observer running now. Historically this
-/// function still returned `Err` in that case, which
-/// misled callers whose retry logic assumes "Err → not present": they
-/// would either double-write (harmless but wasted IO) or, worse, treat
-/// the write as failed and skip session-state advancement while the
-/// file was in fact readable — producing a hard split between on-disk
-/// state and in-registry accounting.
-///
-/// Fix: post-rename `sync_directory` failure now becomes a
-/// `tracing::warn!` (best-effort) and `Ok(())` is returned. Callers
-/// that need a stronger guarantee should call `sync_directory` again
-/// after their own operation completes. A dedicated counter is not
-/// registered here because the metrics `Registry` is instance-scoped
-/// (there is no global registry) and this free function holds no
-/// registry handle; harness-level callers can wrap
-/// this with their own counter if needed.
+/// `Ok(())` means both the file and its parent directory were successfully
+/// synchronized on platforms supporting directory fsync. An error can occur
+/// *after* rename: the complete new file may already be visible, but its
+/// durability is uncertain. Callers must fail closed and retain that file for
+/// recovery or an idempotent retry; an error does not mean the path is absent.
+/// In particular, visibility alone is insufficient for an audit marker that
+/// must survive a crash before an upstream request may be sent.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_atomic_with_directory_sync(path, bytes, sync_directory)
+}
+
+fn write_atomic_with_directory_sync(
+    path: &Path,
+    bytes: &[u8],
+    synchronize_parent: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
     use std::io::Write as _;
     // `Path::new("file.json").parent()` is `Some("")`, not `None` — the
     // empty path fails `sync_directory` (and is not a valid directory for
@@ -369,18 +365,9 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    // Use `create_dir_all_synced` (not
-    // `create_dir_all`) so the FIRST write into a new spool subtree
-    // (`spool/outbox/`, `spool/receipts/`, `spool/tool-executions/`,
-    // …) also fsyncs the newly-created ancestor entries. A bare
-    // `create_dir_all` followed by fsyncing only the leaf on
-    // line 206 left the ancestor dirents volatile — a power loss
-    // between the initial `mkdir` and any ambient dirent sync
-    // could drop the entire subtree, losing the marker even though
-    // its bytes were fsynced. This durability gap was known and
-    // deferred; the helper's fast path (skip when the
-    // directory already exists) means the cost is only paid on
-    // FIRST writes into a fresh directory tree.
+    // Confirm the complete parent hierarchy even on retry. Existing
+    // directories may be visible remnants of a failed ancestor fsync;
+    // synchronizing only the leaf after rename cannot repair that gap.
     create_dir_all_synced(parent)?;
     let temporary = path.with_extension(format!("{}.tmp", crate::new_event_uid()));
     let mut guard = TempPathGuard::new(temporary.clone());
@@ -407,19 +394,9 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     file.sync_all()?;
     std::fs::rename(&temporary, path)?;
     guard.disarm();
-    if let Err(error) = sync_directory(parent) {
-        // Best-effort — the rename already succeeded so `path` is
-        // observable. Log the failure so operators can investigate
-        // filesystem or disk issues; do NOT return Err, which would
-        // wrongly steer callers into "the file is not there" retry
-        // logic.
-        tracing::warn!(
-            path = %basename(path),
-            error = %error,
-            "post-rename directory fsync failed; file is visible but its dirent may not survive an immediate power loss"
-        );
-    }
-    Ok(())
+    // Do not remove the destination on failure: rename committed visibility,
+    // and recovery needs the complete file even when durability is uncertain.
+    synchronize_parent(parent)
 }
 
 /// RAII guard that unlinks a temp path unless [`disarm`](Self::disarm) is
@@ -686,16 +663,14 @@ mod tests {
         }
     }
 
-    /// Fast path: an existing directory short-circuits
-    /// before the mkdir, and — the regression the `is_dir` check
-    /// guards — a regular FILE squatting on the path must still
-    /// surface as an error, not silently "succeed".
+    /// Existing directories skip mkdir but still confirm durability. A file
+    /// at the target or an ancestor must remain an error.
     #[test]
     fn create_dir_all_synced_existing_dir_is_ok_but_file_collision_errors() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("a/b");
         create_dir_all_synced(&target).unwrap();
-        // Second call: the steady-state fast path.
+        // Existing directories must also complete the durability check.
         create_dir_all_synced(&target).unwrap();
         assert!(target.is_dir());
 
@@ -709,6 +684,161 @@ mod tests {
             create_dir_all_synced(&file.join("child")).is_err(),
             "a file squatting on an ANCESTOR must error"
         );
+    }
+
+    #[test]
+    fn ancestor_sync_never_creates_missing_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing/leaf");
+        assert_eq!(
+            sync_directory_ancestors(&missing).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert!(!dir.path().join("missing").exists());
+        let file = dir.path().join("occupied");
+        std::fs::write(&file, b"file").unwrap();
+        assert_eq!(
+            sync_directory_ancestors(&file).unwrap_err().kind(),
+            io::ErrorKind::NotADirectory
+        );
+    }
+
+    #[test]
+    fn directory_sync_retry_confirms_ancestors_that_already_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let boundary = std::fs::canonicalize(dir.path()).unwrap();
+        let target = dir.path().join("a/b/c");
+        for _ in 0..2 {
+            let mut visited = Vec::new();
+            let error = create_dir_all_synced_with_directory_sync(&target, |parent| {
+                visited.push(parent.to_path_buf());
+                assert!(target.is_dir(), "mkdir completes before the sync attempt");
+                if parent == boundary {
+                    return Err(io::Error::other("injected ancestor sync failure"));
+                }
+                Ok(())
+            })
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Other);
+            assert_eq!(visited.last(), Some(&boundary));
+            assert!(
+                target.is_dir(),
+                "failed confirmation must retain the complete tree"
+            );
+        }
+        let resolved = std::fs::canonicalize(&target).unwrap();
+        let mut expected: Vec<_> = resolved.ancestors().skip(1).map(Path::to_path_buf).collect();
+        expected.reverse();
+        let mut confirmed = Vec::new();
+        create_dir_all_synced_with_directory_sync(&target, |parent| {
+            confirmed.push(parent.to_path_buf());
+            sync_directory(parent)
+        })
+        .unwrap();
+        assert_eq!(
+            confirmed, expected,
+            "retry must confirm the complete chain in order"
+        );
+    }
+
+    #[test]
+    fn concurrent_directory_creator_cannot_bypass_ancestor_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let boundary = std::fs::canonicalize(dir.path()).unwrap();
+        let target = dir.path().join("a/b/c");
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let first_path = target.clone();
+        let first_boundary = boundary.clone();
+        let first = std::thread::spawn(move || {
+            create_dir_all_synced_with_directory_sync(&first_path, |parent| {
+                if parent == first_boundary {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    return Err(io::Error::other("first creator could not sync ancestor"));
+                }
+                Ok(())
+            })
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap();
+        assert!(
+            target.is_dir(),
+            "the first caller has made the whole tree visible"
+        );
+        let mut second_reached_boundary = false;
+        let second = create_dir_all_synced_with_directory_sync(&target, |parent| {
+            if parent == boundary {
+                second_reached_boundary = true;
+                return Err(io::Error::other("second creator could not sync ancestor"));
+            }
+            Ok(())
+        });
+        release_tx.send(()).unwrap();
+        assert!(first.join().unwrap().is_err());
+        assert!(
+            second_reached_boundary,
+            "an existing directory is not proof of durability"
+        );
+        assert!(
+            second.is_err(),
+            "each caller must fail closed on its own sync error"
+        );
+        create_dir_all_synced(&target).unwrap();
+    }
+
+    #[test]
+    fn directory_sync_resolves_relative_paths_without_changing_working_directory() {
+        let dir = tempfile::Builder::new()
+            .prefix(".av-relative-directory-test-")
+            .tempdir_in(std::env::current_dir().unwrap())
+            .unwrap();
+        let relative = Path::new(dir.path().file_name().unwrap()).join("nested/./leaf");
+        let mut confirmed = Vec::new();
+        create_dir_all_synced_with_directory_sync(&relative, |parent| {
+            assert!(parent.is_absolute());
+            confirmed.push(parent.to_path_buf());
+            Ok(())
+        })
+        .unwrap();
+        let resolved = std::fs::canonicalize(dir.path().join("nested/leaf")).unwrap();
+        let mut expected: Vec<_> = resolved.ancestors().skip(1).map(Path::to_path_buf).collect();
+        expected.reverse();
+        assert_eq!(confirmed, expected);
+        assert!(dir.path().join("nested/leaf").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_sync_confirms_symlink_target_ancestry_and_rejects_invalid_targets() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real/parent");
+        std::fs::create_dir_all(&real).unwrap();
+        let alias = dir.path().join("alias");
+        symlink(&real, &alias).unwrap();
+        let mut confirmed = Vec::new();
+        create_dir_all_synced_with_directory_sync(&alias.join("child"), |parent| {
+            confirmed.push(parent.to_path_buf());
+            Ok(())
+        })
+        .unwrap();
+        let resolved = std::fs::canonicalize(real.join("child")).unwrap();
+        let mut expected: Vec<_> = resolved.ancestors().skip(1).map(Path::to_path_buf).collect();
+        expected.reverse();
+        assert_eq!(
+            confirmed, expected,
+            "sync the resolved target, not just alias parents"
+        );
+        let occupied = dir.path().join("occupied");
+        std::fs::write(&occupied, b"file").unwrap();
+        let file_alias = dir.path().join("file-alias");
+        symlink(&occupied, &file_alias).unwrap();
+        assert!(create_dir_all_synced(&file_alias).is_err());
+        let broken = dir.path().join("broken");
+        symlink(dir.path().join("absent"), &broken).unwrap();
+        assert!(create_dir_all_synced(&broken).is_err());
     }
 
     #[test]
@@ -726,6 +856,26 @@ mod tests {
         std::fs::write(&target, b"old").unwrap();
         write_atomic(&target, b"new").unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"new");
+    }
+
+    #[test]
+    fn write_atomic_reports_post_rename_sync_failure_and_retains_recoverable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("audit-marker.json");
+        std::fs::write(&target, b"old").unwrap();
+        let error = write_atomic_with_directory_sync(&target, b"complete new marker", |parent| {
+            assert_eq!(parent, dir.path());
+            assert_eq!(std::fs::read(&target).unwrap(), b"complete new marker");
+            Err(io::Error::other("injected directory synchronization failure"))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(std::fs::read(&target).unwrap(), b"complete new marker");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        // A retry makes the same artifact durable without creating duplicates.
+        write_atomic(&target, b"complete new marker").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"complete new marker");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]
@@ -895,15 +1045,16 @@ mod read_capped_tests {
 mod empty_path_tests {
     #![allow(clippy::unwrap_used)]
 
-    /// Round-26: pins the empty-path no-op contract of the
-    /// missing-ancestor walk (`dir.as_os_str().is_empty() || …`).
-    /// NB: the `||`→`&&` mutant here is behaviorally EQUIVALENT — a
-    /// pushed "" ancestor is absorbed downstream (create_dir_all("")
-    /// is Ok with zero components, and the `!parent.is_empty()` sync
-    /// guard skips it); the two arms interlock defensively. This test
-    /// pins the documented contract, not that mutant.
+    /// Preserve the empty-path no-op without attempting canonicalization or fsync.
     #[test]
     fn create_dir_all_synced_treats_empty_path_as_noop() {
+        let mut called = false;
+        super::create_dir_all_synced_with_directory_sync(std::path::Path::new(""), |_| {
+            called = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(!called);
         assert!(
             super::create_dir_all_synced(std::path::Path::new("")).is_ok(),
             "empty path must be a no-op Ok, not an mkdir(\"\") error"

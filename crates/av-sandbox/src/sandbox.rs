@@ -1,7 +1,8 @@
 //! The sandbox pipeline: parse → schema → policy → budget, with timing.
 
+use crate::denial_code::DenialCode;
 use crate::policy::{PolicyDecision, PolicyEngine};
-use crate::rpc::{authorization_error, parse_tool_call, RpcError};
+use crate::rpc::{denial_error, parse_tool_call, RpcError};
 use av_state::{ActionBudget, BudgetDecision, BudgetSpec, StateStore};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -70,6 +71,8 @@ pub enum ToolVerdict {
         /// per-policy attribution must never invent a policy that the
         /// operator can't find in their policy inventory.
         policy: Option<String>,
+        /// Structured denial code for machine consumption.
+        denial_code: DenialCode,
         /// Human/machine-readable reason.
         reason: String,
         /// Ready-to-send JSON-RPC authorization error.
@@ -156,12 +159,16 @@ impl Sandbox {
         let req = match parse_tool_call(raw) {
             Ok(r) => r,
             Err(e) => {
-                let (stage, reason) = match &e {
+                let (stage, reason, denial_code) = match &e {
                     // Passthrough refusal parsed fine as JSON-RPC — a
                     // deliberate policy choice, distinct HTTP class
                     // (403) from true protocol failures (400).
-                    RpcError::NotToolCall(_) => ("passthrough", format!("passthrough refused: {e}")),
-                    _ => ("parse", e.to_string()),
+                    RpcError::NotToolCall(_) => (
+                        "passthrough",
+                        format!("passthrough refused: {e}"),
+                        DenialCode::PassthroughRefused,
+                    ),
+                    _ => ("parse", e.to_string(), DenialCode::ParseError),
                 };
                 // Protocol-level failures
                 // get the reserved JSON-RPC codes (-32700/-32600/
@@ -174,6 +181,7 @@ impl Sandbox {
                     tool: "<unparsed>".into(),
                     stage,
                     policy: None,
+                    denial_code,
                     reason,
                     response: crate::rpc::protocol_error(id.as_ref(), &e),
                     elapsed_us: elapsed(started),
@@ -196,8 +204,9 @@ impl Sandbox {
                     tool: req.tool.clone(),
                     stage: "schema",
                     policy: None,
+                    denial_code: DenialCode::SchemaViolation,
                     reason: reason.clone(),
-                    response: authorization_error(req.id.as_ref(), &reason),
+                    response: denial_error(req.id.as_ref(), DenialCode::SchemaViolation, &reason),
                     elapsed_us: elapsed(started),
                 };
             }
@@ -207,8 +216,9 @@ impl Sandbox {
                 tool: req.tool.clone(),
                 stage: "schema",
                 policy: None,
+                denial_code: DenialCode::SchemaMissing,
                 reason: reason.clone(),
-                response: authorization_error(req.id.as_ref(), &reason),
+                response: denial_error(req.id.as_ref(), DenialCode::SchemaMissing, &reason),
                 elapsed_us: elapsed(started),
             };
         }
@@ -221,8 +231,9 @@ impl Sandbox {
                     tool: req.tool.clone(),
                     stage: "policy",
                     policy: Some(policy.name().to_owned()),
+                    denial_code: DenialCode::PolicyDenied,
                     reason: reason.clone(),
-                    response: authorization_error(req.id.as_ref(), &reason),
+                    response: denial_error(req.id.as_ref(), DenialCode::PolicyDenied, &reason),
                     elapsed_us: elapsed(started),
                 };
             }
@@ -236,8 +247,9 @@ impl Sandbox {
                     tool: req.tool.clone(),
                     stage: "budget",
                     policy: None,
+                    denial_code: DenialCode::PayoutInvalid,
                     reason: reason.clone(),
-                    response: authorization_error(req.id.as_ref(), &reason),
+                    response: denial_error(req.id.as_ref(), DenialCode::PayoutInvalid, &reason),
                     elapsed_us: elapsed(started),
                 }
             }
@@ -259,8 +271,9 @@ impl Sandbox {
                         tool: req.tool.clone(),
                         stage: "budget",
                         policy: None,
+                        denial_code: DenialCode::BudgetExceeded,
                         reason: reason.clone(),
-                        response: authorization_error(req.id.as_ref(), &reason),
+                        response: denial_error(req.id.as_ref(), DenialCode::BudgetExceeded, &reason),
                         elapsed_us: elapsed(started),
                     };
                 }
@@ -270,8 +283,9 @@ impl Sandbox {
                         tool: req.tool.clone(),
                         stage: "budget",
                         policy: None,
+                        denial_code: DenialCode::BudgetError,
                         reason: reason.clone(),
-                        response: authorization_error(req.id.as_ref(), &reason),
+                        response: denial_error(req.id.as_ref(), DenialCode::BudgetError, &reason),
                         elapsed_us: elapsed(started),
                     };
                 }
@@ -295,8 +309,9 @@ impl Sandbox {
                         tool: req.tool.clone(),
                         stage: "budget",
                         policy: None,
+                        denial_code: DenialCode::BudgetExceeded,
                         reason: reason.clone(),
-                        response: authorization_error(req.id.as_ref(), &reason),
+                        response: denial_error(req.id.as_ref(), DenialCode::BudgetExceeded, &reason),
                         elapsed_us: elapsed(started),
                     };
                 }
@@ -307,8 +322,9 @@ impl Sandbox {
                         tool: req.tool.clone(),
                         stage: "budget",
                         policy: None,
+                        denial_code: DenialCode::BudgetError,
                         reason: reason.clone(),
-                        response: authorization_error(req.id.as_ref(), &reason),
+                        response: denial_error(req.id.as_ref(), DenialCode::BudgetError, &reason),
                         elapsed_us: elapsed(started),
                     };
                 }
@@ -331,8 +347,9 @@ impl Sandbox {
                     tool: req.tool.clone(),
                     stage: "budget",
                     policy: None,
+                    denial_code: DenialCode::BudgetExceeded,
                     reason: reason.clone(),
-                    response: authorization_error(req.id.as_ref(), &reason),
+                    response: denial_error(req.id.as_ref(), DenialCode::BudgetExceeded, &reason),
                     elapsed_us: elapsed(started),
                 }
             }
@@ -343,8 +360,9 @@ impl Sandbox {
                     tool: req.tool.clone(),
                     stage: "budget",
                     policy: None,
+                    denial_code: DenialCode::BudgetError,
                     reason: reason.clone(),
-                    response: authorization_error(req.id.as_ref(), &reason),
+                    response: denial_error(req.id.as_ref(), DenialCode::BudgetError, &reason),
                     elapsed_us: elapsed(started),
                 }
             }

@@ -1,0 +1,15 @@
+node_modules
+dist
+coverage
+.git
+.DS_Store
+*.log
+.env
+.env.*
+!.env.example
+**/secrets.env
+**/*.seed
+**/*.key
+**/*.pem
+**/id_rsa
+**/id_rsa.*

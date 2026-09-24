@@ -1,24 +1,16 @@
 # CI for the hosted console (docs/app/) + its backend server (server/).
-# Runs on every push/PR that touches those directories. Keeps the main
-# Rust workspace CI (ci.yml) uncluttered — different toolchain, different
-# concurrency needs.
+# Runs on every push/PR: Rust changes can alter the evidence consumed by the
+# console, so the daemon-to-console regression must also cover those changes.
 name: Console + API
 
 on:
   push:
     branches: [main]
-    paths:
-      - "docs/app/**"
-      - "server/**"
-      - ".github/workflows/console-api.yml"
   pull_request:
-    paths:
-      - "docs/app/**"
-      - "server/**"
-      - ".github/workflows/console-api.yml"
+  workflow_call:
 
 concurrency:
-  group: console-${{ github.ref }}
+  group: console-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 # Least-privilege default: read-only. See ci.yml for rationale.
@@ -47,6 +39,12 @@ jobs:
             echo "→ $f"
             node --check "$f"
           done
+      - name: Encrypted backup failure and cleanup regressions
+        run: |
+          python3 scripts/test-postgres-backup.py
+          python3 scripts/test-postgres-backup-drill.py
+      - name: Container startup lifecycle
+        run: node --test server/ci/container-entrypoint.test.mjs
       - name: Verify MOCK_MODE flag present in config
         # r57 extracted the inline MOCK_MODE script from index.html to
         # config.js so a strict CSP (script-src 'self') can be enforced.
@@ -71,6 +69,7 @@ jobs:
   # ────────────────────────────────────────────────────────────────────
   server-tests:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     services:
       postgres:
         image: postgres:16-alpine
@@ -118,12 +117,47 @@ jobs:
           # without this npm ci drops @types/node + tsx and typecheck fails.
           NODE_ENV: development
         run: npm ci --no-audit --no-fund
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Build daemon and CLI for console integration
+        env:
+          CARGO_BUILD_JOBS: "2"
+        run: cargo build --locked -p av-harness --bin agentvisord -p av-cli --bin avctl
       - name: Prisma generate
         working-directory: server
         run: npx prisma generate
       - name: Typecheck
         working-directory: server
         run: npx tsc --noEmit
+      - name: Database aliases and production URL startup regressions
+        working-directory: server
+        run: node --test ci/startup-env.test.mjs
+      - name: Multi-instance logout and bounded stream recovery regressions
+        working-directory: server
+        run: npm run build && node --import tsx --test ci/multi-instance.test.mjs ci/bus-query-recovery.test.mjs ci/recovery-drill.test.mjs
+      - name: Local identity provider, SMTP, and password reset contracts
+        working-directory: server
+        run: node --import tsx --test ci/external-auth.test.mjs
+      - name: Real database outage and two-instance stream recovery
+        working-directory: server
+        timeout-minutes: 4
+        env:
+          # The service image is already present. The drill creates a
+          # separate container and never resets the job's service DB.
+          PG_IMAGE: postgres:16-alpine
+          TMPDIR: ${{ runner.temp }}
+        run: node scripts/recovery-drill.mjs
+      - name: Preserve console recovery evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: console-recovery-evidence
+          path: |
+            ${{ runner.temp }}/av-console-recovery-*/report.json
+            ${{ runner.temp }}/av-console-recovery-*/api-*.log
+          if-no-files-found: ignore
       - name: Migrate DB
         working-directory: server
         run: npx prisma migrate deploy
@@ -147,7 +181,7 @@ jobs:
         run: |
           npx tsx src/index.ts &
           echo $! > /tmp/api.pid
-          for i in $(seq 1 20); do
+          for _ in $(seq 1 20); do
             if curl -sf http://127.0.0.1:8985/healthz > /dev/null; then break; fi
             sleep 0.5
           done
@@ -172,29 +206,71 @@ jobs:
           mkdir -p /tmp/console-root
           cp -R docs/app /tmp/console-root/app
           cp docs/logo.png /tmp/console-root/logo.png
+          # Test the same pinned minification recipe used by Pages.
+          (cd docs/app && npm ci --no-audit --no-fund)
+          for script in app datasource tour; do
+            docs/app/node_modules/.bin/terser "docs/app/$script.js" \
+              --compress passes=2 --mangle --keep-fnames --keep-classnames \
+              --output "/tmp/console-root/app/$script.js"
+          done
           sed -i 's/window.MOCK_MODE = true;/window.MOCK_MODE = false;/' /tmp/console-root/app/config.js
           sed -i 's#window.API_BASE = "";#window.API_BASE = "http://127.0.0.1:8985";#' /tmp/console-root/app/config.js
           sed -i 's#connect-src '\''self'\'' https://api.agentvisorai.me#connect-src '\''self'\'' http://127.0.0.1:8985#' /tmp/console-root/app/index.html
           grep -q 'MOCK_MODE = false' /tmp/console-root/app/config.js
           grep -q 'connect-src .self. http://127.0.0.1:8985' /tmp/console-root/app/index.html
           (cd /tmp/console-root && python3 -m http.server 8787 >/dev/null 2>&1 &)
-          for i in $(seq 1 20); do
+          for _ in $(seq 1 20); do
             if curl -sf http://127.0.0.1:8787/app/config.js > /dev/null; then break; fi
             sleep 0.5
           done
       - name: Install Playwright Chromium
         working-directory: server
         run: npx playwright install --with-deps chromium
-      - name: Browser E2E (real SPA, real browser, real API)
+      - name: SAML discovery, outage, and recovery in the browser
+        working-directory: server
+        timeout-minutes: 2
+        env:
+          CONSOLE_DOCS_ROOT: /tmp/console-root
+        run: node ci/saml-browser-e2e.mjs
+      - name: Audit pagination and stream recovery in the minified console
+        working-directory: server
+        timeout-minutes: 2
+        env:
+          CONSOLE_DOCS_ROOT: /tmp/console-root
+        run: node --test ci/datasource-recovery.test.mjs
+      # Includes failed logout visibility, resumed SSE, and successful
+      # logout retry. The deliberate 503 is confined to that assertion.
+      - name: Browser E2E including logout failure and retry
         working-directory: server
         env:
           SPA_ORIGIN: http://127.0.0.1:8787/app
           API_BASE: http://127.0.0.1:8985
         run: node ci/browser-e2e.mjs
-      # Load test — validates our "300 rpm per user" claim is actually
-      # true, not just documented. autocannon at 100 rps for 15 s against
-      # the cheap /healthz endpoint. Asserts p99 < 250 ms and zero
-      # non-2xx responses. Realistic for a 256 MB Fly nano.
+      - name: Browser quarantine evidence regression
+        working-directory: server
+        env:
+          SPA_ORIGIN: http://127.0.0.1:8787/app
+          API_BASE: http://127.0.0.1:8985
+        run: node scripts/quarantine-drill.mjs
+      - name: Real daemon crash evidence reaches the console
+        working-directory: server
+        env:
+          TMPDIR: ${{ runner.temp }}
+          API_BASE: http://127.0.0.1:8985
+          AGENTVISORD: ${{ github.workspace }}/target/debug/agentvisord
+          AVCTL: ${{ github.workspace }}/target/debug/avctl
+        run: node scripts/daemon-console-drill.mjs
+      - name: Preserve daemon startup failure logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: console-daemon-startup-logs
+          path: ${{ runner.temp }}/av-crash-*/daemon-boot.log
+          if-no-files-found: ignore
+      # This 15-second load test measures /healthz only, using 20
+      # connections without a request-rate cap. It requires p99 <= 250 ms,
+      # at least 50 requests/second, and zero errors or non-2xx responses.
+      # It does not test database workloads or authenticated rate limits.
       - name: Load test (autocannon → /healthz)
         working-directory: server
         run: |
@@ -230,7 +306,7 @@ jobs:
       - name: Stop API
         if: always()
         run: |
-          kill $(cat /tmp/api.pid) 2>/dev/null || true
+          kill "$(cat /tmp/api.pid)" 2>/dev/null || true
 
   # ────────────────────────────────────────────────────────────────────
   # Docker image — verify the multi-stage Dockerfile builds and runs.
@@ -238,6 +314,7 @@ jobs:
   # ────────────────────────────────────────────────────────────────────
   docker-image:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -255,8 +332,87 @@ jobs:
           tags: agentvisor-api:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
-      - name: Verify image runs as non-root
+      - name: Verify production migrations, API, health, and database recovery
+        timeout-minutes: 10
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: python3 scripts/container-smoke.py --console-image agentvisor-api:ci
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+      - name: Install authentication fixture dependencies
+        working-directory: server
+        run: npm ci --omit=dev --ignore-scripts --no-audit --no-fund
+      - name: Authentication fixture cleanup regressions
+        working-directory: server
+        run: node --test ci/external-auth-drill.test.mjs
+      - name: Verify packaged PostgreSQL notification recovery
+        timeout-minutes: 3
         run: |
-          docker run --rm --entrypoint /usr/bin/id agentvisor-api:ci | grep 'uid=1000(node)'
-      - name: Verify healthcheck defined
-        run: docker inspect --format '{{.Config.Healthcheck.Test}}' agentvisor-api:ci | grep readyz
+          docker run --rm --network none --read-only \
+            --tmpfs /tmp:uid=65532,gid=65532,mode=0700 \
+            --cap-drop ALL --security-opt no-new-privileges \
+            --env BUS_TEST_DIST=1 \
+            --mount "type=bind,src=$GITHUB_WORKSPACE/server/ci,dst=/app/ci,readonly" \
+            agentvisor-api:ci --test /app/ci/bus-query-recovery.test.mjs
+      - name: Verify packaged replicas recover from a real database outage
+        timeout-minutes: 4
+        working-directory: server
+        env:
+          CONSOLE_RECOVERY_IMAGE: agentvisor-api:ci
+          # Reuse the exact PostgreSQL image loaded by container-smoke.py.
+          PG_IMAGE: postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+          TMPDIR: ${{ runner.temp }}
+        run: node scripts/recovery-drill.mjs
+      - name: Verify packaged authentication against PostgreSQL and private providers
+        timeout-minutes: 10
+        working-directory: server
+        env:
+          CONSOLE_AUTH_IMAGE: agentvisor-api:ci
+          AUTH_DRILL_OUTPUT_PARENT: ${{ runner.temp }}
+        # Reuse the exact image built above. The script copies its current
+        # helper and temporary TLS files through Docker's API, then removes
+        # only containers/networks with its own unique ownership label.
+        run: node scripts/external-auth-drill.mjs
+      - name: Verify shared SAML ceremonies across replicas and restarts
+        timeout-minutes: 10
+        working-directory: server
+        env:
+          CONSOLE_SAML_IMAGE: agentvisor-api:ci
+          SAML_DRILL_OUTPUT_PARENT: ${{ runner.temp }}
+        run: node scripts/saml-shared-drill.mjs
+      - name: Preserve container verification logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: console-container-logs
+          path: |
+            ${{ runner.temp }}/av-container-smoke-*/*.log
+            ${{ runner.temp }}/av-container-smoke-*/native-runtime.json
+            ${{ runner.temp }}/av-auth-*/*.log
+            ${{ runner.temp }}/av-auth-*/report.json
+            ${{ runner.temp }}/av-saml-shared-*/*.log
+            ${{ runner.temp }}/av-saml-shared-*/report.json
+            ${{ runner.temp }}/av-console-recovery-*/*.log
+            ${{ runner.temp }}/av-console-recovery-*/report.json
+          if-no-files-found: ignore
+
+  encrypted-backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: PostgreSQL 18 encrypted archive and restore drill
+        run: python3 scripts/postgres-backup-test.py --output-dir "${{ runner.temp }}/backup-results"
+      - name: Preserve backup drill evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: encrypted-backup-drill
+          path: ${{ runner.temp }}/backup-results
+          if-no-files-found: ignore
+          retention-days: 14

@@ -36,7 +36,22 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/v1/sessions/{id}/promote",
             post(promote_session).options(cors_deny),
+        )
+        .route("/v1/token", post(token_exchange).options(cors_deny))
+        .route("/v1/revoke", post(crate::token_routes::revoke).options(cors_deny))
+        .route("/.well-known/jwks.json", get(jwks));
+    if !state.config.introspection_tokens.is_empty() {
+        router = router.route(
+            "/v1/introspect",
+            post(crate::token_routes::introspect).options(cors_deny),
         );
+    }
+    if !state.config.operator_tokens.is_empty() {
+        router = router.route(
+            "/admin/v1/revocations",
+            post(crate::token_routes::admin_revoke).options(cors_deny),
+        );
+    }
     if dashboard_enabled {
         router = router
             .route("/dashboard", get(crate::dashboard::index))
@@ -231,6 +246,11 @@ fn route(path: &str) -> crate::pipeline::Route {
         "/livez" => Route::Livez,
         "/readyz" => Route::Readyz,
         "/metrics" => Route::Metrics,
+        "/v1/token" => Route::TokenExchange,
+        "/v1/revoke" => Route::Revoke,
+        "/v1/introspect" => Route::Introspect,
+        "/admin/v1/revocations" => Route::AdminRevocation,
+        "/.well-known/jwks.json" => Route::Jwks,
         _ if path.starts_with("/v1/sessions/") && path.ends_with("/close") => Route::SessionClose,
         _ if path.starts_with("/v1/sessions/") && path.ends_with("/promote") => Route::SessionPromote,
         _ if path.starts_with("/dashboard") || path.starts_with("/api/v1/dashboard") => Route::Dashboard,
@@ -364,6 +384,18 @@ async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
         .await
         .unwrap_or(false)
     };
+    // Report a shared revocation outage without removing every replica from
+    // service. Authentication still refuses requests when the store is unreadable.
+    let revocation_health: Vec<_> = state
+        .identity
+        .as_ref()
+        .and_then(|validator| validator.revocation_store())
+        .and_then(|store| store.health())
+        .into_iter()
+        .chain(state.exchanged_revocations.health())
+        .collect();
+    let revocation_available = revocation_health.iter().all(|health| health.available);
+    let local_revocations: usize = revocation_health.iter().map(|health| health.local_entries).sum();
     let ready = !draining && spool_writable;
     let body = Json(json!({
         "status": if ready { "ready" } else { "not_ready" },
@@ -371,6 +403,8 @@ async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
         "checks": {
             "draining": draining,
             "spool_dir_writable": spool_writable,
+            "revocation_available": revocation_available,
+            "revocation_local_entries": local_revocations,
         },
     }));
     if ready {
@@ -540,51 +574,17 @@ async fn chat_completions(State(state): State<AppState>, headers: HeaderMap, bod
     // recursion) on a `max_request_bytes = 16 MiB` body BEFORE
     // any admission decision — a DoS amplification surface (three
     // full-body passes × concurrent unauthenticated clients).
-    // Resolve identity here (header-only, no body touched) and
-    // fail fast on rejection; on success, discard the result and
-    // let `prepare_chat_nonblocking` re-resolve (cached JWKS
-    // makes the re-resolve cheap: HMAC compare / cached-key JWT
-    // verify).
-    //
-    // R73 review F3 (landed R75): stash the pre-resolved identity
-    // and thread it through to `prepare_chat_nonblocking` so the
-    // internal `resolve_identity` is skipped. Prior shape re-
-    // resolved inside `prepare_chat`; a JWKS-rotation race
-    // between the two calls (pre-check success + re-check failure)
-    // double-counted `av_identity_rejections_total` and burned a
-    // second full-audit sample slot per rejected request,
-    // distorting alerting rates during a botched IdP key rollout.
-    let resolved_identity = match state.resolve_identity(&headers, Some(&state.config.chat_scope)) {
-        Ok(identity) => identity,
-        Err(identity_error) => {
-            // R72 review F3 (landed R73): always run
-            // `enqueue_transient_failure`, even when
-            // `session_id(&headers)` failed (malformed / oversized /
-            // non-ASCII `X-AV-Session`), so a fuzzer / unauthenticated
-            // probe cannot silently bypass the
-            // `av_identity_rejections_total` counter by sending an
-            // unparseable session header. The `unwrap_or_default()`
-            // gives an empty-string session id — the enqueue path
-            // treats that as anonymous, which matches how the
-            // pre-check would classify a header-less request.
-            let sid = crate::pipeline::session_id(&headers).unwrap_or_default();
-            // R72 review F1 (landed R73): honour the Err path of
-            // `enqueue_transient_failure`, which maps a worker-channel
-            // backpressure failure to `PipelineError::unavailable_source`
-            // (503 + Retry-After). Pre-R72 the request reached
-            // `prepare_chat`'s `?` and returned 503 in that case; R72's
-            // `let _ = ...` silently downgraded it to 401, defeating
-            // SDK retry policies that key on 503. The audited path
-            // now returns 503 on queue-full and 401 on genuine
-            // identity failure, matching pre-R72 semantics exactly.
-            if let Err(enqueue_error) = state.enqueue_transient_failure(
-                &sid,
-                av_events::StopReason::IdentityRejected,
-                identity_error.to_string(),
-            ) {
-                return pipeline_error(enqueue_error);
+    // Authenticate once before parsing, then carry the validated caller into
+    // preparation for scope rechecks and principal binding. Configured identity
+    // validators run off the reactor because revocation may use synchronous I/O;
+    // the anonymous path stays local even when the blocking pool is saturated.
+    let caller = match state.authenticate_chat_nonblocking(&headers).await {
+        Ok(caller) => caller,
+        Err(error) => {
+            if let Err(audit_error) = state.audit_authentication_error(&headers, &error) {
+                return pipeline_error(audit_error);
             }
-            return pipeline_error(identity_error);
+            return pipeline_error(error);
         }
     };
     // Refuse duplicate top-level or
@@ -622,7 +622,7 @@ async fn chat_completions(State(state): State<AppState>, headers: HeaderMap, bod
     }
     let admission_started = std::time::Instant::now();
     let mut prepared = match state
-        .prepare_chat_nonblocking(&headers, payload, body.len(), Some(resolved_identity))
+        .prepare_authenticated_chat(&headers, payload, body.len(), caller)
         .await
     {
         Ok(prepared) => prepared,
@@ -1112,8 +1112,52 @@ async fn mcp_call(State(state): State<AppState>, headers: HeaderMap, body: Bytes
     }
 }
 
+/// Complete compensation before the detached MCP owner releases its permit.
+/// StateStore is synchronous, so network-backed refunds must not run on Tokio.
+async fn refund_tool_admission(
+    state: &AppState,
+    execution: &ToolExecution,
+    payout_micros: u64,
+    principal_id: Option<&str>,
+) -> Result<(), String> {
+    let store = Arc::clone(&state.store);
+    let session_id = execution.session_id.clone();
+    let tool = execution.tool.clone();
+    let budget = state.config.budget.clone();
+    let principal = principal_id
+        .zip(state.config.principal_budget.as_ref())
+        .map(|(id, spec)| (id.to_owned(), spec.clone()));
+    tokio::task::spawn_blocking(move || {
+        av_state::ActionBudget::new(store.as_ref(), &session_id, &budget)
+            .refund_tool_call(&tool, payout_micros);
+        if let Some((principal_id, spec)) = principal {
+            av_state::ActionBudget::for_principal(store.as_ref(), &principal_id, &spec)
+                .refund_tool_call(&tool, payout_micros);
+        }
+    })
+    .await
+    .map_err(|_| "tool admission refund task failed".to_owned())
+}
+
 async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Response {
-    let (execution, unaudited_outcome) = if state.config.tool_upstream_url.is_some() {
+    // Idempotent execution tracking is needed whenever a call CAN be
+    // forwarded — through `tool_upstream_url` or any `[[backends]]` entry —
+    // because the forwarding branch below has no other execution state.
+    let forwarding_configured = state.config.tool_upstream_url.is_some() || !state.backend_router.is_empty();
+    let auth_state = state.clone();
+    let auth_headers = headers.clone();
+    let authenticated =
+        match tokio::task::spawn_blocking(move || auth_state.authenticate(&auth_headers)).await {
+            Ok(Ok(caller)) => caller,
+            Ok(Err(error)) => {
+                if let Err(audit_error) = state.audit_authentication_error(&headers, &error) {
+                    return pipeline_error(audit_error);
+                }
+                return pipeline_error(error);
+            }
+            Err(error) => return pipeline_error(crate::pipeline::PipelineError::unavailable_source(error)),
+        };
+    let (execution, unaudited_outcome, caller) = if forwarding_configured {
         // Same cheap pre-parse identity gate as the intercept path
         // (pipeline::refuse_unauthenticated_tool_call): required
         // identity + no Authorization header can never be admitted —
@@ -1125,12 +1169,22 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
         match ToolExecution::from_request(&state.config.atif_spool_dir, &headers, &body, state.journal_key) {
             Ok(mut execution) => {
                 let required_scope = crate::pipeline::tool_scope(&execution.tool);
-                let identity = match state.resolve_identity(&headers, Some(&required_scope)) {
+                let identity = match authenticated.authorize(&state, Some(&required_scope)) {
                     Ok(identity) => identity,
-                    Err(error) => return pipeline_error(error),
+                    Err(error) => {
+                        if let Err(audit_error) = state.audit_authentication_error(&headers, &error) {
+                            return pipeline_error(audit_error);
+                        }
+                        return pipeline_error(error);
+                    }
                 };
                 if let Err(error) = execution.bind_principal(&identity) {
                     return pipeline_error(error);
+                }
+                if let Some(principal) = authenticated.principal_digest() {
+                    execution.principal_digest = av_core::digest::sha256_hex(
+                        format!("{}:{principal}", execution.principal_digest).as_bytes(),
+                    );
                 }
                 // The three cached-state arms below used
                 // to repeat this lookup+authorize block verbatim,
@@ -1146,8 +1200,8 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
                             )),
                         )));
                     };
-                    state
-                        .authorize_session(&headers, &session, &required_scope)
+                    authenticated
+                        .authorize_session(&state, &session, &required_scope)
                         .map_err(|error| Box::new(pipeline_error(error)))
                 };
                 match execution.load().await {
@@ -1161,7 +1215,7 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
                         if let Err(response) = authorized_session("pending tool audit") {
                             return *response;
                         }
-                        (Some(execution), Some(outcome))
+                        (Some(execution), Some(outcome), Some(identity))
                     }
                     Ok(ToolExecutionState::Pending) => {
                         if let Err(response) = authorized_session("pending tool execution") {
@@ -1173,7 +1227,7 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
                         )
                             .into_response();
                     }
-                    Ok(ToolExecutionState::Missing) => (Some(execution), None),
+                    Ok(ToolExecutionState::Missing) => (Some(execution), None, Some(identity)),
                     Err(error) if error == TOOL_REQUEST_MISMATCH => {
                         // Same session-binding discipline as every other
                         // `load()` arm above: without it, any holder of a
@@ -1188,8 +1242,8 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
                                 "unknown session for tool execution".to_owned(),
                             ));
                         };
-                        if let Err(error) = state.authorize_session(
-                            &headers,
+                        if let Err(error) = authenticated.authorize_session(
+                            &state,
                             &session,
                             &crate::pipeline::tool_scope(&execution.tool),
                         ) {
@@ -1207,7 +1261,7 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
             Err(error) => return pipeline_error(error),
         }
     } else {
-        (None, None)
+        (None, None, None)
     };
     if let (Some(execution), Some(_)) = (execution.as_ref(), unaudited_outcome.as_ref()) {
         let _lease = match state.lease_session(&headers) {
@@ -1244,7 +1298,43 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
     // tool_call` on the lost-claim branch. `refund` is best-effort
     // (backend errors are silently absorbed) so a Redis blip on the
     // compensation path cannot turn the CONFLICT response into 5xx.
-    match state.intercept_tool_nonblocking(&headers, &body).await {
+    // Credential exchange is an authorization gate: finish it before the
+    // sandbox charges budget or records an allowed verdict.
+    let mut exchange_token = None;
+    let mut exchange_denial = None;
+    if let Some(execution) = &execution {
+        if let Some(backend) = state
+            .backend_router
+            .resolve(&execution.tool)
+            .filter(|backend| backend.auth_mode == crate::backend::BackendAuthMode::Exchange)
+        {
+            match exchange_for_backend(&state, &authenticated, &backend.name, &execution.tool) {
+                Ok(token) => exchange_token = Some(token),
+                Err(crate::pipeline::PipelineError::Blocked { context: reason, .. }) => {
+                    let request = av_sandbox::parse_tool_call(&body).ok();
+                    let code = av_sandbox::DenialCode::PolicyDenied;
+                    exchange_denial = Some(ToolVerdict::Blocked {
+                        tool: execution.tool.clone(),
+                        stage: "policy",
+                        policy: Some("backend.exchange".into()),
+                        denial_code: code,
+                        response: av_sandbox::rpc::denial_error(
+                            request.as_ref().and_then(|r| r.id.as_ref()),
+                            code,
+                            &reason,
+                        ),
+                        reason,
+                        elapsed_us: 0,
+                    });
+                }
+                Err(error) => return pipeline_error(error),
+            }
+        }
+    }
+    match state
+        .intercept_authenticated_nonblocking(&headers, &body, authenticated, exchange_denial)
+        .await
+    {
         Ok(ToolVerdict::Allowed {
             tool,
             budget_remaining,
@@ -1252,7 +1342,11 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
             payout_micros,
             principal_id,
         }) => {
-            if let Some(url) = state.config.tool_upstream_url.as_deref() {
+            let resolved_backend = state.backend_router.resolve(&tool);
+            if let Some(url) = resolved_backend
+                .map(|b| b.url.as_str())
+                .or(state.config.tool_upstream_url.as_deref())
+            {
                 let execution = match execution {
                     Some(execution) => execution,
                     None => return lifecycle_error("tool execution state is missing".to_owned()),
@@ -1265,31 +1359,37 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
                 // (session AND principal — the principal ledger persists
                 // across sessions, so a leak there never heals) with zero
                 // tools executed; each client retry re-debits.
-                let refund_admission = || {
-                    av_state::ActionBudget::new(
-                        state.store.as_ref(),
-                        &execution.session_id,
-                        &state.config.budget,
-                    )
-                    .refund_tool_call(&execution.tool, payout_micros);
-                    if let (Some(principal), Some(spec)) =
-                        (principal_id.as_deref(), state.config.principal_budget.as_ref())
-                    {
-                        av_state::ActionBudget::for_principal(state.store.as_ref(), principal, spec)
-                            .refund_tool_call(&execution.tool, payout_micros);
-                    }
-                };
+                let refund_admission =
+                    || refund_tool_admission(&state, &execution, payout_micros, principal_id.as_deref());
+                let now_s = av_core::time::now_ms() / 1000;
+                // The pipeline made (and audited) the PDP decision before
+                // charging the budget; deciding again here could disagree
+                // with that audit record, so only the intent is looked up.
+                let intent = state.pdp.intent_for(&tool);
+                let audience =
+                    resolved_backend.map_or(crate::backend::DEFAULT_BACKEND_NAME, |b| b.name.as_str());
+                let subject = caller.as_ref().map_or_else(
+                    || "anonymous".to_owned(),
+                    crate::pipeline::principal_id_for_budget,
+                );
+                let intent_token = state
+                    .pdp
+                    .mint_intent_token(&tool, &intent, &subject, audience, now_s);
                 let _lease = match state.lease_session(&headers) {
                     Ok(lease) => lease,
                     Err(error) => {
-                        refund_admission();
+                        if let Err(error) = refund_admission().await {
+                            return lifecycle_error(error);
+                        }
                         return pipeline_error(error);
                     }
                 };
                 let completion_permit = match state.worker.try_reserve(&execution.session_id) {
                     Ok(permit) => permit,
                     Err(error) => {
-                        refund_admission();
+                        if let Err(error) = refund_admission().await {
+                            return lifecycle_error(error);
+                        }
                         return pipeline_error(crate::pipeline::PipelineError::unavailable(
                             error.to_string(),
                         ));
@@ -1308,7 +1408,9 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
                         // Refund the exact amount debited so
                         // the budget counters reflect only admitted work,
                         // not the lost race.
-                        refund_admission();
+                        if let Err(error) = refund_admission().await {
+                            return lifecycle_error(error);
+                        }
                         return (
                             StatusCode::CONFLICT,
                             Json(json!({"error": TOOL_OUTCOME_UNCERTAIN})),
@@ -1326,19 +1428,53 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
                             %error,
                             "tool execution claim failed; refunding budget"
                         );
-                        refund_admission();
+                        if let Err(error) = refund_admission().await {
+                            return lifecycle_error(error);
+                        }
                         return pipeline_error(crate::pipeline::PipelineError::unavailable(
                             "tool execution intent could not be persisted".to_owned(),
                         ));
                     }
                 }
+                // Once claimed, a failure to capture the result must poison
+                // complete evidence before the session lease is released. A
+                // successful durable outcome still follows the existing audit
+                // retry path, including recoverable audited-marker failures.
+                let mark_incomplete = || {
+                    if let Some(session) = state.sessions.get(&execution.session_id) {
+                        session.mark_capture_failed();
+                    }
+                };
                 let mut tool_request = state
                     .client
                     .post(url)
+                    // A fixed request-local deadline follows the response
+                    // through body reads. Idle reads alone let a slow drip
+                    // occupy this detached task and its admission slot forever.
+                    .timeout(std::time::Duration::from_secs(
+                        state
+                            .config
+                            .mcp_request_timeout_s
+                            .unwrap_or(crate::config::DEFAULT_MCP_REQUEST_TIMEOUT_S),
+                    ))
                     .header(axum::http::header::CONTENT_TYPE, "application/json")
                     .body(body);
-                if let Some(bearer) = &state.tool_auth {
+                if let Some(token) = &exchange_token {
+                    if let Ok(mut val) = HeaderValue::from_str(&format!("Bearer {token}")) {
+                        val.set_sensitive(true);
+                        tool_request = tool_request.header(axum::http::header::AUTHORIZATION, val);
+                    }
+                } else if let Some(backend) = resolved_backend {
+                    if let Some((name, value)) = &backend.auth_header {
+                        tool_request = tool_request.header(name.clone(), value.clone());
+                    }
+                } else if let Some(bearer) = &state.tool_auth {
                     tool_request = tool_request.header(axum::http::header::AUTHORIZATION, bearer.clone());
+                }
+                if let Some(token) = &intent_token {
+                    if let Ok(value) = HeaderValue::from_str(token) {
+                        tool_request = tool_request.header("x-av-intent-token", value);
+                    }
                 }
                 match tool_request.send().await {
                     Ok(upstream) => {
@@ -1384,6 +1520,7 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
                             let gate = tool_audit_gate(&state, &execution.key);
                             let _gate = gate.lock().await;
                             if let Err(error) = execution.persist(&failure).await {
+                                mark_incomplete();
                                 return lifecycle_error(error);
                             }
                             let session = match state.sessions.get(&execution.session_id) {
@@ -1414,6 +1551,7 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
                                 let gate = tool_audit_gate(&state, &execution.key);
                                 let _gate = gate.lock().await;
                                 if let Err(error) = execution.persist(&outcome).await {
+                                    mark_incomplete();
                                     return lifecycle_error(error);
                                 }
                                 let session = match state.sessions.get(&execution.session_id) {
@@ -1459,6 +1597,7 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
                                         .await;
                                     }
                                 }
+                                mark_incomplete();
                                 pipeline_error(crate::pipeline::PipelineError::upstream(format!(
                                     "read tool response: {error}"
                                 )))
@@ -1501,13 +1640,24 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
                         // failures stay claimed — the tool may have executed.
                         if error.is_connect() {
                             match execution.release_unexecuted().await {
-                                Ok(()) => refund_admission(),
-                                Err(release_error) => tracing::warn!(
-                                    session = %execution.session_id,
-                                    error = %release_error,
-                                    "failed to release unexecuted tool intent; charge kept, key stays claimed"
-                                ),
+                                Ok(()) => {
+                                    if let Err(error) = refund_admission().await {
+                                        return lifecycle_error(error);
+                                    }
+                                }
+                                Err(release_error) => {
+                                    mark_incomplete();
+                                    tracing::warn!(
+                                        session = %execution.session_id,
+                                        error = %release_error,
+                                        "failed to release unexecuted tool intent; charge kept, key stays claimed"
+                                    );
+                                }
                             }
+                        } else {
+                            // No headers does not prove the tool never executed.
+                            // Preserve its durable claim and the charged budget.
+                            mark_incomplete();
                         }
                         // Upstream faults must surface as 502 (as the chat
                         // relay does), not 500: a 500 blames the harness and
@@ -1812,6 +1962,108 @@ const TOOL_REQUEST_MISMATCH: &str = "JSON-RPC id is already bound to a different
 /// state and a lost concurrent claim race so neither reveals more than the
 /// other (a raw claim error would leak filesystem detail, CWE-209).
 const TOOL_OUTCOME_UNCERTAIN: &str = "tool execution outcome is uncertain; refusing duplicate execution";
+
+/// Read-only lifecycle barrier. Unlike startup recovery, this check never
+/// renames incomplete evidence belonging to another concurrent live request.
+pub(crate) async fn ensure_tool_executions_resolved(
+    spool: &std::path::Path,
+    session_id: &str,
+    control_key: &[u8; 32],
+) -> Result<(), String> {
+    let directory = spool.join(crate::spool::TOOL_EXECUTIONS);
+    let session_id = session_id.to_owned();
+    let control_key = *control_key;
+    tokio::task::spawn_blocking(move || {
+        ensure_tool_executions_resolved_with_limit(
+            &directory,
+            &session_id,
+            &control_key,
+            crate::reconciler::MAX_RECOVERY_DIRENTS_PER_TICK,
+        )
+    })
+    .await
+    .map_err(|_| "tool evidence lookup task failed".to_owned())?
+}
+
+fn ensure_tool_executions_resolved_with_limit(
+    directory: &std::path::Path,
+    session_id: &str,
+    control_key: &[u8; 32],
+    max_dirents: usize,
+) -> Result<(), String> {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err("tool evidence directory is unavailable".to_owned()),
+    };
+    for (index, entry) in entries.enumerate() {
+        if index >= max_dirents {
+            return Err("tool evidence directory exceeds the bounded scan limit".to_owned());
+        }
+        let path = entry
+            .map_err(|_| "tool evidence entry is unavailable".to_owned())?
+            .path();
+        let Some(name) = path.file_name().and_then(std::ffi::OsStr::to_str) else {
+            continue;
+        };
+        let Some(key) = name.strip_suffix(crate::spool::TOOL_INTENT_SUFFIX) else {
+            continue;
+        };
+        let bytes = av_core::fsutil::read_capped(&path, av_core::fsutil::MAX_CONTROL_BYTES)
+            .map_err(|_| "tool execution intent is unavailable".to_owned())?;
+        let intent: ToolIntent = crate::journal::open(
+            control_key,
+            &format!("{}:{key}", crate::journal::TOOL_INTENT_DOMAIN),
+            0,
+            &bytes,
+        )
+        .map_err(|_| "tool execution intent could not be authenticated".to_owned())?;
+        if intent.execution_key != key {
+            return Err("tool intent path does not match its authenticated key".to_owned());
+        }
+        if intent.session_id == session_id && !tool_completion_is_authenticated(directory, key, control_key) {
+            return Err("tool execution outcome or completion audit is unresolved".to_owned());
+        }
+    }
+    Ok(())
+}
+
+/// A capture-failed close may archive only independently authenticated
+/// completed tool records. Callers authenticate the intent and session first.
+/// Missing, corrupt or unreadable evidence remains active for recovery.
+pub(crate) fn tool_completion_is_authenticated(
+    directory: &std::path::Path,
+    key: &str,
+    control_key: &[u8; 32],
+) -> bool {
+    let outcome_path = directory.join(format!("{key}{}", crate::spool::TOOL_OUTCOME_SUFFIX));
+    let Ok(outcome_bytes) = av_core::fsutil::read_capped(&outcome_path, av_core::fsutil::MAX_ATIF_BYTES)
+    else {
+        return false;
+    };
+    if crate::journal::open::<ToolOutcome>(
+        control_key,
+        &format!("{}:{key}", crate::journal::TOOL_OUTCOME_DOMAIN),
+        0,
+        &outcome_bytes,
+    )
+    .is_err()
+    {
+        return false;
+    }
+    let audited_path = directory.join(format!("{key}{}", crate::spool::TOOL_AUDITED_SUFFIX));
+    let Ok(audited_bytes) = av_core::fsutil::read_capped(&audited_path, av_core::fsutil::MAX_CONTROL_BYTES)
+    else {
+        return false;
+    };
+    crate::journal::open::<serde_json::Value>(
+        control_key,
+        &format!("{}:{key}", crate::journal::TOOL_AUDITED_DOMAIN),
+        0,
+        &audited_bytes,
+    )
+    .is_ok()
+}
 
 #[derive(PartialEq, serde::Serialize, serde::Deserialize)]
 struct ToolIntent {
@@ -2434,30 +2686,40 @@ fn write_atomic_bytes(path: &std::path::Path, bytes: &[u8]) -> Result<(), String
     av_core::fsutil::write_atomic(path, bytes).map_err(|error| error.to_string())
 }
 
+async fn lifecycle_caller(
+    state: &AppState,
+    headers: &HeaderMap,
+    scope: &str,
+) -> Result<crate::pipeline::AuthenticatedCaller, crate::pipeline::PipelineError> {
+    let state = state.clone();
+    let headers = headers.clone();
+    let scope = scope.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let caller = state.authenticate(&headers)?;
+        caller.authorize(&state, Some(&scope))?;
+        Ok(caller)
+    })
+    .await
+    .map_err(crate::pipeline::PipelineError::unavailable_source)?
+}
+
 async fn close_session(
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
+    let caller = match lifecycle_caller(&state, &headers, &state.config.session_close_scope).await {
+        Ok(caller) => caller,
+        Err(error) => return pipeline_error(error),
+    };
     let Some(session) = state.sessions.get(&id) else {
-        // Authenticate BEFORE revealing whether the session exists.
-        // Returning 404 straight from the registry miss gave
-        // unauthenticated callers a response-differential oracle
-        // (404 = free, 401 = live) to enumerate active session ids
-        // without ever presenting a token. Run the same identity +
-        // scope resolution the found-path runs, so the status split
-        // is identical whether or not the id is live.
-        if let Err(error) = state.resolve_identity(&headers, Some(state.config.session_close_scope.as_str()))
-        {
-            return pipeline_error(error);
-        }
         return (
             StatusCode::NOT_FOUND,
             Json(openai_error_body(StatusCode::NOT_FOUND, "unknown session")),
         )
             .into_response();
     };
-    if let Err(error) = state.authorize_session(&headers, &session, &state.config.session_close_scope) {
+    if let Err(error) = caller.authorize_session(&state, &session, &state.config.session_close_scope) {
         return pipeline_error(error);
     }
     match state
@@ -2475,21 +2737,18 @@ async fn promote_session(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
+    let caller = match lifecycle_caller(&state, &headers, &state.config.session_promote_scope).await {
+        Ok(caller) => caller,
+        Err(error) => return pipeline_error(error),
+    };
     let Some(session) = state.sessions.get(&id) else {
-        // Same authenticate-before-404 discipline as `close_session`:
-        // no session-existence oracle for unauthenticated callers.
-        if let Err(error) =
-            state.resolve_identity(&headers, Some(state.config.session_promote_scope.as_str()))
-        {
-            return pipeline_error(error);
-        }
         return (
             StatusCode::NOT_FOUND,
             Json(openai_error_body(StatusCode::NOT_FOUND, "unknown session")),
         )
             .into_response();
     };
-    if let Err(error) = state.authorize_session(&headers, &session, &state.config.session_promote_scope) {
+    if let Err(error) = caller.authorize_session(&state, &session, &state.config.session_promote_scope) {
         return pipeline_error(error);
     }
     // `promote()` silently drives `close_session_locked`
@@ -2501,7 +2760,7 @@ async fn promote_session(
     // open, additionally require the close scope so promote ⊇ close
     // in the scope authority sense.
     if !session.is_closed() {
-        if let Err(error) = state.authorize_session(&headers, &session, &state.config.session_close_scope) {
+        if let Err(error) = caller.authorize_session(&state, &session, &state.config.session_close_scope) {
             return pipeline_error(error);
         }
     }
@@ -2509,6 +2768,193 @@ async fn promote_session(
         Ok(receipt) => Json(receipt).into_response(),
         Err(error) => finalize_error_response(&error),
     }
+}
+
+/// JWKS endpoint exposing the exchange signer's public key so backends
+/// can verify signed tokens offline.
+async fn jwks(State(state): State<AppState>) -> Response {
+    match &state.token_signer {
+        Some(signer) => Json(signer.jwks_json()).into_response(),
+        None => Json(serde_json::json!({"keys": []})).into_response(),
+    }
+}
+
+/// RFC 8693 token exchange endpoint. Accepts a form-encoded request,
+/// validates the inbound subject token, narrows scopes to their
+/// intersection with the requested set, and returns a fresh JWT
+/// scoped to the target backend audience.
+async fn token_exchange(State(state): State<AppState>, body: Bytes) -> Response {
+    crate::token_routes::control_request(state, move |state| async move {
+        tokio::task::spawn_blocking(move || token_exchange_inner(state, body))
+            .await
+            .unwrap_or_else(|_| oauth_unavailable())
+    })
+    .await
+}
+
+fn token_exchange_inner(state: AppState, body: Bytes) -> Response {
+    if !state.config.token_exchange_enabled {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let validator = match &state.identity {
+        Some(v) => v,
+        None => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(oauth_error(
+                    "server_error",
+                    "token exchange requires an identity validator",
+                )),
+            )
+                .into_response();
+        }
+    };
+    let req: av_identity::TokenExchangeRequest = match serde_urlencoded::from_bytes(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(oauth_error(
+                    "invalid_request",
+                    &format!("invalid token exchange request: {e}"),
+                )),
+            )
+                .into_response();
+        }
+    };
+    if req.grant_type != av_identity::TOKEN_EXCHANGE_GRANT_TYPE {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(oauth_error(
+                "unsupported_grant_type",
+                &format!("unsupported grant_type: {:?}", req.grant_type),
+            )),
+        )
+            .into_response();
+    }
+    if req.subject_token_type != av_identity::exchange::JWT_TOKEN_TYPE {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(oauth_error(
+                "invalid_request",
+                &format!("unsupported subject_token_type: {:?}", req.subject_token_type),
+            )),
+        )
+            .into_response();
+    }
+    state
+        .metrics
+        .counter(
+            "av_identity_validations_total",
+            "Full inbound identity validations",
+        )
+        .inc();
+    let validated = match validator.validate(&req.subject_token) {
+        Ok(v) => v,
+        Err(av_identity::IdentityError::RevocationUnavailable(detail)) => {
+            tracing::error!(%detail, "identity revocation list unavailable; refusing token exchange");
+            return oauth_unavailable();
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "token exchange subject token rejected");
+            // Same opaque description as the proxy routes: the detailed
+            // error names configured kids, issuers, and algorithms.
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(oauth_error(
+                    "invalid_request",
+                    crate::pipeline::classify_identity_error(&e),
+                )),
+            )
+                .into_response();
+        }
+    };
+    let now_s = av_core::time::now_ms() / 1000;
+    let ttl = state.config.token_exchange_ttl_s.min(900);
+    let azp = &validated.claims.instance_uid;
+    let allowed_audiences: Vec<String> = state.config.backends.iter().map(|b| b.name.clone()).collect();
+    // `build_exchanged_claims` reads an empty allow-list as "any audience".
+    // The gateway must sign only for audiences it knows (RFC 8693 §2.2.2),
+    // so with no backends configured every target is refused.
+    if allowed_audiences.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(oauth_error(
+                "invalid_target",
+                "no [[backends]] are configured, so no exchange audience is permitted",
+            )),
+        )
+            .into_response();
+    }
+    let params = av_identity::ExchangeParams {
+        subject: &validated.claims,
+        subject_chain: &validated.chain_tokens,
+        subject_delegation_depth: validated.total_delegation_depth,
+        target_audience: &req.audience,
+        requested_scopes: req.scope.as_deref(),
+        azp,
+        now_s,
+        ttl_s: ttl,
+        issuer: &state.config.audience,
+        max_depth: state.config.max_delegation_depth,
+        allowed_audiences: &allowed_audiences,
+    };
+    let exchanged = match av_identity::build_exchanged_claims(&params) {
+        Ok(c) => c,
+        Err(e) => {
+            let code = match &e {
+                av_identity::ExchangeError::EmptyIntersection
+                | av_identity::ExchangeError::ScopeExceedsSubject(_)
+                | av_identity::ExchangeError::InvalidScopes => "invalid_scope",
+                av_identity::ExchangeError::DelegationExceeded { .. } => "invalid_grant",
+                av_identity::ExchangeError::TargetNotAllowed(_) => "invalid_target",
+                _ => "invalid_request",
+            };
+            return (StatusCode::BAD_REQUEST, Json(oauth_error(code, &e.to_string()))).into_response();
+        }
+    };
+    let signer = match &state.token_signer {
+        Some(s) => s,
+        None => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(oauth_error(
+                    "server_error",
+                    "token exchange is enabled but no signing key is configured",
+                )),
+            )
+                .into_response();
+        }
+    };
+    let access_token = match signer.sign(&exchanged) {
+        Ok(jwt) => jwt,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(oauth_error("server_error", &format!("token signing failed: {e}"))),
+            )
+                .into_response();
+        }
+    };
+    let resp = av_identity::TokenExchangeResponse {
+        access_token,
+        issued_token_type: av_identity::exchange::JWT_TOKEN_TYPE.to_owned(),
+        token_type: "Bearer".to_owned(),
+        expires_in: exchanged.exp.saturating_sub(now_s),
+        scope: if exchanged.scopes.is_empty() {
+            None
+        } else {
+            Some(exchanged.scopes.join(" "))
+        },
+    };
+    (
+        [
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+            (axum::http::header::PRAGMA, "no-cache"),
+        ],
+        Json(resp),
+    )
+        .into_response()
 }
 
 /// Typed status mapping for close/promote failures. Flattening every
@@ -2557,7 +3003,7 @@ fn finalize_error_response(error: &crate::reconciler::FinalizeError) -> Response
         FinalizeError::BridgeConfig { .. } => StatusCode::BAD_REQUEST,
         // Transient infrastructure: the broker is unreachable; the close
         // stays pending and a retry (or the reconciler sweep) completes it.
-        FinalizeError::Bridge { .. } => StatusCode::SERVICE_UNAVAILABLE,
+        FinalizeError::Bridge { .. } | FinalizeError::ToolEvidence(_) => StatusCode::SERVICE_UNAVAILABLE,
         // Everything else is a genuine internal fault.
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
@@ -2597,6 +3043,78 @@ fn openai_error_body(status: StatusCode, message: &str) -> serde_json::Value {
             "code": status.as_u16(),
         }
     })
+}
+
+pub(crate) const TOKENS_REVOKED_METRIC: &str = "av_tokens_revoked_total";
+pub(crate) const TOKENS_REVOKED_HELP: &str = "Successful holder revocations and operator revocation commands";
+
+/// Exchange the caller's NHI bearer for a token scoped to one backend and
+/// one tool. Refusals (no bearer, exchange rules) are 403; faults on the
+/// gateway's side (missing validator or signer, unreachable revocation
+/// list, signing failure) are 503 so they never read as the caller's fault.
+fn exchange_for_backend(
+    state: &AppState,
+    caller: &crate::pipeline::AuthenticatedCaller,
+    target_audience: &str,
+    tool: &str,
+) -> Result<String, crate::pipeline::PipelineError> {
+    use crate::pipeline::PipelineError;
+    let refused = |reason: String| PipelineError::blocked(format!("backend token exchange failed: {reason}"));
+    let Some(signer) = state.token_signer.as_ref() else {
+        return Err(PipelineError::unavailable(
+            "backend token exchange is not configured on this gateway".to_owned(),
+        ));
+    };
+    let validated = caller
+        .validated
+        .as_ref()
+        .ok_or_else(|| refused("no validated caller identity".into()))?;
+    let now_s = av_core::time::now_ms() / 1000;
+    let ttl = state.config.token_exchange_ttl_s.min(900);
+    let allowed_audiences: Vec<String> = state.config.backends.iter().map(|b| b.name.clone()).collect();
+    let tool_scope = crate::pipeline::tool_scope(tool);
+    let params = av_identity::ExchangeParams {
+        subject: &validated.claims,
+        subject_chain: &validated.chain_tokens,
+        subject_delegation_depth: validated.total_delegation_depth,
+        target_audience,
+        requested_scopes: Some(&tool_scope),
+        azp: &validated.claims.instance_uid,
+        now_s,
+        ttl_s: ttl,
+        issuer: &state.config.audience,
+        max_depth: state.config.max_delegation_depth,
+        allowed_audiences: &allowed_audiences,
+    };
+    let exchanged = av_identity::build_exchanged_claims(&params).map_err(|e| refused(e.to_string()))?;
+    signer.sign_with_typ(&exchanged, "av-tool+jwt").map_err(|error| {
+        tracing::error!(%error, "exchanged token signing failed");
+        PipelineError::unavailable("backend token exchange could not sign a token".to_owned())
+    })
+}
+
+fn oauth_error(error: &str, description: &str) -> serde_json::Value {
+    json!({
+        "error": error,
+        "error_description": description,
+    })
+}
+
+/// 503 for OAuth endpoints when a dependency (the revocation list) is
+/// down; `Retry-After` tells the client when to try again.
+fn oauth_unavailable() -> Response {
+    let mut response = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(oauth_error(
+            "temporarily_unavailable",
+            "the token revocation list is unavailable; retry shortly",
+        )),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert(axum::http::header::RETRY_AFTER, HeaderValue::from_static("5"));
+    response
 }
 
 /// `pipeline_error` plus the `X-AV-Session` echo. Once a request is
@@ -7357,6 +7875,1469 @@ mod tests {
             unreadable.exists(),
             "the unreadable intent must be left in place for the operator"
         );
+    }
+
+    struct BlockingRefundStore {
+        inner: InMemoryStore,
+        batches: parking_lot::Mutex<Vec<Vec<av_state::Refund>>>,
+        entered: tokio::sync::Notify,
+        released: parking_lot::Mutex<bool>,
+        wake: parking_lot::Condvar,
+        fallback_used: std::sync::atomic::AtomicBool,
+    }
+
+    impl StateStore for BlockingRefundStore {
+        fn add(&self, key: &str, delta: u64) -> Result<u64, StateError> {
+            self.inner.add(key, delta)
+        }
+
+        fn get(&self, key: &str) -> Result<u64, StateError> {
+            self.inner.get(key)
+        }
+
+        fn try_spend(&self, key: &str, amount: u64, limit: u64) -> Result<bool, StateError> {
+            self.inner.try_spend(key, amount, limit)
+        }
+
+        fn try_spend_many(&self, spends: &[Spend]) -> Result<av_state::TrySpendOutcome, StateError> {
+            self.inner.try_spend_many(spends)
+        }
+
+        fn remove(&self, key: &str) {
+            self.inner.remove(key);
+        }
+
+        fn refund_many(&self, refunds: &[av_state::Refund]) {
+            let first = {
+                let mut batches = self.batches.lock();
+                batches.push(refunds.to_vec());
+                batches.len() == 1
+            };
+            if first {
+                self.entered.notify_one();
+                let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                let mut released = self.released.lock();
+                while !*released {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() || self.wake.wait_for(&mut released, remaining).timed_out() {
+                        // Keep the pre-fix test finite when this blocking call
+                        // incorrectly occupies the only Tokio runtime thread.
+                        self.fallback_used
+                            .store(true, std::sync::atomic::Ordering::Release);
+                        break;
+                    }
+                }
+            }
+            self.inner.refund_many(refunds);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mcp_refund_keeps_reactor_live_and_survives_caller_cancellation() {
+        let directory = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        // A refused connection proves that no upstream tool effect occurred.
+        drop(listener);
+        let mut config = crate::config::HarnessConfig::for_tests(
+            &format!("http://{address}"),
+            &directory.path().to_string_lossy(),
+            &directory.path().to_string_lossy(),
+        );
+        config.tool_upstream_url = Some(format!("http://{address}/mcp"));
+        config.budget.max_total_tool_calls = Some(1);
+        config.budget.max_tool_calls.insert("read".into(), 1);
+        config.principal_budget = Some(config.budget.clone());
+        config.allow_anonymous_principal_budget = true;
+        config.mcp_concurrency = 1;
+        let store = Arc::new(BlockingRefundStore {
+            inner: InMemoryStore::new(),
+            batches: parking_lot::Mutex::new(Vec::new()),
+            entered: tokio::sync::Notify::new(),
+            released: parking_lot::Mutex::new(false),
+            wake: parking_lot::Condvar::new(),
+            fallback_used: std::sync::atomic::AtomicBool::new(false),
+        });
+        let sandbox = Arc::new(
+            Sandbox::new(
+                SandboxConfig {
+                    budget: config.budget.clone(),
+                    ..SandboxConfig::default()
+                },
+                Vec::new(),
+            )
+            .unwrap(),
+        );
+        let state = AppState::new(
+            config,
+            store.clone(),
+            sandbox,
+            Arc::new(NullBus),
+            None,
+            Arc::new(Ed25519Signer::from_seed(&[11; 32])),
+        )
+        .unwrap();
+        let app = build_router(state.clone());
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/mcp")
+                .header("x-av-session", "refund-cancel")
+                .body(Body::from(
+                    r#"{"jsonrpc":"2.0","id":"refund","method":"tools/call","params":{"name":"read","arguments":{}}}"#,
+                ))
+                .unwrap()
+        };
+        let mut expected_keys = Vec::new();
+        for prefix in [
+            av_state::ActionBudget::session_prefix("refund-cancel"),
+            av_state::ActionBudget::principal_prefix("anonymous"),
+        ] {
+            expected_keys.push(format!("{prefix}total_calls"));
+            expected_keys.push(format!("{prefix}tool:read"));
+        }
+        let first = tokio::spawn(app.clone().oneshot(request()));
+        tokio::time::timeout(Duration::from_secs(5), store.entered.notified())
+            .await
+            .unwrap();
+        // This task must be scheduled while refund_many is still blocked.
+        // Abort the caller at that point; the detached owner must finish
+        // both ledger compensations before releasing its admission permit.
+        let progressed_while_refund_waited = !store.fallback_used.load(std::sync::atomic::Ordering::Acquire);
+        let charged_before_release: Vec<_> =
+            expected_keys.iter().map(|key| store.get(key).unwrap()).collect();
+        first.abort();
+        *store.released.lock() = true;
+        store.wake.notify_all();
+        let caller_cancelled = first.await.is_err_and(|error| error.is_cancelled());
+        tokio::time::timeout(Duration::from_secs(5), state.mcp_inflight.wait_drained())
+            .await
+            .unwrap();
+        let first_batches = store.batches.lock().clone();
+        let after_first: Vec<_> = expected_keys.iter().map(|key| store.get(key).unwrap()).collect();
+        let retry = app.oneshot(request()).await.unwrap();
+        let retry_status = retry.status();
+        tokio::time::timeout(Duration::from_secs(5), state.mcp_inflight.wait_drained())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), state.worker.wait_idle())
+            .await
+            .unwrap();
+        let batches = store.batches.lock().clone();
+        let session = state.sessions.get("refund-cancel").unwrap();
+
+        assert!(
+            progressed_while_refund_waited,
+            "synchronous budget compensation blocked the only Tokio thread until the fallback released it"
+        );
+        assert!(
+            charged_before_release.iter().all(|value| *value == 1),
+            "both session and principal ledgers must actually be debited before compensation"
+        );
+        assert!(
+            caller_cancelled,
+            "the outer caller must be cancelled while compensation is in progress"
+        );
+        assert_eq!(
+            first_batches.len(),
+            2,
+            "one session and one principal refund must complete despite cancellation"
+        );
+        assert!(
+            after_first.iter().all(|value| *value == 0),
+            "both ledgers must be refunded before retry"
+        );
+        assert_eq!(
+            retry_status,
+            StatusCode::BAD_GATEWAY,
+            "retry must attempt the unexecuted call, not return a pending claim or spent-budget refusal"
+        );
+        assert_eq!(
+            batches.len(),
+            4,
+            "each of two attempts refunds each ledger exactly once"
+        );
+        for key in expected_keys {
+            let amounts: Vec<_> = batches
+                .iter()
+                .flatten()
+                .filter(|refund| refund.key == key)
+                .map(|refund| refund.amount)
+                .collect();
+            assert_eq!(amounts, [1, 1], "unexpected compensation for {key}");
+            assert_eq!(store.get(&key).unwrap(), 0);
+        }
+        assert_eq!(state.mcp_admission.available_permits(), 1);
+        assert_eq!(session.active_streams_count(), 0);
+        assert_eq!(session.pending_jobs_count(), 0);
+    }
+
+    async fn assert_orphan_mcp_intent_refuses_startup(unaudited: bool) {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, provider) = test_state(directory.path()).await;
+        let session_id = "orphan-uncertain";
+        let mut headers = HeaderMap::new();
+        headers.insert("x-av-session", HeaderValue::from_static("orphan-uncertain"));
+        let body = br#"{"jsonrpc":"2.0","id":"orphan","method":"tools/call","params":{"name":"read","arguments":{}}}"#;
+        let mut execution =
+            ToolExecution::from_request(&state.config.atif_spool_dir, &headers, body, state.journal_key)
+                .unwrap();
+        execution
+            .bind_principal(&av_events::AgentIdentity {
+                version: "dev".to_owned(),
+                charter: "anonymous".into(),
+                instance_uid: "anonymous".to_owned(),
+                ttl_remaining_s: None,
+            })
+            .unwrap();
+        // This is a valid authenticated execution claim with no first journal
+        // record. MCP authorization queues its worker job without waiting, so
+        // claim() and the remote effect may precede that metadata commit.
+        execution.claim().await.unwrap();
+        if unaudited {
+            execution
+                .persist(&ToolOutcome {
+                    status: 200,
+                    body_hex: hex::encode(b"effect happened"),
+                    content_type: Some("text/plain".to_owned()),
+                })
+                .await
+                .unwrap();
+        }
+        let intent_before = std::fs::read(&execution.intent_path).unwrap();
+        assert!(state.sessions.get(session_id).is_none());
+        assert!(!std::fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().ends_with(".session.json")));
+        let recovered = tokio::time::timeout(
+            Duration::from_secs(5),
+            state
+                .finalizer
+                .recover_spooled_sessions(&state.sessions, &state.config.breaker),
+        )
+        .await
+        .unwrap();
+        let mut minted_after_new_traffic = false;
+        if recovered.is_ok() {
+            // Main would start accepting traffic after this successful return.
+            // A new chat with the same external ID must not manufacture a
+            // clean trajectory that omits the earlier uncertain tool effect.
+            let app = build_router(state.clone());
+            let chat = app.clone().oneshot(chat_request(session_id)).await.unwrap();
+            axum::body::to_bytes(chat.into_body(), 64 * 1024).await.unwrap();
+            let _ = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/sessions/orphan-uncertain/close")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let _ = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/sessions/orphan-uncertain/promote")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), state.worker.wait_idle())
+                .await
+                .unwrap();
+            minted_after_new_traffic = state
+                .sessions
+                .get(session_id)
+                .is_some_and(|session| session.receipt.lock().is_some());
+        }
+        provider.abort();
+        let _ = provider.await;
+        assert!(!minted_after_new_traffic,
+            "startup accepted an authenticated orphan intent, then new traffic minted a receipt omitting its uncertain effect");
+        let error = recovered.expect_err(
+            "an authenticated unresolved intent without recoverable session metadata must refuse startup",
+        );
+        assert!(error.to_string().contains("unresolved tool execution"));
+        assert_eq!(std::fs::read(&execution.intent_path).unwrap(), intent_before);
+        assert!(
+            state.sessions.get(session_id).is_none(),
+            "recovery must not invent session attribution"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_durable_orphan_pending_intent_refuses_startup_and_new_receipt() {
+        assert_orphan_mcp_intent_refuses_startup(false).await;
+    }
+
+    #[tokio::test]
+    async fn mcp_durable_orphan_unaudited_intent_refuses_startup_and_new_receipt() {
+        assert_orphan_mcp_intent_refuses_startup(true).await;
+    }
+
+    async fn assert_evicted_mcp_intent_refuses_receipt(workflow: &str) {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, provider) = test_state(directory.path()).await;
+        let session_id = "evicted-uncertain";
+        let identity = av_events::AgentIdentity {
+            version: "dev".to_owned(),
+            charter: "anonymous".into(),
+            instance_uid: "anonymous".to_owned(),
+            ttl_remaining_s: None,
+        };
+        let original = state.sessions.get_or_open(
+            session_id,
+            crate::session::Workflow::parse(workflow).unwrap(),
+            &identity,
+            &state.config.breaker,
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("x-av-session", HeaderValue::from_static("evicted-uncertain"));
+        let body = br#"{"jsonrpc":"2.0","id":"evicted","method":"tools/call","params":{"name":"read","arguments":{}}}"#;
+        let mut execution =
+            ToolExecution::from_request(&state.config.atif_spool_dir, &headers, body, state.journal_key)
+                .unwrap();
+        execution.bind_principal(&identity).unwrap();
+        execution.claim().await.unwrap();
+        let intent_before = std::fs::read(&execution.intent_path).unwrap();
+        original.mark_capture_failed();
+        // Deterministically model the existing retained-quarantine overflow
+        // eviction, without constructing thousands of unrelated sessions.
+        state.sessions.remove(session_id);
+        let app = build_router(state.clone());
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("x-av-session", session_id)
+            .header("x-av-workflow", workflow)
+            .body(Body::from(serde_json::to_vec(&chat_payload()).unwrap()))
+            .unwrap();
+        let chat = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(chat.status(), StatusCode::OK);
+        axum::body::to_bytes(chat.into_body(), 64 * 1024).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), state.worker.wait_idle())
+            .await
+            .unwrap();
+        let fresh = state.sessions.get(session_id).unwrap();
+        assert!(!Arc::ptr_eq(&original, &fresh));
+        assert!(
+            !fresh.capture_failed(),
+            "the durable guard cannot rely on the old RAM flag"
+        );
+        let close = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions/evicted-uncertain/close")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status();
+        let promote = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions/evicted-uncertain/promote")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status();
+        provider.abort();
+        let _ = provider.await;
+        assert!(
+            fresh.receipt.lock().is_none(),
+            "evicting the RAM quarantine must not permit a receipt omitting the durable uncertain effect"
+        );
+        assert_eq!(close, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!promote.is_success());
+        assert_eq!(std::fs::read(&execution.intent_path).unwrap(), intent_before);
+        assert!(
+            !fresh.capture_failed(),
+            "the durable refusal must preserve retryable audit completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_durable_evicted_signed_quarantine_cannot_mint_receipt() {
+        assert_evicted_mcp_intent_refuses_receipt("signed").await;
+    }
+
+    #[tokio::test]
+    async fn mcp_durable_evicted_unsigned_quarantine_cannot_promote() {
+        assert_evicted_mcp_intent_refuses_receipt("unsigned").await;
+    }
+
+    #[tokio::test]
+    async fn mcp_durable_closed_unsigned_artifact_checks_durable_intent_before_promotion() {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, provider) = test_state(directory.path()).await;
+        let app = build_router(state.clone());
+        let chat = app
+            .clone()
+            .oneshot(chat_request("closed-uncertain"))
+            .await
+            .unwrap();
+        axum::body::to_bytes(chat.into_body(), 64 * 1024).await.unwrap();
+        let close = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions/closed-uncertain/close")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(close.status(), StatusCode::OK);
+        let session = state.sessions.get("closed-uncertain").unwrap();
+        assert!(session.is_closed());
+        assert!(session.receipt.lock().is_none());
+        let mut headers = HeaderMap::new();
+        headers.insert("x-av-session", HeaderValue::from_static("closed-uncertain"));
+        let body = br#"{"jsonrpc":"2.0","id":"closed","method":"tools/call","params":{"name":"read","arguments":{}}}"#;
+        let mut execution =
+            ToolExecution::from_request(&state.config.atif_spool_dir, &headers, body, state.journal_key)
+                .unwrap();
+        execution.bind_principal(&session.current_identity()).unwrap();
+        execution.claim().await.unwrap();
+        let before = std::fs::read(&execution.intent_path).unwrap();
+        let promotion = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions/closed-uncertain/promote")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status();
+        provider.abort();
+        let _ = provider.await;
+        assert!(
+            session.receipt.lock().is_none(),
+            "a closed unsigned artifact must not bypass the durable uncertainty guard"
+        );
+        assert_eq!(promotion, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(std::fs::read(&execution.intent_path).unwrap(), before);
+        assert!(!session.capture_failed());
+    }
+
+    #[tokio::test]
+    async fn mcp_durable_missing_audit_marker_keeps_finalization_retryable() {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, provider) = test_state(directory.path()).await;
+        let app = build_router(state.clone());
+        let chat = app.clone().oneshot(chat_request("audit-retry")).await.unwrap();
+        axum::body::to_bytes(chat.into_body(), 64 * 1024).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), state.worker.wait_idle())
+            .await
+            .unwrap();
+        let session = state.sessions.get("audit-retry").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-av-session", HeaderValue::from_static("audit-retry"));
+        let body = br#"{"jsonrpc":"2.0","id":"audit","method":"tools/call","params":{"name":"read","arguments":{}}}"#;
+        let mut execution =
+            ToolExecution::from_request(&state.config.atif_spool_dir, &headers, body, state.journal_key)
+                .unwrap();
+        execution.bind_principal(&session.current_identity()).unwrap();
+        execution.claim().await.unwrap();
+        execution
+            .persist(&ToolOutcome {
+                status: 200,
+                body_hex: hex::encode(b"captured outcome"),
+                content_type: None,
+            })
+            .await
+            .unwrap();
+        let close_request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/sessions/audit-retry/close")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let first = app.clone().oneshot(close_request()).await.unwrap().status();
+        let refused_without_poison = !session.capture_failed()
+            && !session.is_closed()
+            && execution.intent_path.exists()
+            && execution.outcome_path.exists();
+        // Simulate completion of the existing replay/audit-marker retry path.
+        execution.mark_audited().await.unwrap();
+        let second = app.clone().oneshot(close_request()).await.unwrap().status();
+        let promotion = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions/audit-retry/promote")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status();
+        provider.abort();
+        let _ = provider.await;
+        assert_eq!(first, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            refused_without_poison,
+            "an unfinished audit must remain retryable with its evidence intact"
+        );
+        assert_eq!(second, StatusCode::OK);
+        assert_eq!(promotion, StatusCode::OK);
+        assert!(session.receipt.lock().is_some());
+        assert!(!session.capture_failed());
+    }
+
+    #[tokio::test]
+    async fn mcp_durable_lifecycle_scan_io_failure_preserves_evidence_and_can_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, provider) = test_state(directory.path()).await;
+        let app = build_router(state.clone());
+        let chat = app.clone().oneshot(chat_request("scan-error")).await.unwrap();
+        axum::body::to_bytes(chat.into_body(), 64 * 1024).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), state.worker.wait_idle())
+            .await
+            .unwrap();
+        let session = state.sessions.get("scan-error").unwrap();
+        let execution_dir = directory.path().join(crate::spool::TOOL_EXECUTIONS);
+        let evidence = b"operator recovery evidence at an invalid directory path";
+        std::fs::write(&execution_dir, evidence).unwrap();
+        let close_request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/sessions/scan-error/close")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let failed = app.clone().oneshot(close_request()).await.unwrap().status();
+        let retained = std::fs::read(&execution_dir).unwrap() == evidence;
+        let issued_on_failure = session.receipt.lock().is_some() || session.atif_path.lock().is_some();
+        let retryable = !session.capture_failed() && !session.is_closed();
+        std::fs::remove_file(&execution_dir).unwrap();
+        let repaired = app.oneshot(close_request()).await.unwrap().status();
+        provider.abort();
+        let _ = provider.await;
+        assert_eq!(failed, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(retained);
+        assert!(!issued_on_failure);
+        assert!(retryable);
+        assert_eq!(repaired, StatusCode::OK);
+    }
+
+    #[test]
+    fn mcp_durable_readonly_scan_preserves_evidence_on_cap_and_authentication_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        for name in ["one.evidence", "two.evidence", "three.evidence"] {
+            std::fs::write(directory.path().join(name), b"retained evidence").unwrap();
+        }
+        let capped = ensure_tool_executions_resolved_with_limit(directory.path(), "session", &[7; 32], 2);
+        assert!(capped.unwrap_err().contains("bounded scan limit"));
+        for name in ["one.evidence", "two.evidence", "three.evidence"] {
+            assert_eq!(
+                std::fs::read(directory.path().join(name)).unwrap(),
+                b"retained evidence"
+            );
+        }
+        let writing_claim = directory.path().join("partial.intent.json");
+        std::fs::write(&writing_claim, b"unfinished concurrent claim").unwrap();
+        let unauthenticated =
+            ensure_tool_executions_resolved_with_limit(directory.path(), "session", &[7; 32], 10);
+        assert!(unauthenticated.unwrap_err().contains("authenticated"));
+        assert_eq!(
+            std::fs::read(writing_claim).unwrap(),
+            b"unfinished concurrent claim"
+        );
+        assert_eq!(
+            std::fs::read_dir(directory.path()).unwrap().count(),
+            4,
+            "the lifecycle scan must never rename or delete another live request's incomplete files"
+        );
+    }
+
+    struct WithheldHeadersToolState {
+        effects: std::sync::atomic::AtomicUsize,
+        release: tokio::sync::Notify,
+        returned: std::sync::atomic::AtomicBool,
+        terminated: std::sync::atomic::AtomicBool,
+    }
+
+    struct WithheldHeadersGuard(Arc<WithheldHeadersToolState>);
+
+    impl Drop for WithheldHeadersGuard {
+        fn drop(&mut self) {
+            self.0
+                .terminated
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    async fn tool_effect_before_headers(State(state): State<Arc<WithheldHeadersToolState>>) -> Response {
+        let _guard = WithheldHeadersGuard(Arc::clone(&state));
+        // The request has crossed the remote execution boundary, but the
+        // gateway has received no HTTP status or response headers yet.
+        state.effects.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let _ = tokio::time::timeout(Duration::from_secs(6), state.release.notified()).await;
+        state.returned.store(true, std::sync::atomic::Ordering::Release);
+        Json(json!({"ok": true})).into_response()
+    }
+
+    async fn assert_mcp_header_deadline(workflow: &str, cancel_caller: bool, restart: bool) {
+        let directory = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let observed = Arc::new(WithheldHeadersToolState {
+            effects: std::sync::atomic::AtomicUsize::new(0),
+            release: tokio::sync::Notify::new(),
+            returned: std::sync::atomic::AtomicBool::new(false),
+            terminated: std::sync::atomic::AtomicBool::new(false),
+        });
+        let tool = Router::new()
+            .route("/mcp", post(tool_effect_before_headers))
+            .with_state(Arc::clone(&observed));
+        let server = tokio::spawn(async move { axum::serve(listener, tool).await.unwrap() });
+        let mut config = crate::config::HarnessConfig::for_tests(
+            &format!("http://{address}"),
+            &directory.path().to_string_lossy(),
+            &directory.path().to_string_lossy(),
+        );
+        config.default_workflow = workflow.to_owned();
+        config.tool_upstream_url = Some(format!("http://{address}/mcp"));
+        // A long read-idle timeout isolates the shorter MCP total deadline.
+        config.upstream_read_timeout_s = Some(10);
+        config.mcp_request_timeout_s = Some(1);
+        config.mcp_concurrency = 1;
+        config.budget.max_total_tool_calls = Some(2);
+        config.budget.max_tool_calls.insert("read".into(), 2);
+        config.principal_budget = Some(config.budget.clone());
+        config.allow_anonymous_principal_budget = true;
+        let make_state = |store: Arc<InMemoryStore>| {
+            AppState::new(
+                config.clone(),
+                store,
+                Arc::new(
+                    Sandbox::new(
+                        SandboxConfig {
+                            budget: config.budget.clone(),
+                            ..SandboxConfig::default()
+                        },
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                ),
+                Arc::new(NullBus),
+                None,
+                Arc::new(Ed25519Signer::from_seed(&[11; 32])),
+            )
+            .unwrap()
+        };
+        let store = Arc::new(InMemoryStore::new());
+        let state = make_state(Arc::clone(&store));
+        let app = build_router(state.clone());
+        let body = br#"{"jsonrpc":"2.0","id":"headers","method":"tools/call","params":{"name":"read","arguments":{}}}"#;
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/mcp")
+                .header("content-type", "application/json")
+                .header("x-av-session", "withheld-headers")
+                .body(Body::from(Bytes::from_static(body)))
+                .unwrap()
+        };
+        let first = tokio::spawn(app.clone().oneshot(request()));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while observed.effects.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        if cancel_caller {
+            first.abort();
+        }
+        tokio::time::timeout(Duration::from_secs(5), state.mcp_inflight.wait_drained())
+            .await
+            .unwrap();
+        let first_status = if cancel_caller {
+            assert!(first.await.unwrap_err().is_cancelled());
+            None
+        } else {
+            Some(first.await.unwrap().unwrap().status())
+        };
+        assert!(!observed.returned.load(std::sync::atomic::Ordering::Acquire));
+        let retry = app.clone().oneshot(request()).await.unwrap();
+        let retry_status = retry.status();
+        let retry_body = axum::body::to_bytes(retry.into_body(), 64 * 1024).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), state.worker.wait_idle())
+            .await
+            .unwrap();
+        let session = state.sessions.get("withheld-headers").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-av-session", HeaderValue::from_static("withheld-headers"));
+        let mut execution =
+            ToolExecution::from_request(&state.config.atif_spool_dir, &headers, body, state.journal_key)
+                .unwrap();
+        execution.bind_principal(&session.current_identity()).unwrap();
+        assert!(matches!(
+            execution.load().await.unwrap(),
+            ToolExecutionState::Pending
+        ));
+        assert!(execution.intent_path.exists());
+        assert!(!execution.outcome_path.exists());
+        assert!(!execution.audited_path.exists());
+        for prefix in [
+            av_state::ActionBudget::session_prefix("withheld-headers"),
+            av_state::ActionBudget::principal_prefix("anonymous"),
+        ] {
+            for suffix in ["total_calls", "tool:read"] {
+                assert_eq!(
+                    store.get(&format!("{prefix}{suffix}")).unwrap(),
+                    1,
+                    "uncertain execution must retain its charge without charging the refused retry"
+                );
+            }
+        }
+        assert_eq!(state.mcp_inflight.count(), 0);
+        assert_eq!(state.mcp_admission.available_permits(), 1);
+        assert_eq!(session.active_streams_count(), 0);
+        assert_eq!(session.pending_jobs_count(), 0);
+        drop(session);
+        drop(app);
+        // A fresh registry and store ensure recovery uses authenticated disk
+        // evidence, not the old in-memory session or a spent quota.
+        let lifecycle_state = if restart {
+            drop(state);
+            let recovered = make_state(Arc::new(InMemoryStore::new()));
+            recovered
+                .finalizer
+                .recover_spooled_sessions(&recovered.sessions, &recovered.config.breaker)
+                .await
+                .unwrap();
+            assert!(recovered
+                .sessions
+                .get("withheld-headers")
+                .unwrap()
+                .capture_failed());
+            recovered
+        } else {
+            state
+        };
+        let lifecycle_app = build_router(lifecycle_state.clone());
+        let replay = lifecycle_app.clone().oneshot(request()).await.unwrap();
+        let replay_status = replay.status();
+        let close = lifecycle_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions/withheld-headers/close")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let close_status = close.status();
+        let close_body = axum::body::to_bytes(close.into_body(), 64 * 1024).await.unwrap();
+        let promote = lifecycle_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions/withheld-headers/promote")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let promote_status = promote.status();
+        tokio::time::timeout(Duration::from_secs(5), lifecycle_state.worker.wait_idle())
+            .await
+            .unwrap();
+        let session = lifecycle_state.sessions.get("withheld-headers").unwrap();
+        let receipt_minted = session.receipt.lock().is_some();
+        let retained_intent_after_close = execution.intent_path.exists();
+        let retry_after_close = lifecycle_app.clone().oneshot(request()).await.unwrap().status();
+        drop(session);
+        drop(lifecycle_app);
+        drop(lifecycle_state);
+        let recovered_again = make_state(Arc::new(InMemoryStore::new()));
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            recovered_again
+                .finalizer
+                .recover_spooled_sessions(&recovered_again.sessions, &recovered_again.config.breaker),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let session = recovered_again.sessions.get("withheld-headers").unwrap();
+        let still_quarantined = session.capture_failed();
+        let recovered_receipt = session.receipt.lock().is_some();
+        let recovered_app = build_router(recovered_again.clone());
+        let retry_after_restart = recovered_app.clone().oneshot(request()).await.unwrap().status();
+        let close_after_restart = recovered_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions/withheld-headers/close")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let close_after_restart_status = close_after_restart.status();
+        let close_after_restart_body = axum::body::to_bytes(close_after_restart.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let promote_after_restart = recovered_app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions/withheld-headers/promote")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status();
+        tokio::time::timeout(Duration::from_secs(5), recovered_again.worker.wait_idle())
+            .await
+            .unwrap();
+        // Release the real remote handler and drain it even on the failing
+        // pre-fix lifecycle path before asserting the final outcomes.
+        observed.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !observed.terminated.load(std::sync::atomic::Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        server.abort();
+        let _ = server.await;
+
+        if let Some(status) = first_status {
+            assert_eq!(status, StatusCode::BAD_GATEWAY);
+        }
+        assert_eq!(retry_status, StatusCode::CONFLICT);
+        assert!(String::from_utf8_lossy(&retry_body).contains(TOOL_OUTCOME_UNCERTAIN));
+        assert_eq!(replay_status, StatusCode::CONFLICT);
+        assert_eq!(observed.effects.load(std::sync::atomic::Ordering::Acquire), 1);
+        assert!(
+            !receipt_minted,
+            "uncertain tool execution must never mint a complete receipt"
+        );
+        assert_eq!(promote_status, StatusCode::CONFLICT);
+        assert!(
+            retained_intent_after_close,
+            "closing a quarantine must retain the authenticated uncertain intent"
+        );
+        assert_eq!(retry_after_close, StatusCode::CONFLICT);
+        assert!(
+            still_quarantined,
+            "quarantine must survive closing and another restart"
+        );
+        assert!(
+            !recovered_receipt,
+            "restart must not turn an uncertain execution into a complete receipt"
+        );
+        assert_eq!(retry_after_restart, StatusCode::CONFLICT);
+        assert_eq!(promote_after_restart, StatusCode::CONFLICT);
+        if close_after_restart_status == StatusCode::OK {
+            assert_eq!(
+                serde_json::from_slice::<Value>(&close_after_restart_body).unwrap(),
+                json!({"kind": "already_closed"})
+            );
+        } else {
+            assert_eq!(close_after_restart_status, StatusCode::CONFLICT);
+        }
+        assert!(session.receipt.lock().is_none());
+        assert!(session.atif_path.lock().is_none());
+        // A recovered quarantine may already be closed. Its idempotent close
+        // can acknowledge that fact, but cannot return an ATIF or receipt.
+        if restart && close_status == StatusCode::OK {
+            assert_eq!(
+                serde_json::from_slice::<Value>(&close_body).unwrap(),
+                json!({"kind": "already_closed"})
+            );
+        } else {
+            assert_eq!(close_status, StatusCode::CONFLICT);
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_header_deadline_refuses_live_signed_receipt() {
+        assert_mcp_header_deadline("signed", false, false).await;
+    }
+
+    #[tokio::test]
+    async fn mcp_header_deadline_refuses_live_unsigned_promotion() {
+        assert_mcp_header_deadline("unsigned", false, false).await;
+    }
+
+    #[tokio::test]
+    async fn mcp_header_deadline_cancellation_keeps_live_intent() {
+        assert_mcp_header_deadline("unsigned", true, false).await;
+    }
+
+    #[tokio::test]
+    async fn mcp_header_deadline_restart_quarantines_signed_session() {
+        assert_mcp_header_deadline("signed", false, true).await;
+    }
+
+    #[tokio::test]
+    async fn mcp_header_deadline_cancel_then_restart_quarantines_unsigned_session() {
+        assert_mcp_header_deadline("unsigned", true, true).await;
+    }
+
+    #[tokio::test]
+    async fn mcp_outcome_persist_failure_refuses_receipt_and_keeps_charge() {
+        let directory = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let observed = Arc::new(WithheldHeadersToolState {
+            effects: std::sync::atomic::AtomicUsize::new(0),
+            release: tokio::sync::Notify::new(),
+            returned: std::sync::atomic::AtomicBool::new(false),
+            terminated: std::sync::atomic::AtomicBool::new(false),
+        });
+        let tool = Router::new()
+            .route("/mcp", post(tool_effect_before_headers))
+            .with_state(Arc::clone(&observed));
+        let server = tokio::spawn(async move { axum::serve(listener, tool).await.unwrap() });
+        let mut config = crate::config::HarnessConfig::for_tests(
+            &format!("http://{address}"),
+            &directory.path().to_string_lossy(),
+            &directory.path().to_string_lossy(),
+        );
+        config.default_workflow = "signed".to_owned();
+        config.tool_upstream_url = Some(format!("http://{address}/mcp"));
+        config.mcp_request_timeout_s = Some(5);
+        config.mcp_concurrency = 1;
+        config.budget.max_total_tool_calls = Some(2);
+        config.principal_budget = Some(config.budget.clone());
+        config.allow_anonymous_principal_budget = true;
+        let store = Arc::new(InMemoryStore::new());
+        let sandbox = Arc::new(
+            Sandbox::new(
+                SandboxConfig {
+                    budget: config.budget.clone(),
+                    ..SandboxConfig::default()
+                },
+                Vec::new(),
+            )
+            .unwrap(),
+        );
+        let state = AppState::new(
+            config,
+            store.clone(),
+            sandbox,
+            Arc::new(NullBus),
+            None,
+            Arc::new(Ed25519Signer::from_seed(&[11; 32])),
+        )
+        .unwrap();
+        let app = build_router(state.clone());
+        let body = br#"{"jsonrpc":"2.0","id":"persist","method":"tools/call","params":{"name":"read","arguments":{}}}"#;
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/mcp")
+                .header("x-av-session", "persist-failure")
+                .body(Body::from(Bytes::from_static(body)))
+                .unwrap()
+        };
+        let first = tokio::spawn(app.clone().oneshot(request()));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while observed.effects.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let session = state.sessions.get("persist-failure").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-av-session", HeaderValue::from_static("persist-failure"));
+        let mut execution =
+            ToolExecution::from_request(&state.config.atif_spool_dir, &headers, body, state.journal_key)
+                .unwrap();
+        execution.bind_principal(&session.current_identity()).unwrap();
+        // Atomic rename cannot overwrite a directory. Inject only after
+        // the remote effect, so this cannot be a pre-execution refusal.
+        std::fs::create_dir(&execution.outcome_path).unwrap();
+        observed.release.notify_one();
+        let first_status = tokio::time::timeout(Duration::from_secs(5), first)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .status();
+        tokio::time::timeout(Duration::from_secs(5), state.mcp_inflight.wait_drained())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), state.worker.wait_idle())
+            .await
+            .unwrap();
+        std::fs::remove_dir(&execution.outcome_path).unwrap();
+        assert!(matches!(
+            execution.load().await.unwrap(),
+            ToolExecutionState::Pending
+        ));
+        let capture_failed = session.capture_failed();
+        let retry_status = app.clone().oneshot(request()).await.unwrap().status();
+        for prefix in [
+            av_state::ActionBudget::session_prefix("persist-failure"),
+            av_state::ActionBudget::principal_prefix("anonymous"),
+        ] {
+            assert_eq!(store.get(&format!("{prefix}total_calls")).unwrap(), 1);
+        }
+        let close = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions/persist-failure/close")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status();
+        let promote = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions/persist-failure/promote")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status();
+        server.abort();
+        let _ = server.await;
+        assert_eq!(first_status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(retry_status, StatusCode::CONFLICT);
+        assert_eq!(observed.effects.load(std::sync::atomic::Ordering::Acquire), 1);
+        assert!(
+            capture_failed,
+            "an executed tool whose outcome cannot persist must poison complete evidence"
+        );
+        assert_eq!(close, StatusCode::CONFLICT);
+        assert_eq!(promote, StatusCode::CONFLICT);
+        assert!(session.receipt.lock().is_none());
+        assert!(execution.intent_path.exists());
+        assert!(!execution.outcome_path.exists());
+        assert!(!execution.audited_path.exists());
+        assert_eq!(state.mcp_inflight.count(), 0);
+        assert_eq!(state.mcp_admission.available_permits(), 1);
+        assert_eq!(session.active_streams_count(), 0);
+        assert_eq!(session.pending_jobs_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn mcp_quarantine_retains_only_unresolved_execution_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, provider) = test_state(directory.path()).await;
+        let app = build_router(state.clone());
+        let opened = app.clone().oneshot(chat_request("retention")).await.unwrap();
+        assert_eq!(opened.status(), StatusCode::OK);
+        axum::body::to_bytes(opened.into_body(), 64 * 1024).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), state.worker.wait_idle())
+            .await
+            .unwrap();
+        let session = state.sessions.get("retention").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-av-session", HeaderValue::from_static("retention"));
+        let outcome = ToolOutcome {
+            status: 502,
+            body_hex: hex::encode(b"partial failure evidence"),
+            content_type: Some("text/plain".to_owned()),
+        };
+        let mut executions = Vec::new();
+        for kind in [
+            "pending",
+            "unaudited",
+            "corrupt-outcome",
+            "corrupt-audit",
+            "completed",
+        ] {
+            let body = serde_json::to_vec(&json!({
+                "jsonrpc": "2.0", "id": kind, "method": "tools/call",
+                "params": {"name": "read", "arguments": {}}
+            }))
+            .unwrap();
+            let mut execution =
+                ToolExecution::from_request(&state.config.atif_spool_dir, &headers, &body, state.journal_key)
+                    .unwrap();
+            execution.bind_principal(&session.current_identity()).unwrap();
+            execution.claim().await.unwrap();
+            if kind != "pending" {
+                execution.persist(&outcome).await.unwrap();
+            }
+            if matches!(kind, "completed" | "corrupt-outcome" | "corrupt-audit") {
+                execution.mark_audited().await.unwrap();
+            }
+            if kind == "corrupt-outcome" {
+                std::fs::write(&execution.outcome_path, b"not an authenticated outcome").unwrap();
+            }
+            if kind == "corrupt-audit" {
+                std::fs::write(&execution.audited_path, b"not an authenticated audit marker").unwrap();
+            }
+            let intent_before = std::fs::read(&execution.intent_path).unwrap();
+            let outcome_before = std::fs::read(&execution.outcome_path).ok();
+            executions.push((kind, execution, intent_before, outcome_before));
+        }
+        session.mark_capture_failed();
+        let refused = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions/retention/close")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status();
+        // One quarantined session must not stop another valid session from
+        // capturing, closing and issuing its own complete receipt.
+        let other = app.clone().oneshot(chat_request("other-complete")).await.unwrap();
+        let other_status = other.status();
+        axum::body::to_bytes(other.into_body(), 64 * 1024).await.unwrap();
+        let other_close = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions/other-complete/close")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status();
+        let other_promote = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions/other-complete/promote")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status();
+        tokio::time::timeout(Duration::from_secs(5), state.worker.wait_idle())
+            .await
+            .unwrap();
+        provider.abort();
+        let _ = provider.await;
+        assert_eq!(refused, StatusCode::CONFLICT);
+        assert!(session.receipt.lock().is_none());
+        assert_eq!(other_status, StatusCode::OK);
+        assert_eq!(other_close, StatusCode::OK);
+        assert_eq!(other_promote, StatusCode::OK);
+        for (kind, execution, intent_before, outcome_before) in executions {
+            if kind == "completed" {
+                assert!(!execution.intent_path.exists());
+                assert!(!execution.outcome_path.exists());
+                assert!(!execution.audited_path.exists());
+                let archived_intent = std::fs::read_dir(execution.intent_path.parent().unwrap())
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .find(|entry| {
+                        entry
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with(&format!("{}.intent.json.capturefailed-", execution.key))
+                    })
+                    .expect("completed evidence must be archived, not deleted");
+                assert_eq!(std::fs::read(archived_intent.path()).unwrap(), intent_before);
+            } else {
+                assert_eq!(
+                    std::fs::read(&execution.intent_path).unwrap(),
+                    intent_before,
+                    "{kind} must retain its authenticated primary intent"
+                );
+                assert_eq!(
+                    std::fs::read(&execution.outcome_path).ok(),
+                    outcome_before,
+                    "{kind} must preserve all partial outcome evidence"
+                );
+            }
+        }
+    }
+
+    async fn slow_active_chat() -> Response {
+        let frames = futures::stream::unfold(0u8, |index| async move {
+            if index == 7 {
+                return None;
+            }
+            if index != 0 {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            let frame = if index == 6 {
+                format!(
+                    "data: {}\n\ndata: [DONE]\n\n",
+                    json!({
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": 2, "completion_tokens": 6}
+                    })
+                )
+            } else {
+                // Each frame exceeds the capture threshold and arrives well
+                // before the one-second read-idle deadline.
+                format!(
+                    "data: {}\n\n",
+                    json!({
+                        "choices": [{"index": 0, "delta": {"content": format!("chat exceeds MCP {}", "x".repeat(280))}, "finish_reason": null}]
+                    })
+                )
+            };
+            Some((Ok::<_, std::convert::Infallible>(Bytes::from(frame)), index + 1))
+        });
+        let mut response = Response::new(Body::from_stream(frames));
+        response.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        response
+    }
+
+    #[tokio::test]
+    async fn mcp_total_deadline_does_not_limit_active_chat_streams() {
+        let directory = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let provider = Router::new().route("/v1/chat/completions", post(slow_active_chat));
+        let server = tokio::spawn(async move { axum::serve(listener, provider).await.unwrap() });
+        let mut config = crate::config::HarnessConfig::for_tests(
+            &format!("http://{address}"),
+            &directory.path().to_string_lossy(),
+            &directory.path().to_string_lossy(),
+        );
+        config.upstream_read_timeout_s = Some(1);
+        config.mcp_request_timeout_s = Some(1);
+        let state = AppState::new(
+            config,
+            Arc::new(InMemoryStore::new()),
+            Arc::new(Sandbox::new(SandboxConfig::default(), Vec::new()).unwrap()),
+            Arc::new(NullBus),
+            None,
+            Arc::new(Ed25519Signer::from_seed(&[11; 32])),
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        let response = build_router(state.clone())
+            .oneshot(chat_request_with_payload("chat-idle-boundary", chat_payload()))
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = tokio::time::timeout(
+            Duration::from_secs(5),
+            axum::body::to_bytes(response.into_body(), 64 * 1024),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let elapsed = started.elapsed();
+        tokio::time::timeout(Duration::from_secs(5), state.worker.wait_idle())
+            .await
+            .unwrap();
+        server.abort();
+        let _ = server.await;
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert!(elapsed > Duration::from_secs(1));
+        assert_eq!(text.matches("chat exceeds MCP").count(), 6);
+        assert!(text.contains("\"finish_reason\":\"stop\""));
+        assert!(text.contains("data: [DONE]"));
+        assert!(!text.contains("\"error\""));
+        let session = state.sessions.get("chat-idle-boundary").unwrap();
+        assert!(!session.capture_failed());
+        assert_eq!(session.active_streams_count(), 0);
+        assert_eq!(session.pending_jobs_count(), 0);
+    }
+
+    struct SlowDripToolState {
+        calls: std::sync::atomic::AtomicUsize,
+        chunks: std::sync::atomic::AtomicUsize,
+        dropped: std::sync::atomic::AtomicBool,
+    }
+
+    struct SlowDripBodyGuard(Arc<SlowDripToolState>);
+
+    impl Drop for SlowDripBodyGuard {
+        fn drop(&mut self) {
+            self.0.dropped.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    async fn slow_drip_tool(State(state): State<Arc<SlowDripToolState>>) -> Response {
+        state.calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        // A finite three-second response keeps the one-second idle timer
+        // alive. Keeping this finite also makes the pre-fix regression safe
+        // to run: detached MCP work can drain before its spool is deleted.
+        let chunks = futures::stream::unfold((0u8, SlowDripBodyGuard(state)), |(index, guard)| async move {
+            if index == 16 {
+                return None;
+            }
+            if index != 0 {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            let bytes = match index {
+                0 => Bytes::from_static(b"{\"ok\":"),
+                15 => Bytes::from_static(b"true}"),
+                _ => Bytes::from_static(b" "),
+            };
+            guard.0.chunks.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            Some((Ok::<_, std::convert::Infallible>(bytes), (index + 1, guard)))
+        });
+        let mut response = Response::new(Body::from_stream(chunks));
+        response.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        response
+    }
+
+    async fn assert_mcp_slow_drip_deadline(cancel_caller: bool) {
+        let directory = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let observed = Arc::new(SlowDripToolState {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            chunks: std::sync::atomic::AtomicUsize::new(0),
+            dropped: std::sync::atomic::AtomicBool::new(false),
+        });
+        let tool = Router::new()
+            .route("/mcp", post(slow_drip_tool))
+            .with_state(Arc::clone(&observed));
+        let server = tokio::spawn(async move { axum::serve(listener, tool).await.unwrap() });
+        let mut config = crate::config::HarnessConfig::for_tests(
+            &format!("http://{address}"),
+            &directory.path().to_string_lossy(),
+            &directory.path().to_string_lossy(),
+        );
+        config.tool_upstream_url = Some(format!("http://{address}/mcp"));
+        config.upstream_read_timeout_s = Some(1);
+        config.mcp_request_timeout_s = Some(1);
+        config.mcp_concurrency = 1;
+        let state = AppState::new(
+            config,
+            Arc::new(InMemoryStore::new()),
+            Arc::new(Sandbox::new(SandboxConfig::default(), Vec::new()).unwrap()),
+            Arc::new(NullBus),
+            None,
+            Arc::new(Ed25519Signer::from_seed(&[11; 32])),
+        )
+        .unwrap();
+        let app = build_router(state.clone());
+        let body = br#"{"jsonrpc":"2.0","id":"slow-drip","method":"tools/call","params":{"name":"read","arguments":{}}}"#;
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/mcp")
+                .header("content-type", "application/json")
+                .header("x-av-session", "slow-drip")
+                .body(Body::from(Bytes::from_static(body)))
+                .unwrap()
+        };
+        let first = tokio::spawn(app.clone().oneshot(request()));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while observed.chunks.load(std::sync::atomic::Ordering::Acquire) < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        if cancel_caller {
+            first.abort();
+        }
+        // The intentionally detached audit owner must finish even when the
+        // caller disappears. Do not delete its spool before it has drained.
+        tokio::time::timeout(Duration::from_secs(5), state.mcp_inflight.wait_drained())
+            .await
+            .unwrap();
+        let first_status = if cancel_caller {
+            assert!(first.await.unwrap_err().is_cancelled());
+            None
+        } else {
+            Some(first.await.unwrap().unwrap().status())
+        };
+        let retry = app.oneshot(request()).await.unwrap();
+        let retry_status = retry.status();
+        let retry_body = axum::body::to_bytes(retry.into_body(), 64 * 1024).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), state.worker.wait_idle())
+            .await
+            .unwrap();
+        let session = state.sessions.get("slow-drip").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-av-session", HeaderValue::from_static("slow-drip"));
+        let mut execution =
+            ToolExecution::from_request(&state.config.atif_spool_dir, &headers, body, state.journal_key)
+                .unwrap();
+        execution.bind_principal(&session.current_identity()).unwrap();
+        let audited = matches!(execution.load().await.unwrap(), ToolExecutionState::Completed(_));
+        let upstream_dropped = tokio::time::timeout(Duration::from_secs(2), async {
+            while !observed.dropped.load(std::sync::atomic::Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok();
+        server.abort();
+        let _ = server.await;
+
+        assert_eq!(
+            retry_status,
+            StatusCode::BAD_GATEWAY,
+            "the total deadline must terminate a response that never exceeds the idle timeout"
+        );
+        if let Some(status) = first_status {
+            assert_eq!(status, retry_status, "the retry must replay the original failure");
+        }
+        assert!(String::from_utf8_lossy(&retry_body).contains("response could not be read"));
+        assert_eq!(
+            observed.calls.load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "retry must not repeat tool effects"
+        );
+        assert!(
+            observed.chunks.load(std::sync::atomic::Ordering::Acquire) < 16,
+            "the upstream response must be dropped before its finite completion"
+        );
+        assert!(upstream_dropped, "timing out must release the upstream body");
+        assert!(audited, "the timeout outcome must carry its durable audit marker");
+        assert_eq!(state.mcp_inflight.count(), 0);
+        assert_eq!(state.mcp_admission.available_permits(), 1);
+        assert_eq!(session.active_streams_count(), 0);
+        assert_eq!(session.pending_jobs_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn mcp_slow_drip_total_deadline_records_failure_once() {
+        assert_mcp_slow_drip_deadline(false).await;
+    }
+
+    #[tokio::test]
+    async fn mcp_slow_drip_total_deadline_survives_caller_cancellation() {
+        assert_mcp_slow_drip_deadline(true).await;
     }
 
     #[tokio::test]

@@ -34,6 +34,8 @@ fn hmac_claims() -> NhiClaims {
         nbf: None,
         exp: iat + 300,
         jti: av_core::new_event_uid(),
+        azp: None,
+        act: None,
         instance_uid: "inst-1".into(),
         charter: "support".into(),
         version: "1.2.3".into(),

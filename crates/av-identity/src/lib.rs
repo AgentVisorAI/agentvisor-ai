@@ -12,7 +12,17 @@
 //! scope escalation at any link, truncated & tampered tokens, unknown `kid`.
 
 pub mod claims;
+pub mod exchange;
+pub mod revocation;
 pub mod validator;
 
-pub use claims::{NhiClaims, MAX_TTL_SECS};
+pub use claims::{ActorClaim, Audience, NhiClaims, MAX_TTL_SECS};
+pub use exchange::{
+    build_exchanged_claims, check_exchanged_revocation, scope_intersection, verify_exchanged_token,
+    ExchangeError, ExchangeParams, ExchangedClaims, ExchangedValidation, TokenExchangeRequest,
+    TokenExchangeResponse, TOKEN_EXCHANGE_GRANT_TYPE,
+};
+pub use revocation::{
+    InMemoryRevocationStore, RevocationHealth, RevocationIdentity, RevocationStore, RevokeOutcome, RevokedBy,
+};
 pub use validator::{IdentityError, IdentityValidator, KeyMaterial, ValidatedIdentity};

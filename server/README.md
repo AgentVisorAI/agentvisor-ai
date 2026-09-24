@@ -2,9 +2,11 @@
 
 Multi-tenant control plane for the AgentVisor console. Users sign up here,
 register `agentvisord` deployments, and view sessions/receipts posted by
-those daemons. Provider keys, prompts, and completions do **not** flow
-through this server; only session metadata, event summaries, and Ed25519
-signed receipts do.
+those daemons. Live LLM and tool requests run through the customer's daemon.
+Console sync uploads session metadata, captured event messages and observations,
+and Ed25519 signed receipts. Event content can include prompts, completions, and
+tool payloads after the daemon's configured redaction; this API stores those
+uploaded fields and restricts their visibility by role.
 
 **For deployment (Fly.io, Cloud Run, Neon, self-host) see [DEPLOY.md](./DEPLOY.md).**
 
@@ -17,8 +19,8 @@ signed receipts do.
 │  by customer)  │◀───────│  Postgres (any host)  │◀───────│              │
 └────────────────┘        └───────────────────────┘        └──────────────┘
        │                          ▲                                 │
-       └── LLM + tool traffic ─────┴── auth (JWT cookie) ────────────┘
-           (stays on customer infra — never enters here)
+       └── LLM + tool traffic stays local; captured evidence is uploaded
+                                  └── auth (JWT cookie) ────────────┘
 ```
 
 ## Requirements
@@ -57,6 +59,42 @@ exact edits before driving the SPA in headless Chromium):
 - Serve the SPA **under `/app/` with `logo.png` one level up** (the
   production topology). The console references `../logo.png` for the
   brand mark and favicon; a flat copy of `docs/app` alone 404s both.
+
+## Production container
+
+Build the image with `docker build -t agentvisor-api server/` from the repository
+root. The pinned runtime uses Node 22 on Debian 13 Distroless, runs as UID 65532,
+and contains no shell or package manager. The build generates the Prisma client
+on Debian 13 and retains the Prisma CLI and migrations as production dependencies.
+
+The image starts `container-entrypoint.mjs` directly with Node. It runs the
+packaged `prisma migrate deploy` first and starts the API only after migrations
+succeed. A migration failure preserves its nonzero exit status. SIGTERM and
+SIGINT reach the active child and its process group, including Prisma's schema
+engine. Deployment platforms should use the image's entrypoint and command.
+
+Supply the production settings described in [DEPLOY.md](./DEPLOY.md), including
+the database, JWT secret, allowed origin, public URLs, and mailer. The runtime
+supports a read-only root filesystem with a writable temporary directory:
+
+```sh
+docker run --read-only --tmpfs /tmp:uid=65532,gid=65532,mode=0700 \
+  --cap-drop ALL --security-opt no-new-privileges \
+  --env-file /secure/path/agentvisor-api.env -p 8080:8080 agentvisor-api
+```
+
+The container healthcheck requests `/readyz`, which checks database availability.
+Use `docker logs` for diagnostics. For a one-off Prisma command, run the packaged
+CLI with Node, for example `docker exec <container> node
+/app/node_modules/prisma/build/index.js migrate status`. Do not rely on `sh`,
+`npm`, or `npx` inside the runtime.
+
+Run `node --test server/ci/container-entrypoint.test.mjs` to verify process exit
+and signal handling. `python3 scripts/container-smoke.py --console-image
+agentvisor-api` tests the actual image with its own temporary PostgreSQL container,
+including migration refusal, native engine loading, API calls, database recovery,
+and clean shutdown. Add `--agentvisord /path/to/agentvisord --avctl /path/to/avctl`
+to include the daemon crash and console synchronization drill.
 
 ## API surface
 
@@ -121,7 +159,7 @@ Auth: `Authorization: Bearer <ingest_token>` + `X-AV-Deployment: <deployment_id>
 | Method | Path | Notes |
 |---|---|---|
 | `POST` | `/ingest/pubkey` | `{ publicKeyHex }` — anchored on first set; rotation refused |
-| `POST` | `/ingest/sessions` | Upsert a session (idempotent on `externalId`) |
+| `POST` | `/ingest/sessions` | Upsert a session (idempotent on `externalId`); `quarantined_crash_evidence` permanently marks incomplete recovered evidence |
 | `POST` | `/ingest/events` | Array of events, deduped on `(session, seq)` |
 | `POST` | `/ingest/receipts` | Signed receipt at seal (key-id must match the anchor) |
 
@@ -129,8 +167,8 @@ Auth: `Authorization: Bearer <ingest_token>` + `X-AV-Deployment: <deployment_id>
 
 | Method | Path | Notes |
 |---|---|---|
-| `GET`  | `/overview` | Fleet stats + time-series + recent sessions |
-| `GET`  | `/sessions` (+ `/sessions/:id`) | Cursor-paginated list; detail with cursor-paginated events + receipt |
+| `GET`  | `/overview` | Session totals and time-series for the selected UTC bucket window, plus fleet counts and recent sessions |
+| `GET`  | `/sessions` (+ `/sessions/:id`) | Cursor-paginated list; detail with cursor-paginated events + receipt; `eventCount` remains the total across all pages |
 | `GET`  | `/receipts/:sessionId` | Raw receipt + deployment public key for offline verify |
 | `GET`  | `/audit` (+ `/audit.csv`) | Cursor-paginated audit trail; CSV streams up to 10k rows |
 | `GET`  | `/stream` | SSE: session/event/receipt updates, multi-instance via PG LISTEN/NOTIFY |
@@ -140,15 +178,19 @@ Auth: `Authorization: Bearer <ingest_token>` + `X-AV-Deployment: <deployment_id>
 Four layers, all runnable locally and (except the browser drills'
 prod target) wired into CI:
 
-- **`ci/e2e.mjs`** — 93-check API contract suite. Boot the server,
+- **`ci/e2e.mjs`** — API contract suite. Boot the server,
   then `API_BASE=http://127.0.0.1:<port> node ci/e2e.mjs`. Runs in the
   Console + API workflow.
-- **`scripts/run-drill-battery.sh`** — the 14 DB-backed attack drills
+- **`scripts/run-drill-battery.sh`** — the 15 DB-backed attack drills
   (apikey ×2, invite ×2, ip-allowlist, retention, saml ×2, webauthn ×2,
-  webhook ×3, oidc). Boots a fresh server per drill on uncontested
-  604xx ports. Needs a Postgres the drills can `docker exec psql` into:
+  webhook ×3, oidc, crash-evidence quarantine). Boots a fresh server per drill
+  on 204xx and 207xx ports. Needs a Postgres the drills can `docker exec psql` into:
   `PG_CONTAINER=<container> PG_USER=av PG_DB=avdb bash scripts/run-drill-battery.sh [drill…]`.
   Runs in CI on every `server/**` change (api-drills workflow).
+  Set `SPA_ORIGIN` when running `scripts/quarantine-drill.mjs` directly
+  to also check the live browser's incomplete-evidence warning and disabled
+  receipt actions. Recovered events remain appendable and idempotent;
+  quarantined sessions cannot return to live status or receive a receipt.
 - **Browser drills** (`scripts/a11y-audit.mjs`, `interactive-drill.mjs`,
   `mobile-smoke.mjs`, `engine-matrix.mjs`, …) — Playwright suites the
   console-smoke workflow runs against the deployed console after every
@@ -160,6 +202,11 @@ prod target) wired into CI:
   idempotency-keyed by (session, JSON-RPC id, tool, args) — reuse an id
   and you get the cached outcome, not a re-execution; use unique ids
   unless you are testing replay.
+  With current binaries already built, run the complete console contract with
+  `API_BASE=http://127.0.0.1:8985 AGENTVISORD=/absolute/path/agentvisord AVCTL=/absolute/path/avctl node scripts/daemon-console-drill.mjs`.
+  This runner creates its own test workspace and credentials, runs the real
+  SIGKILL/restart/sync drill, and deletes only that workspace afterward.
+  Missing binaries fail the run instead of skipping synchronization.
 
 ## Security posture
 
@@ -172,20 +219,29 @@ In short:
 - Every read query is org-scoped through the session claim — no route
   accepts a user-supplied org id.
 - Ingest tokens are argon2-hashed at rest; plaintext returned only once.
-- Global rate limit: 300 rpm per client IP (not per user — the global
+- Global rate limit: 300 rpm per client IP on each API instance (not per user — the global
   bucket keys on `req.ip` per R93 F1 / R100 F1 in `src/index.ts`;
   a cookie/sub-derived key would let an attacker plant a fresh random
-  cookie per request and bypass the cap). Auth-tree endpoints
-  (`/login`, `/signup`, `/reset-*`, `/webauthn/*`) apply tighter
-  per-IP buckets on top.
+  cookie per request and bypass the cap). Buckets are held in process memory:
+  restarting an instance resets them, and requests spread across multiple
+  instances receive a separate allowance on each. Enforce a fleet-wide limit
+  at the ingress if the deployment requires one. Auth-tree endpoints
+  (`/login`, `/signup`, `/reset-*`, `/webauthn/*`) use tighter per-IP route
+  buckets that replace the global bucket. Cookie session listing and detail
+  reads have limits of 30 and 60 requests/minute respectively; authenticated
+  API-key clients are exempt from those two route limits. Ingest is exempt
+  from the global limit.
 - CORS locked to `ALLOWED_ORIGINS`.
 - `helmet` sets HSTS 2y (preload), strict CSP, X-Frame-Options: deny.
-- Container runs as non-root under `dumb-init` PID 1.
+- The container runs as UID 65532. Its Node entrypoint forwards shutdown signals
+  to the API or migration process group and preserves the child's exit status.
 - Request body cap: 4 MiB.
 
-## What is **not** stored
+## Evidence storage
 
-- Provider API keys (they stay on the customer's box).
-- Prompts, completions, or tool arguments (only summarized event bodies).
-- Anything the daemon doesn't post to us. The customer's daemon runs on
-  their own infra and decides what to send.
+Uploaded event content can contain prompts, completions, and tool arguments
+after the daemon's configured redaction. The console stores that captured
+content along with session metadata and signed receipts, and restricts access
+by organization and role. The customer's daemon runs on their infrastructure
+and controls which evidence it uploads. Configured provider API keys remain
+with the daemon and are not part of console synchronization.

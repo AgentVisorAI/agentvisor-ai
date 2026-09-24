@@ -12,6 +12,8 @@
 //! closed), never dropped mid-flight; client aborts still finalize sessions;
 //! worker panics are supervised and counted.
 
+pub mod authz;
+pub mod backend;
 pub mod config;
 pub mod dashboard;
 pub mod http_serve;
@@ -21,10 +23,15 @@ pub mod pipeline;
 pub(crate) mod provider;
 pub mod reconciler;
 pub(crate) mod recovery;
+pub mod revocation;
 pub mod routes;
 pub mod session;
 pub(crate) mod spool;
+pub(crate) mod token_routes;
 pub mod worker;
+
+#[cfg(feature = "service-binding")]
+pub mod service_binding;
 
 pub use config::HarnessConfig;
 pub use journal::key_from_signer as control_key_from_signer;

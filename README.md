@@ -42,6 +42,8 @@ client = OpenAI(
   [advisory form](https://github.com/AgentVisorAI/agentvisor-ai/security/advisories/new).
 - **[Architecture](ARCHITECTURE.md)** · **[Benchmarks](BENCHMARKS.md)** ·
   **[Conformance status](CONFORMANCE-STATUS.md)** — going deeper.
+- **[Current validation record](docs/PRODUCTION-VALIDATION.md)** — tested
+  behavior, reproducible checks, and remaining deployment-specific validation.
 - **[Reference docs](docs/reference/)** — configuration, operations,
   OpenAI compatibility, limits, and offline receipt verification.
 - **[API docs](https://agentvisorai.me/api/)** — Rust crate
@@ -202,6 +204,14 @@ uncomment `ignore_client_authorization` — before sending traffic.
 - `POST /v1/mcp` and `POST /mcp`: JSON-RPC tool interception and optional forwarding.
 - `POST /v1/sessions/{id}/close`: finalize a signed receipt or unsigned ATIF file.
 - `POST /v1/sessions/{id}/promote`: issue a retroactive receipt for an ATIF trajectory.
+- `POST /v1/token`: RFC 8693 token exchange for a backend-scoped token
+  (opt-in via `token_exchange_enabled`).
+- `POST /v1/revoke`: RFC 7009 revocation of an NHI or exchanged token (available when an
+  identity validator is configured).
+- `POST /v1/introspect`: authenticated backend checks for token expiry and revocation.
+- `POST /admin/v1/revocations`: operator revocation by token id or agent instance (opt-in).
+- `GET /.well-known/jwks.json`: public key that verifies exchanged tokens
+  and intent tokens.
 - `GET /health`: liveness.
 - `GET /metrics`: Prometheus text exposition.
 - `GET /dashboard`: read-only operator dashboard (HTML). Disable via
@@ -242,35 +252,48 @@ When identity enforcement is enabled, pass `--bearer-token-file /path/to/token` 
 
 ## Container deployment
 
-Minimal (one container, embedded bridge, in-memory state):
+Local demonstration (one container, embedded bridge, in-memory state):
 
 ```bash
 AV_UPSTREAM_URL=https://api.openai.com AV_UPSTREAM_API_KEY=sk-... \
   docker compose -f docker/docker-compose.minimal.yml up --build
 ```
 
+The minimal configuration accepts anonymous callers and loses revocations on restart. Use authenticated identity and persistent Redis for production, including single-instance deployments.
+
 Full reference stack (Redpanda, AOF-backed Redis, Qdrant, Vector/OTLP):
 
 ```bash
-docker secret create identity_hmac /path/to/identity-hmac-secret
-docker secret create signing_seed /path/to/signing.seed
+install -m 0600 /path/to/identity-hmac-secret docker/secrets/identity_hmac
+install -m 0600 /path/to/signing.seed docker/secrets/signing.seed
 docker compose -f docker/docker-compose.yml up --build
 ```
 
-Both external secrets are required by the production profile — the compose file declares `identity_hmac` and `signing_seed` as external, and `docker compose up` refuses to start if either is missing. Bridge data, cold exports, Redis state, and Qdrant data use persistent volumes. The embedded Bridge remains available for single-binary and air-gapped deployments. Container healthchecks use `avctl health` (real liveness, not config parsing).
+Both source files are required. The committed files contain deliberately invalid placeholders. For a new deployment, generate an identity secret with `openssl rand -hex 32` and a signing seed with `avctl keygen --output /path/to/signing.seed`. Preserve and back up the signing seed across deployments so existing receipts retain their trust anchor. Plain Docker Compose preserves the host ownership of file secrets, so the `install-secrets` service checks their owner-only permissions and copies them into a dedicated volume owned by UID 65532. The daemon mounts those copies read-only. Bridge data, cold exports, Redis state, and Qdrant data use separate persistent volumes. The embedded Bridge remains available for single-binary and air-gapped deployments. Container healthchecks use `avctl health` against `/readyz`.
 
-The production image checksum-pins `sentence-transformers/all-MiniLM-L6-v2` at revision `1110a243fdf4706b3f48f1d95db1a4f5529b4d41`, validates the model/tokenizer hashes during build, and selects the ONNX backend. Air-gapped builds can mirror those immutable URLs or mount equivalent verified artifacts and update the configured paths.
+The full stack disables the unauthenticated operator dashboard. Identity validation protects proxy operations, but it does not protect dashboard routes, and other containers can reach the listener directly without using the host's loopback port mapping. Keep the dashboard disabled unless a separate access control protects every path to those routes. The minimal configuration remains a local development and evaluation example.
+
+After building the image, run `python3 scripts/container-smoke.py --image agentvisor-ai:local` to check startup, a real streaming request, signed receipt verification, and restart persistence using isolated local containers.
+
+Signed receipts remain in the durable spool and event bridge after restart. Session control endpoints, including `/promote`, are not a historical receipt lookup API: a closed signed session can return `404` after eviction or restart. Retained unsigned trajectories can still be recovered for later promotion.
+
+The broker pins target new installations. Existing Redpanda 25.2 data requires sequential upgrades through 25.3 and 26.1 before 26.2; follow the [Redpanda upgrade procedure](https://docs.redpanda.com/streaming/current/upgrade/rolling-upgrade/) before starting the updated image against an existing volume. Review the [NATS upgrade guides](https://docs.nats.io/release-notes) before reusing older JetStream data. The isolated contract tests use fresh broker data and do not certify an existing deployment's migration.
+
+Production cold storage must use a maintained S3-compatible service. The bundled MinIO container is a local test fixture behind the `local-test` profile because the [community repository and legacy binaries are no longer maintained](https://github.com/minio/minio). CI starts that service explicitly for its S3 contract tests; it is excluded from the default stack.
+
+The production image checksum-pins `sentence-transformers/all-MiniLM-L6-v2` at revision `1110a243fdf4706b3f48f1d95db1a4f5529b4d41` and validates the model/tokenizer hashes during build. The full reference stack selects the ONNX backend; the standalone container uses the hash embedder. Air-gapped builds can mirror those immutable URLs or mount equivalent verified artifacts and update the configured paths.
 
 ## Kubernetes and systemd
 
-- `deploy/kubernetes/agentvisor-ai.yaml`: single-replica starter (ConfigMap + PVC + probes + Secret-mounted key). Scale horizontally by switching to kafka/nats + redis backends.
+- [Kubernetes template](deploy/kubernetes/README.md): authenticated single-replica deployment with a ConfigMap, PVC, probes, and private signing and identity credentials. Configure the issuer and Secrets before applying it. Horizontal scaling requires shared bridge, state, and revocation backends.
 - `deploy/systemd/agentvisor-ai.service`: hardened unit with `EnvironmentFile` for the key; install steps in the file header.
 
 ### Running multiple instances
 
-A single AgentVisor AI process is the default and the tested-at-scale
-configuration (10k concurrent streams, p95 0.865 ms — see
-`BENCHMARKS.md`). Running two or more replicas is safe **only** when
+A single AgentVisor AI process is the default. [Benchmarks](BENCHMARKS.md)
+records the tested concurrency, measurement boundaries, and fixture settings.
+Production revocation persistence requires durable Redis even for one replica;
+the in-memory default is suitable for local evaluation. Running two or more replicas is safe **only** when
 every backend below is external — the embedded defaults are strictly
 single-instance:
 

@@ -118,6 +118,9 @@ pub struct AppState {
     pub worker: WorkerHandle,
     /// Optional NHI validator. Required in production identity mode.
     pub identity: Option<Arc<IdentityValidator>>,
+    /// Separate revocation namespace for tokens signed by this gateway.
+    pub exchanged_revocations: Arc<dyn av_identity::RevocationStore>,
+    pub(crate) revocation_audit_window: Arc<parking_lot::Mutex<(Instant, u32)>>,
     /// Prometheus-compatible metrics registry.
     pub metrics: Arc<Registry>,
     /// Pre-resolved metric handles for the request hot
@@ -196,6 +199,18 @@ pub struct AppState {
     /// refusal arm call `.inc()` directly with zero registry
     /// contention.
     pub(crate) mcp_admission_refusals_counter: Arc<av_core::metrics::Counter>,
+    /// Per-backend credential routing (pillar 4). Resolves tool names to
+    /// their designated backend and attaches the pre-resolved credential.
+    pub backend_router: Arc<crate::backend::BackendRouter>,
+    /// Local policy decision point (pillar 2). Maps tool names to business
+    /// intents and enforces mission constraints per call.
+    pub pdp: Arc<crate::authz::PolicyDecisionPoint>,
+    /// Token signer (pillar 3). Signs exchange tokens and intent tokens
+    /// with EdDSA. Present only when `token_exchange_seed_file` is configured.
+    pub token_signer: Option<Arc<crate::authz::TokenSigner>>,
+    /// Redaction engine (pillar 5). Strips sensitive data from event
+    /// payloads and ATIF step text before they are journaled or published.
+    pub redaction: Option<Arc<av_redact::RedactionEngine>>,
 }
 
 /// Pre-resolved metric handles for the request hot path so the
@@ -223,13 +238,13 @@ pub(crate) struct HotMetrics {
     /// mutex ops on the shared `Registry` per HTTP request plus
     /// ~120 B of allocator churn (at 10k req/s: ~40k mutex ops/s +
     /// 1.2 MB/s allocs on the request middleware alone).
-    pub(crate) request_counters: [[Arc<av_core::metrics::Counter>; 5]; 10],
+    pub(crate) request_counters: [[Arc<av_core::metrics::Counter>; 5]; 15],
     /// Pre-resolved `av_request_duration_seconds{route}` histograms,
     /// indexed by `Route::index()`. Same rationale as
     /// `request_counters` above; the histogram fetch used to hit
     /// TWO Registry mutex ops per request (base_kinds + metrics
     /// map).
-    pub(crate) request_duration_histograms: [Arc<av_core::metrics::Histogram>; 10],
+    pub(crate) request_duration_histograms: [Arc<av_core::metrics::Histogram>; 15],
     /// Pre-resolved `av_upstream_latency_seconds` histogram — hit
     /// on every successful chat forward. R59 continuation of R58's
     /// hot-path pre-resolution: prior code called
@@ -312,11 +327,16 @@ pub(crate) enum Route {
     SessionClose,
     SessionPromote,
     Dashboard,
+    TokenExchange,
+    Revoke,
+    Introspect,
+    AdminRevocation,
+    Jwks,
     Other,
 }
 
 impl Route {
-    pub(crate) const ORDER: [Route; 10] = [
+    pub(crate) const ORDER: [Route; 15] = [
         Route::Chat,
         Route::Mcp,
         Route::Health,
@@ -326,6 +346,11 @@ impl Route {
         Route::SessionClose,
         Route::SessionPromote,
         Route::Dashboard,
+        Route::TokenExchange,
+        Route::Revoke,
+        Route::Introspect,
+        Route::AdminRevocation,
+        Route::Jwks,
         Route::Other,
     ];
 
@@ -340,6 +365,11 @@ impl Route {
             Route::SessionClose => "session_close",
             Route::SessionPromote => "session_promote",
             Route::Dashboard => "dashboard",
+            Route::TokenExchange => "token_exchange",
+            Route::Revoke => "revoke",
+            Route::Introspect => "introspect",
+            Route::AdminRevocation => "admin_revocation",
+            Route::Jwks => "jwks",
             Route::Other => "other",
         }
     }
@@ -355,7 +385,12 @@ impl Route {
             Route::SessionClose => 6,
             Route::SessionPromote => 7,
             Route::Dashboard => 8,
-            Route::Other => 9,
+            Route::TokenExchange => 9,
+            Route::Revoke => 10,
+            Route::Introspect => 11,
+            Route::AdminRevocation => 12,
+            Route::Jwks => 13,
+            Route::Other => 14,
         }
     }
 }
@@ -561,7 +596,7 @@ impl HotMetrics {
         // mutex ops. Registration order matches the enum ORDER
         // constants, matched at read time via `Route::index()` and
         // `StatusClass::index()`.
-        let request_counters: [[Arc<av_core::metrics::Counter>; 5]; 10] = Route::ORDER.map(|route| {
+        let request_counters: [[Arc<av_core::metrics::Counter>; 5]; 15] = Route::ORDER.map(|route| {
             StatusClass::ORDER.map(|status| {
                 metrics.counter(
                     &format!(
@@ -573,7 +608,7 @@ impl HotMetrics {
                 )
             })
         });
-        let request_duration_histograms: [Arc<av_core::metrics::Histogram>; 10] = Route::ORDER.map(|route| {
+        let request_duration_histograms: [Arc<av_core::metrics::Histogram>; 15] = Route::ORDER.map(|route| {
             metrics.histogram_with_bounds(
                 &format!("av_request_duration_seconds{{route=\"{}\"}}", route.label()),
                 "End-to-end HTTP request latency by route",
@@ -709,7 +744,7 @@ pub(crate) fn resolve_tool_auth(config: &HarnessConfig) -> Result<Option<HeaderV
 /// Read a secret from an env var or an owner-only file, trimming
 /// surrounding whitespace. A configured-but-missing source is a loud startup error:
 /// silently proxying unauthenticated would produce baffling upstream 401s.
-fn read_secret(
+pub(crate) fn read_secret(
     env_name: Option<&str>,
     file_path: Option<&str>,
     what: &str,
@@ -757,7 +792,7 @@ fn read_secret_from(
 /// Same posture as the signing-seed loader: refuse symlinks (a pre-planted
 /// link would fool the mode check, CWE-59) and group/other-readable modes
 /// on Unix. Windows deployments rely on operator-set ACLs.
-fn require_owner_only_secret(path: &std::path::Path) -> Result<(), String> {
+pub(crate) fn require_owner_only_secret(path: &std::path::Path) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
@@ -1202,7 +1237,7 @@ pub enum PipelineError {
     #[error("connection aborted: {0}")]
     Abort(String),
     /// Required audit capture infrastructure is unavailable.
-    #[error("audit capture unavailable: {context}")]
+    #[error("service unavailable: {context}")]
     Unavailable {
         /// Human-readable description.
         context: String,
@@ -1751,6 +1786,19 @@ impl AppState {
         }
         let sessions = Arc::new(SessionRegistry::new());
         let journal_key = crate::journal::key_from_signer(signer.as_ref());
+        let redaction = if !config.redaction_patterns.is_empty() || !config.redaction_paths.is_empty() {
+            let redact_config = av_redact::RedactionConfig {
+                regex_patterns: config.redaction_patterns.clone(),
+                pointer_paths: config.redaction_paths.clone(),
+                include_builtin_patterns: true,
+                ..av_redact::RedactionConfig::default()
+            };
+            let engine = av_redact::RedactionEngine::new(redact_config)
+                .map_err(|e| PipelineError::bad_request(format!("redaction engine: {e}")))?;
+            Some(Arc::new(engine))
+        } else {
+            None
+        };
         let worker = crate::worker::spawn_worker_with_spool_authenticated(
             config.worker_channel_capacity,
             Arc::clone(&bridge),
@@ -1759,9 +1807,10 @@ impl AppState {
             Some(std::path::PathBuf::from(&config.atif_spool_dir)),
             journal_key,
             Arc::clone(&metrics),
+            redaction.clone(),
         );
         let finalizer = Finalizer::with_bridge(
-            signer,
+            signer.clone(),
             std::path::PathBuf::from(&config.atif_spool_dir),
             Arc::clone(&metrics),
             Arc::clone(&bridge),
@@ -1851,6 +1900,51 @@ impl AppState {
              tool-upstream slowdown, a burst-traffic event, or an undersized \
              `mcp_concurrency`.",
         );
+        for pdp_code in ["UNMAPPED_TOOL", "MISSION_EXPIRED", "MISSION_DENIED"] {
+            metrics.counter(
+                &format!("av_pdp_denials_total{{code=\"{pdp_code}\"}}"),
+                "PDP denials by denial code",
+            );
+        }
+        metrics.counter(
+            crate::routes::TOKENS_REVOKED_METRIC,
+            crate::routes::TOKENS_REVOKED_HELP,
+        );
+        let backend_router = crate::backend::BackendRouter::new(
+            &config.backends,
+            config.tool_upstream_url.as_deref(),
+            tool_auth.clone(),
+        )
+        .map_err(|e| PipelineError::bad_request(format!("backend routing: {e}")))?;
+        let token_signer = if let Some(ref seed_path) = config.token_exchange_seed_file {
+            let seed = load_exchange_seed(seed_path)
+                .map_err(|e| PipelineError::bad_request(format!("exchange signing key: {e}")))?;
+            let ts = Arc::new(crate::authz::TokenSigner::from_seed(&seed));
+            if ts.kid() == signer.key_id() {
+                return Err(PipelineError::bad_request(
+                    "token_exchange_seed_file must use a different key than the receipt signer \
+                     (both derive the same kid, which means the same seed)"
+                        .to_owned(),
+                ));
+            }
+            Some(ts)
+        } else {
+            None
+        };
+        let pdp = crate::authz::PolicyDecisionPoint::from_config(&config, token_signer.clone());
+        let exchanged_revocations: Arc<dyn av_identity::RevocationStore> = if config.state_backend == "redis"
+        {
+            Arc::new(crate::revocation::GuardedRevocationStore::new(
+                Arc::new(crate::revocation::StateRevocationStore::with_namespace(
+                    Arc::clone(&store),
+                    "exchanged",
+                )),
+                &metrics,
+                "exchanged",
+            ))
+        } else {
+            Arc::new(av_identity::InMemoryRevocationStore::new())
+        };
         Ok(Self {
             config,
             store,
@@ -1859,6 +1953,8 @@ impl AppState {
             sessions,
             worker,
             identity,
+            exchanged_revocations,
+            revocation_audit_window: Arc::new(parking_lot::Mutex::new((Instant::now(), 0))),
             hot_metrics,
             metrics,
             client,
@@ -1874,6 +1970,10 @@ impl AppState {
             mcp_inflight: Arc::new(crate::inflight::InflightTracker::new()),
             mcp_admission,
             mcp_admission_refusals_counter,
+            backend_router: Arc::new(backend_router),
+            pdp: Arc::new(pdp),
+            token_signer,
+            redaction,
         })
     }
 
@@ -1894,8 +1994,18 @@ impl AppState {
     pub fn prepare_chat(
         &self,
         headers: &HeaderMap,
+        payload: Value,
+        identity_hint: Option<AgentIdentity>,
+    ) -> Result<PreparedRequest, PipelineError> {
+        self.prepare_chat_with_caller(headers, payload, identity_hint, None)
+    }
+
+    fn prepare_chat_with_caller(
+        &self,
+        headers: &HeaderMap,
         mut payload: Value,
         identity_hint: Option<AgentIdentity>,
+        caller: Option<&AuthenticatedCaller>,
     ) -> Result<PreparedRequest, PipelineError> {
         let total_started = Instant::now();
         let session_id = session_id(headers)?;
@@ -1957,11 +2067,7 @@ impl AppState {
             match self.resolve_identity(headers, Some(&self.config.chat_scope)) {
                 Ok(identity) => identity,
                 Err(error) => {
-                    self.enqueue_transient_failure(
-                        &session_id,
-                        StopReason::IdentityRejected,
-                        error.to_string(),
-                    )?;
+                    self.audit_authentication_error(headers, &error)?;
                     return Err(error);
                 }
             }
@@ -1973,6 +2079,9 @@ impl AppState {
             .get_or_open(&session_id, workflow, &identity, &self.config.breaker);
         let admission = session.admission_guard();
         validate_session_binding(&session, workflow, &identity)?;
+        if let Some(caller) = caller {
+            caller.bind_session(&session)?;
+        }
         session.refresh_identity(&identity);
         if session.is_closed() {
             // Distinguish the PERMANENT quarantine (empty-unsigned close
@@ -2339,13 +2448,10 @@ impl AppState {
         body_bytes: usize,
         identity_hint: Option<AgentIdentity>,
     ) -> Result<PreparedRequest, PipelineError> {
-        /// Above this the CPU-bound gates run on the blocking pool.
-        /// 16 KiB ≈ 250 µs of gate work on the review's 2-vCPU
-        /// reference box — comfortably under a poll-stall budget.
-        const INLINE_BODY_LIMIT: usize = 16 * 1024;
-        if body_bytes <= INLINE_BODY_LIMIT
-            && self.config.budget.max_tokens.is_none()
-            && self.config.principal_budget.is_none()
+        if self.chat_preparation_can_run_inline(body_bytes)
+            // Without a trusted hint, a configured validator may perform
+            // synchronous shared-revocation I/O even for a tiny request.
+            && (identity_hint.is_some() || self.identity.is_none())
         {
             return self.prepare_chat(headers, payload, identity_hint);
         }
@@ -2354,6 +2460,59 @@ impl AppState {
         tokio::task::spawn_blocking(move || state.prepare_chat(&headers, payload, identity_hint))
             .await
             .map_err(PipelineError::unavailable_source)?
+    }
+
+    fn chat_preparation_can_run_inline(&self, body_bytes: usize) -> bool {
+        // Above 16 KiB, CPU-bound gates can stall the reactor. Any token
+        // budget can also call a synchronous state backend, regardless of size.
+        body_bytes <= 16 * 1024
+            && self.config.budget.max_tokens.is_none()
+            && self.config.principal_budget.is_none()
+    }
+
+    pub(crate) async fn authenticate_chat_nonblocking(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<AuthenticatedCaller, PipelineError> {
+        if self.identity.is_none() {
+            // Preserve all anonymous/header checks without queueing local work
+            // behind durable filesystem writes in the shared blocking pool.
+            let caller = self.authenticate(headers)?;
+            caller.authorize(self, Some(&self.config.chat_scope))?;
+            return Ok(caller);
+        }
+        let state = self.clone();
+        let headers = headers.clone();
+        tokio::task::spawn_blocking(move || {
+            let caller = state.authenticate(&headers)?;
+            caller.authorize(&state, Some(&state.config.chat_scope))?;
+            Ok(caller)
+        })
+        .await
+        .map_err(PipelineError::unavailable_source)?
+    }
+
+    pub(crate) async fn prepare_authenticated_chat(
+        &self,
+        headers: &HeaderMap,
+        payload: Value,
+        body_bytes: usize,
+        caller: AuthenticatedCaller,
+    ) -> Result<PreparedRequest, PipelineError> {
+        if self.chat_preparation_can_run_inline(body_bytes) {
+            // Authentication already finished. This rechecks only local
+            // expiry/scope and retains principal binding during preparation.
+            let identity = caller.authorize(self, Some(&self.config.chat_scope))?;
+            return self.prepare_chat_with_caller(headers, payload, Some(identity), Some(&caller));
+        }
+        let state = self.clone();
+        let headers = headers.clone();
+        tokio::task::spawn_blocking(move || {
+            let identity = caller.authorize(&state, Some(&state.config.chat_scope))?;
+            state.prepare_chat_with_caller(&headers, payload, Some(identity), Some(&caller))
+        })
+        .await
+        .map_err(PipelineError::unavailable_source)?
     }
 
     /// Prepare a request and wait until its audit record is durably captured
@@ -2747,15 +2906,31 @@ impl AppState {
         headers: &HeaderMap,
         raw: &[u8],
     ) -> Result<(ToolVerdict, Arc<Session>), PipelineError> {
+        let caller = match self.authenticate(headers) {
+            Ok(caller) => caller,
+            Err(error) => {
+                self.audit_authentication_error(headers, &error)?;
+                return Err(error);
+            }
+        };
+        self.intercept_tool_authenticated(headers, raw, &caller, None)
+    }
+
+    fn intercept_tool_authenticated(
+        &self,
+        headers: &HeaderMap,
+        raw: &[u8],
+        caller: &AuthenticatedCaller,
+        preflight_denial: Option<ToolVerdict>,
+    ) -> Result<(ToolVerdict, Arc<Session>), PipelineError> {
         let session_id = session_id(headers)?;
         let workflow = workflow(headers, &self.config.default_workflow)?;
-        self.refuse_unauthenticated_tool_call(headers)?;
         let parsed_call = av_sandbox::parse_tool_call(raw).ok();
         let required_scope = parsed_call
             .as_ref()
             .map(|request| tool_scope(&request.tool))
             .unwrap_or_else(|| TOOL_INVOKE_SCOPE.to_owned());
-        let identity = match self.resolve_identity(headers, Some(&required_scope)) {
+        let identity = match caller.authorize(self, Some(&required_scope)) {
             Ok(identity) => identity,
             Err(error) => {
                 self.enqueue_transient_failure(&session_id, StopReason::IdentityRejected, error.to_string())?;
@@ -2774,6 +2949,7 @@ impl AppState {
                 .get_or_open_no_reopen(&session_id, workflow, &identity, &self.config.breaker);
         let admission = session.admission_guard();
         validate_session_binding(&session, workflow, &identity)?;
+        caller.bind_session(&session)?;
         session.refresh_identity(&identity);
         if session.is_closed() {
             return Err(PipelineError::bad_request("session is already closed".to_owned()));
@@ -2810,39 +2986,73 @@ impl AppState {
             .worker
             .try_reserve(&session_id)
             .map_err(PipelineError::unavailable_source)?;
-        let verdict = match parsed_call.as_ref() {
-            // `sandbox.check`'s budget gate spends before we return, so we must
-            // veto workflow-mismatched consequential tools before it runs.
-            Some(request)
-                if workflow == Workflow::Unsigned
-                    && self
-                        .config
-                        .consequential_tools
-                        .iter()
-                        .any(|required| required == &request.tool) =>
-            {
-                let reason = format!("tool {:?} requires a signed workflow", request.tool);
-                ToolVerdict::Blocked {
-                    tool: request.tool.clone(),
-                    stage: "policy",
-                    // Built-in workflow gate, named so console-side
-                    // attribution has a stable handle an operator can
-                    // create a matching policy row for.
-                    policy: Some("workflow.signed_required".to_owned()),
-                    reason: reason.clone(),
-                    response: av_sandbox::rpc::authorization_error(request.id.as_ref(), &reason),
-                    elapsed_us: 0,
+        let budgeted_check = || {
+            let principal_binding = self
+                .config
+                .principal_budget
+                .as_ref()
+                .map(|spec| (principal_id_for_budget(&identity), spec));
+            let principal_ref = principal_binding.as_ref().map(|(id, spec)| (id.as_str(), *spec));
+            self.sandbox
+                .check_with_principal(self.store.as_ref(), &session_id, principal_ref, raw)
+        };
+        let verdict = if let Some(denial) = preflight_denial {
+            denial
+        } else {
+            match parsed_call.as_ref() {
+                // `sandbox.check`'s budget gate spends before we return, so we must
+                // veto workflow-mismatched consequential tools before it runs.
+                Some(request)
+                    if workflow == Workflow::Unsigned
+                        && self
+                            .config
+                            .consequential_tools
+                            .iter()
+                            .any(|required| required == &request.tool) =>
+                {
+                    let reason = format!("tool {:?} requires a signed workflow", request.tool);
+                    ToolVerdict::Blocked {
+                        tool: request.tool.clone(),
+                        stage: "policy",
+                        // Built-in workflow gate, named so console-side
+                        // attribution has a stable handle an operator can
+                        // create a matching policy row for.
+                        policy: Some("workflow.signed_required".to_owned()),
+                        denial_code: av_sandbox::DenialCode::PolicyDenied,
+                        reason: reason.clone(),
+                        response: av_sandbox::rpc::denial_error(
+                            request.id.as_ref(),
+                            av_sandbox::DenialCode::PolicyDenied,
+                            &reason,
+                        ),
+                        elapsed_us: 0,
+                    }
                 }
-            }
-            _ => {
-                let principal_binding = self
-                    .config
-                    .principal_budget
-                    .as_ref()
-                    .map(|spec| (principal_id_for_budget(&identity), spec));
-                let principal_ref = principal_binding.as_ref().map(|(id, spec)| (id.as_str(), *spec));
-                self.sandbox
-                    .check_with_principal(self.store.as_ref(), &session_id, principal_ref, raw)
+                // Same pre-spend veto for the intent map and the active
+                // mission: a denied call must neither consume budget nor be
+                // audited as allowed. This also covers verdict-only mode, where
+                // no forwarding branch ever runs.
+                Some(request) => match self.pdp.decide(&request.tool, av_core::time::now_ms() / 1000) {
+                    crate::authz::AuthzDecision::Deny { code, reason } => {
+                        self.metrics
+                            .counter(
+                                &format!("av_pdp_denials_total{{code=\"{}\"}}", code.as_str()),
+                                "PDP denials by denial code",
+                            )
+                            .inc();
+                        ToolVerdict::Blocked {
+                            tool: request.tool.clone(),
+                            stage: "policy",
+                            policy: Some(pdp_policy_name(code).to_owned()),
+                            denial_code: code,
+                            response: av_sandbox::rpc::denial_error(request.id.as_ref(), code, &reason),
+                            reason,
+                            elapsed_us: 0,
+                        }
+                    }
+                    crate::authz::AuthzDecision::Permit { .. } => budgeted_check(),
+                },
+                None => budgeted_check(),
             }
         };
         let (status, payload) = match &verdict {
@@ -2866,6 +3076,7 @@ impl AppState {
                 tool,
                 stage,
                 policy,
+                denial_code,
                 reason,
                 elapsed_us,
                 ..
@@ -2879,6 +3090,7 @@ impl AppState {
                     // consumed by console-sync as the per-policy
                     // attribution (`payload.policy` → ingest policyName).
                     "policy": policy,
+                    "denial_code": denial_code.as_str(),
                     "reason": reason,
                     "decision_us": elapsed_us,
                 }),
@@ -3011,6 +3223,25 @@ impl AppState {
         tokio::task::spawn_blocking(move || state.intercept_tool(&owned_headers, &raw))
             .await
             .map_err(PipelineError::unavailable_source)?
+    }
+
+    pub(crate) async fn intercept_authenticated_nonblocking(
+        &self,
+        headers: &HeaderMap,
+        raw: &[u8],
+        caller: AuthenticatedCaller,
+        preflight_denial: Option<ToolVerdict>,
+    ) -> Result<ToolVerdict, PipelineError> {
+        let state = self.clone();
+        let headers = headers.clone();
+        let raw = raw.to_vec();
+        tokio::task::spawn_blocking(move || {
+            state
+                .intercept_tool_authenticated(&headers, &raw, &caller, preflight_denial)
+                .map(|(verdict, _)| verdict)
+        })
+        .await
+        .map_err(PipelineError::unavailable_source)?
     }
 
     pub(crate) fn lease_session(&self, headers: &HeaderMap) -> Result<SessionLease, PipelineError> {
@@ -3146,19 +3377,74 @@ impl AppState {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn authorize_session(
         &self,
         headers: &HeaderMap,
         session: &Session,
         required_scope: &str,
     ) -> Result<(), PipelineError> {
-        let identity = self.resolve_identity(headers, Some(required_scope))?;
-        validate_session_binding(session, session.workflow, &identity)?;
-        session.refresh_identity(&identity);
-        Ok(())
+        self.authenticate(headers)?
+            .authorize_session(self, session, required_scope)
     }
 
     pub(crate) fn resolve_identity(
+        &self,
+        headers: &HeaderMap,
+        required_scope: Option<&str>,
+    ) -> Result<AgentIdentity, PipelineError> {
+        self.authenticate(headers)?.authorize(self, required_scope)
+    }
+
+    pub(crate) fn authenticate(&self, headers: &HeaderMap) -> Result<AuthenticatedCaller, PipelineError> {
+        let bearer = single_header(headers, "authorization")?
+            .and_then(|value| value.to_str().ok())
+            .and_then(strip_bearer_scheme);
+        if let (Some(token), Some(validator)) = (bearer, &self.identity) {
+            self.metrics
+                .counter(
+                    "av_identity_validations_total",
+                    "Full inbound identity validations",
+                )
+                .inc();
+            let validated = validator.validate(token).map_err(identity_error_to_pipeline)?;
+            return Ok(AuthenticatedCaller {
+                identity: validated.agent_identity(),
+                validated: Some(validated),
+            });
+        }
+        Ok(AuthenticatedCaller {
+            identity: self.resolve_anonymous_identity(headers, None)?,
+            validated: None,
+        })
+    }
+
+    pub(crate) fn audit_authentication_error(
+        &self,
+        headers: &HeaderMap,
+        error: &PipelineError,
+    ) -> Result<(), PipelineError> {
+        if matches!(
+            error,
+            PipelineError::Unauthorized(_) | PipelineError::Blocked { .. }
+        ) {
+            self.enqueue_transient_failure(
+                &session_id(headers).unwrap_or_default(),
+                StopReason::IdentityRejected,
+                error.to_string(),
+            )?;
+        } else if matches!(error, PipelineError::Unavailable { .. }) {
+            self.metrics
+                .counter(
+                    "av_identity_unavailable_total",
+                    "Identity validation dependency failures",
+                )
+                .inc();
+        }
+        Ok(())
+    }
+
+    fn resolve_anonymous_identity(
         &self,
         headers: &HeaderMap,
         required_scope: Option<&str>,
@@ -3189,13 +3475,7 @@ impl AppState {
             .and_then(strip_bearer_scheme);
         match (bearer, &self.identity) {
             (Some(token), Some(validator)) => {
-                let validated = validator.validate(token).map_err(|error| {
-                    tracing::warn!(
-                        error = %error,
-                        "identity validation failed"
-                    );
-                    PipelineError::Unauthorized(classify_identity_error(&error).to_owned())
-                })?;
+                let validated = validator.validate(token).map_err(identity_error_to_pipeline)?;
                 if self.config.enforce_identity_scopes {
                     if let Some(required) = required_scope {
                         if !scope_allows(&validated.claims.scopes, required) {
@@ -3349,6 +3629,71 @@ impl AppState {
     }
 }
 
+/// Authentication result confined to one request. It cannot be constructed by callers.
+#[derive(Clone)]
+pub(crate) struct AuthenticatedCaller {
+    pub(crate) identity: AgentIdentity,
+    pub(crate) validated: Option<av_identity::ValidatedIdentity>,
+}
+
+impl AuthenticatedCaller {
+    pub(crate) fn authorize(
+        &self,
+        state: &AppState,
+        scope: Option<&str>,
+    ) -> Result<AgentIdentity, PipelineError> {
+        if let Some(validated) = &self.validated {
+            let now = av_core::time::now_ms() / 1000;
+            let leeway = state.identity.as_ref().map_or(0, |v| v.leeway_secs());
+            if now > validated.claims.exp.saturating_add(leeway) {
+                return Err(PipelineError::Unauthorized("identity validation failed".into()));
+            }
+            if state.config.enforce_identity_scopes {
+                if let Some(required) = scope {
+                    if !scope_allows(&validated.claims.scopes, required) {
+                        return Err(PipelineError::blocked(format!(
+                            "identity scope {required:?} is required"
+                        )));
+                    }
+                }
+            }
+            let mut identity = self.identity.clone();
+            identity.ttl_remaining_s = Some(validated.claims.exp.saturating_sub(now));
+            return Ok(identity);
+        }
+        Ok(self.identity.clone())
+    }
+
+    pub(crate) fn authorize_session(
+        &self,
+        state: &AppState,
+        session: &Session,
+        scope: &str,
+    ) -> Result<(), PipelineError> {
+        let identity = self.authorize(state, Some(scope))?;
+        validate_session_binding(session, session.workflow, &identity)?;
+        self.bind_session(session)?;
+        session.refresh_identity(&identity);
+        Ok(())
+    }
+
+    pub(crate) fn principal_digest(&self) -> Option<String> {
+        self.validated.as_ref().map(|validated| {
+            let pair = serde_json::json!([validated.claims.iss, validated.claims.sub]);
+            av_core::digest::sha256_hex(pair.to_string().as_bytes())
+        })
+    }
+
+    fn bind_session(&self, session: &Session) -> Result<(), PipelineError> {
+        if !session.bind_principal(self.principal_digest().as_deref()) {
+            return Err(PipelineError::Unauthorized(
+                "session is bound to a different principal".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 fn truthy_env(name: &str) -> bool {
     match std::env::var(name) {
         Ok(value) => matches!(
@@ -3396,7 +3741,21 @@ pub(crate) fn classify_upstream_error(error: &reqwest::Error) -> &'static str {
 /// The detailed cause is preserved server-side by the caller via
 /// `tracing::warn!` and the failure-job audit chain, so operators keep
 /// full diagnostic detail without exposing it to the network.
-fn classify_identity_error(error: &av_identity::IdentityError) -> &'static str {
+/// An unreachable revocation list is an availability fault: answer 503 so
+/// clients back off and retry, instead of a 401 that tells them to throw
+/// away a credential that may be perfectly valid.
+pub(crate) fn identity_error_to_pipeline(error: av_identity::IdentityError) -> PipelineError {
+    if matches!(error, av_identity::IdentityError::RevocationUnavailable(_)) {
+        tracing::error!(error = %error, "identity revocation list unavailable; refusing the request");
+        return PipelineError::unavailable(
+            "identity revocation list is unavailable; retry shortly".to_owned(),
+        );
+    }
+    tracing::warn!(error = %error, "identity validation failed");
+    PipelineError::Unauthorized(classify_identity_error(&error).to_owned())
+}
+
+pub(crate) fn classify_identity_error(error: &av_identity::IdentityError) -> &'static str {
     match error {
         // Server-side misconfiguration is not attacker-reachable in the
         // normal request path (validator construction rejects a bad JWKS
@@ -3489,6 +3848,17 @@ pub(crate) fn session_id(headers: &HeaderMap) -> Result<String, PipelineError> {
 /// pass-through; the shipping default is a single shared bucket and the
 /// config validator refuses `principal_budget` while `require_identity =
 /// false` unless the operator explicitly acknowledges that shape.
+/// Stable policy handle for a PDP denial, following the
+/// `workflow.signed_required` naming: the console attributes denials by
+/// this name, and it points the operator at the config block responsible.
+fn pdp_policy_name(code: av_sandbox::DenialCode) -> &'static str {
+    match code {
+        av_sandbox::DenialCode::UnmappedTool => "pdp.intent_map",
+        av_sandbox::DenialCode::MissionExpired | av_sandbox::DenialCode::MissionDenied => "pdp.mission",
+        _ => "pdp",
+    }
+}
+
 pub(crate) fn principal_id_for_budget(identity: &AgentIdentity) -> String {
     if identity.instance_uid.is_empty() {
         "anonymous".to_owned()
@@ -3751,6 +4121,25 @@ fn inject_corrective_message(payload: &mut Value) -> Result<(), PipelineError> {
     Ok(())
 }
 
+fn load_exchange_seed(path: &str) -> Result<zeroize::Zeroizing<[u8; 32]>, String> {
+    use zeroize::Zeroizing;
+    require_owner_only_secret(std::path::Path::new(path)).map_err(|e| format!("exchange seed file: {e}"))?;
+    let encoded = Zeroizing::new(
+        av_core::fsutil::read_capped_string(std::path::Path::new(path), av_core::fsutil::MAX_CONTROL_BYTES)
+            .map_err(|e| format!("read exchange seed {path}: {e}"))?,
+    );
+    let bytes =
+        Zeroizing::new(hex::decode(encoded.trim()).map_err(|e| format!("decode exchange seed as hex: {e}"))?);
+    let seed: Zeroizing<[u8; 32]> = Zeroizing::new(
+        <[u8; 32]>::try_from(bytes.as_slice())
+            .map_err(|_| "exchange seed must contain exactly 32 bytes".to_owned())?,
+    );
+    if *seed == [0u8; 32] || *seed == [0xFFu8; 32] {
+        return Err(format!("exchange seed at {path} is a known-weak value; refusing"));
+    }
+    Ok(seed)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -3976,6 +4365,276 @@ mod tests {
             "model": "test",
             "messages": [{"role": "user", "content": "hello"}],
         })
+    }
+
+    fn admission_test_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    async fn occupy_admission_blocking_pool(
+    ) -> (tokio::sync::oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::task::spawn_blocking(move || {
+            let _ = started_tx.send(());
+            // Dropping the sender also releases this thread if a test panics.
+            let _ = release_rx.blocking_recv();
+        });
+        started_rx.await.unwrap();
+        (release_tx, task)
+    }
+
+    async fn poll_admission_once<F: std::future::Future>(
+        mut future: std::pin::Pin<&mut F>,
+    ) -> std::task::Poll<F::Output> {
+        std::future::poll_fn(|context| std::task::Poll::Ready(future.as_mut().poll(context))).await
+    }
+
+    #[test]
+    fn small_chat_admission_bypasses_saturated_blocking_pool() {
+        admission_test_runtime().block_on(async {
+            for authenticated in [false, true] {
+                let mut config = HarnessConfig::for_tests("http://127.0.0.1:9", "/tmp", "/tmp");
+                config.require_identity = authenticated;
+                config.enforce_identity_scopes = authenticated;
+                let mut state = state(config);
+                let mut headers = HeaderMap::new();
+                headers.insert(SESSION_HEADER, HeaderValue::from_static("small-local-admission"));
+                if authenticated {
+                    let validator = IdentityValidator::new("agentvisor-ai");
+                    validator
+                        .add_key(
+                            "scope-key",
+                            av_identity::KeyMaterial::HmacSecret(b"scope-secret".to_vec()),
+                        )
+                        .unwrap();
+                    state.identity = Some(Arc::new(validator));
+                    headers.insert(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {}", scoped_token(&["chat:write"]))
+                            .parse()
+                            .unwrap(),
+                    );
+                }
+                let caller = state.authenticate_chat_nonblocking(&headers).await.unwrap();
+                let principal = caller.principal_digest();
+                let mut other_principal = caller.clone();
+                if let Some(validated) = &mut other_principal.validated {
+                    validated.claims.sub = "another-principal".into();
+                }
+                let (release, blocker) = occupy_admission_blocking_pool().await;
+                if !authenticated {
+                    let mut authenticate = Box::pin(state.authenticate_chat_nonblocking(&headers));
+                    assert!(matches!(
+                        poll_admission_once(authenticate.as_mut()).await,
+                        std::task::Poll::Ready(Ok(_))
+                    ));
+                    let mut duplicated = headers.clone();
+                    duplicated.append(
+                        axum::http::header::AUTHORIZATION,
+                        HeaderValue::from_static("Bearer a"),
+                    );
+                    duplicated.append(
+                        axum::http::header::AUTHORIZATION,
+                        HeaderValue::from_static("Bearer b"),
+                    );
+                    let mut authenticate = Box::pin(state.authenticate_chat_nonblocking(&duplicated));
+                    assert!(matches!(
+                        poll_admission_once(authenticate.as_mut()).await,
+                        std::task::Poll::Ready(Err(PipelineError::BadRequest { .. }))
+                    ));
+                }
+                let body = payload();
+                let body_bytes = body.to_string().len();
+                let mut prepare =
+                    Box::pin(state.prepare_authenticated_chat(&headers, body, body_bytes, caller));
+                let outcome = poll_admission_once(prepare.as_mut()).await;
+                let completed_inline = outcome.is_ready();
+                release.send(()).unwrap();
+                blocker.await.unwrap();
+                let prepared = match outcome {
+                    std::task::Poll::Ready(result) => result.unwrap(),
+                    std::task::Poll::Pending => prepare.await.unwrap(),
+                };
+                assert!(
+                    completed_inline,
+                    "small local admission queued behind unrelated blocking work"
+                );
+                assert_eq!(prepared.session.principal_binding(), principal);
+                if authenticated {
+                    assert_eq!(
+                        state
+                            .metrics
+                            .counter(
+                                "av_identity_validations_total",
+                                "Full inbound identity validations"
+                            )
+                            .get(),
+                        1
+                    );
+                    // The inline path must still refuse another principal on
+                    // this session even when agent instance claims coincide.
+                    let refused = state
+                        .prepare_authenticated_chat(&headers, payload(), body_bytes, other_principal)
+                        .await;
+                    assert!(matches!(refused, Err(PipelineError::Unauthorized(_))));
+                }
+                drop(prepared);
+                state.worker.wait_idle().await;
+            }
+        });
+    }
+
+    #[test]
+    fn chat_preparation_offloads_large_bodies_and_both_quota_classes() {
+        admission_test_runtime().block_on(async {
+            for (session_quota, principal_quota, large_body) in [(true, false, false), (false, true, false), (false, false, true)] {
+                let mut config = HarnessConfig::for_tests("http://127.0.0.1:9", "/tmp", "/tmp");
+                if session_quota {
+                    config.budget.max_tokens = Some(1_000_000);
+                }
+                if principal_quota {
+                    config.principal_budget = Some(av_state::BudgetSpec { max_tokens: Some(1_000_000), ..Default::default() });
+                }
+                let state = state(config);
+                let mut headers = HeaderMap::new();
+                headers.insert(SESSION_HEADER, HeaderValue::from_static("offloaded-admission"));
+                let caller = state.authenticate_chat_nonblocking(&headers).await.unwrap();
+                let body = if large_body {
+                    serde_json::json!({"model":"test", "messages":[{"role":"user", "content":"x".repeat(32 * 1024)}]})
+                } else {
+                    payload()
+                };
+                let body_bytes = body.to_string().len();
+                let (release, blocker) = occupy_admission_blocking_pool().await;
+                let mut prepare = Box::pin(state.prepare_authenticated_chat(&headers, body, body_bytes, caller));
+                let outcome = poll_admission_once(prepare.as_mut()).await;
+                let offloaded = outcome.is_pending();
+                let sessions_before_release = state.sessions.len();
+                release.send(()).unwrap();
+                blocker.await.unwrap();
+                let prepared = match outcome {
+                    std::task::Poll::Ready(result) => result.unwrap(),
+                    std::task::Poll::Pending => prepare.await.unwrap(),
+                };
+                assert!(offloaded, "large-body or quota preparation ran inline");
+                assert_eq!(sessions_before_release, 0, "preparation ran before the blocking worker was available");
+                drop(prepared);
+                state.worker.wait_idle().await;
+            }
+        });
+    }
+
+    #[test]
+    fn chat_route_passes_actual_body_size_to_admission() {
+        use tower::ServiceExt as _;
+
+        admission_test_runtime().block_on(async {
+            let state = state(HarnessConfig::for_tests("http://127.0.0.1:9", "/tmp", "/tmp"));
+            let body = serde_json::json!({
+                "model": "test",
+                "messages": [{"role": "user", "content": "x".repeat(32 * 1024)}],
+            })
+            .to_string();
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(SESSION_HEADER, "large-route-admission")
+                .body(axum::body::Body::from(body))
+                .unwrap();
+            let (release, blocker) = occupy_admission_blocking_pool().await;
+            let mut request = Box::pin(crate::build_router(state.clone()).oneshot(request));
+            let outcome = poll_admission_once(request.as_mut()).await;
+            let offloaded = outcome.is_pending();
+            // If the route passed zero instead of body.len(), preparation
+            // would already have opened a session before forwarding blocked.
+            let sessions_before_release = state.sessions.len();
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+            let response = match outcome {
+                std::task::Poll::Ready(result) => result.unwrap(),
+                std::task::Poll::Pending => request.await.unwrap(),
+            };
+            assert!(offloaded);
+            assert_eq!(sessions_before_release, 0);
+            assert_eq!(response.status(), axum::http::StatusCode::BAD_GATEWAY);
+            assert_eq!(state.sessions.len(), 1);
+            state.worker.wait_idle().await;
+        });
+    }
+
+    #[test]
+    fn unresolved_identity_never_runs_revocation_on_the_admission_task() {
+        struct CountRevocations(std::sync::atomic::AtomicUsize);
+        impl av_identity::RevocationStore for CountRevocations {
+            fn revoke(&self, _jti: &str, _expires_at: u64) -> Result<(), String> {
+                Ok(())
+            }
+            fn is_revoked(&self, _jti: &str) -> Result<bool, String> {
+                self.0.fetch_add(1, AtomicOrdering::SeqCst);
+                Ok(false)
+            }
+        }
+        admission_test_runtime().block_on(async {
+            let revocations = Arc::new(CountRevocations(std::sync::atomic::AtomicUsize::new(0)));
+            let mut validator = IdentityValidator::new("agentvisor-ai");
+            validator
+                .add_key(
+                    "scope-key",
+                    av_identity::KeyMaterial::HmacSecret(b"scope-secret".to_vec()),
+                )
+                .unwrap();
+            validator.set_revocation_store(revocations.clone());
+            let mut state = state(HarnessConfig::for_tests("http://127.0.0.1:9", "/tmp", "/tmp"));
+            state.identity = Some(Arc::new(validator));
+            let mut headers = HeaderMap::new();
+            headers.insert(SESSION_HEADER, HeaderValue::from_static("unresolved-admission"));
+            headers.insert(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {}", scoped_token(&["chat:write"]))
+                    .parse()
+                    .unwrap(),
+            );
+            let (release, blocker) = occupy_admission_blocking_pool().await;
+            let mut authenticate = Box::pin(state.authenticate_chat_nonblocking(&headers));
+            let outcome = poll_admission_once(authenticate.as_mut()).await;
+            let offloaded = outcome.is_pending();
+            let calls_before_release = revocations.0.load(AtomicOrdering::SeqCst);
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+            let _caller = match outcome {
+                std::task::Poll::Ready(result) => result.unwrap(),
+                std::task::Poll::Pending => authenticate.await.unwrap(),
+            };
+            assert!(offloaded);
+            assert_eq!(calls_before_release, 0);
+            assert_eq!(revocations.0.load(AtomicOrdering::SeqCst), 1);
+
+            let (release, blocker) = occupy_admission_blocking_pool().await;
+            let body = payload();
+            let body_bytes = body.to_string().len();
+            let mut prepare = Box::pin(state.prepare_chat_nonblocking(&headers, body, body_bytes, None));
+            let outcome = poll_admission_once(prepare.as_mut()).await;
+            let offloaded = outcome.is_pending();
+            let calls_before_release = revocations.0.load(AtomicOrdering::SeqCst);
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+            let prepared = match outcome {
+                std::task::Poll::Ready(result) => result.unwrap(),
+                std::task::Poll::Pending => prepare.await.unwrap(),
+            };
+            assert!(offloaded);
+            assert_eq!(calls_before_release, 1);
+            assert_eq!(revocations.0.load(AtomicOrdering::SeqCst), 2);
+            drop(prepared);
+            state.worker.wait_idle().await;
+        });
     }
 
     async fn trip_loop(state: &AppState, headers: &HeaderMap, repeated: &Value) {
@@ -5205,6 +5864,8 @@ mod tests {
             nbf: None,
             exp: now + 600,
             jti: av_core::new_event_uid(),
+            azp: None,
+            act: None,
             instance_uid: "scoped-instance".into(),
             charter: "scoped-charter".into(),
             version: "1".into(),

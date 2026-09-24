@@ -1,0 +1,11 @@
+api = "0.9"
+
+[buildpack]
+id = "io.agentvisor.buildpack"
+version = "0.1.0"
+name = "AgentVisor AI Service Binding"
+
+# CNB API 0.9 requires at least one stack declaration. The wildcard
+# allows stacks that provide the documented POSIX shell and jq prerequisites.
+[[stacks]]
+id = "*"

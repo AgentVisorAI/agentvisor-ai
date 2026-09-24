@@ -102,8 +102,8 @@ jobs:
           # below). Cloudflare Pages and GitHub Pages both handle
           # response-time gzip / brotli negotiation server-side against
           # the client's Accept-Encoding, so we don't ship precompressed
-          # .gz artifacts here — the wire cost is ~30 KB per pageview
-          # regardless. Minification does NOT touch index.html so the
+          # .gz artifacts here. Payload size depends on the current
+          # assets and negotiated encoding. Minification does NOT touch index.html so the
           # boot-time crash-card script stays readable.
           mkdir -p "$site/app"
           cp docs/app/index.html "$site/app/"

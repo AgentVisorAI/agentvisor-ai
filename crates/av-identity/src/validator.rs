@@ -1,6 +1,14 @@
 //! Token validation and delegation-chain verification.
 
 use crate::claims::{NhiClaims, MAX_TTL_SECS};
+use crate::revocation::{RevocationIdentity, RevokedBy};
+
+/// Clock tolerance shared by inbound and exchanged-token validation.
+pub const DEFAULT_LEEWAY_SECS: u64 = 30;
+/// Maximum number of scopes carried by a token.
+pub const MAX_SCOPES: usize = 64;
+/// Maximum characters in a rendered identity field or scope.
+pub const MAX_IDENTITY_STRING_CHARS: usize = 256;
 use base64::Engine as _;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use parking_lot::RwLock;
@@ -162,6 +170,23 @@ pub enum IdentityError {
     /// Delegation chain deeper than permitted.
     #[error("delegation chain deeper than {0}")]
     ChainTooDeep(usize),
+    /// Token's JTI (or the JTI of a token in its delegation chain) appears
+    /// in the revocation store.
+    #[error("token {0:?} has been revoked")]
+    Revoked(String),
+    /// Tokens issued by this instance at or before the cutoff were revoked.
+    #[error("instance {instance_uid:?} revoked through {cutoff}")]
+    InstanceRevoked {
+        /// Revoked instance identifier.
+        instance_uid: String,
+        /// Inclusive issued-at cutoff.
+        cutoff: u64,
+    },
+    /// The revocation store could not be read. The token is refused
+    /// because it might be revoked; this is an availability fault, not a
+    /// credential fault.
+    #[error("revocation list unavailable: {0}")]
+    RevocationUnavailable(String),
 }
 
 /// A successfully validated identity.
@@ -171,6 +196,11 @@ pub struct ValidatedIdentity {
     pub claims: NhiClaims,
     /// Number of delegation links above the leaf (0 = root token).
     pub chain_depth: usize,
+    /// Validated tokens in the delegation chain, leaf first.
+    pub chain_tokens: Vec<RevocationIdentity>,
+    /// Total delegation depth including both `parent_token` chain links
+    /// and `act` claim nesting.
+    pub total_delegation_depth: usize,
     /// Seconds of TTL remaining at validation time.
     pub ttl_remaining_s: u64,
 }
@@ -197,6 +227,7 @@ pub struct IdentityValidator {
     allowed_issuers: Option<Vec<String>>,
     max_chain_depth: usize,
     leeway_secs: u64,
+    revocation: Option<std::sync::Arc<dyn crate::revocation::RevocationStore>>,
 }
 
 impl IdentityValidator {
@@ -208,7 +239,8 @@ impl IdentityValidator {
             audience: audience.into(),
             allowed_issuers: None,
             max_chain_depth: 4,
-            leeway_secs: 30,
+            leeway_secs: DEFAULT_LEEWAY_SECS,
+            revocation: None,
         }
     }
 
@@ -304,17 +336,35 @@ impl IdentityValidator {
                 .get("kid")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("<missing>");
-            if let Some(use_) = key.get("use").and_then(serde_json::Value::as_str) {
-                if use_ != "sig" {
+            if let Some(use_) = key.get("use") {
+                if use_.as_str() != Some("sig") {
                     return Err(IdentityError::Jwks(format!(
                         "kid {kid_for_diag:?} declares use={use_:?}; only \"sig\" is accepted"
                     )));
                 }
             }
-            if let Some(alg) = key.get("alg").and_then(serde_json::Value::as_str) {
-                if alg != "EdDSA" {
+            if let Some(alg) = key.get("alg") {
+                if alg.as_str() != Some("EdDSA") {
                     return Err(IdentityError::Jwks(format!(
                         "kid {kid_for_diag:?} declares alg={alg:?}; only \"EdDSA\" is accepted for OKP/Ed25519"
+                    )));
+                }
+            }
+            if let Some(operations) = key.get("key_ops") {
+                let Some(operations) = operations.as_array() else {
+                    return Err(IdentityError::Jwks(format!(
+                        "kid {kid_for_diag:?} key_ops must be an array"
+                    )));
+                };
+                let mut seen_operations = HashSet::new();
+                if operations.iter().any(|operation| {
+                    operation
+                        .as_str()
+                        .is_none_or(|operation| !seen_operations.insert(operation))
+                }) || !seen_operations.contains("verify")
+                {
+                    return Err(IdentityError::Jwks(format!(
+                        "kid {kid_for_diag:?} key_ops must contain unique strings and permit verify"
                     )));
                 }
             }
@@ -432,18 +482,87 @@ impl IdentityValidator {
         self.max_chain_depth = depth;
     }
 
+    /// Clock tolerance used when checking token timestamps.
+    pub fn leeway_secs(&self) -> u64 {
+        self.leeway_secs
+    }
+
+    /// Attach a JTI revocation store. When set, the `jti` of every
+    /// validated token, and of every token in its delegation chain, is
+    /// checked against the store; revoked tokens are refused with
+    /// `IdentityError::Revoked`.
+    pub fn set_revocation_store(&mut self, store: std::sync::Arc<dyn crate::revocation::RevocationStore>) {
+        self.revocation = Some(store);
+    }
+
+    /// The attached revocation store, so a revocation endpoint writes to
+    /// the same list this validator reads.
+    pub fn revocation_store(&self) -> Option<&std::sync::Arc<dyn crate::revocation::RevocationStore>> {
+        self.revocation.as_ref()
+    }
+
+    /// Must run only after the token's signature verified, so an attacker
+    /// cannot probe the revocation list with unsigned tokens.
+    fn check_not_revoked(&self, claims: &NhiClaims) -> Result<(), IdentityError> {
+        let Some(store) = &self.revocation else {
+            return Ok(());
+        };
+        match store.check_token(&claims.iss, &claims.jti, &claims.instance_uid, claims.iat) {
+            Ok(None) => Ok(()),
+            Ok(Some(RevokedBy::Jti)) => Err(IdentityError::Revoked(claims.jti.clone())),
+            Ok(Some(RevokedBy::Instance { cutoff })) => Err(IdentityError::InstanceRevoked {
+                instance_uid: claims.instance_uid.clone(),
+                cutoff,
+            }),
+            Err(error) => Err(IdentityError::RevocationUnavailable(error)),
+        }
+    }
+
     /// Validate a token and its full delegation chain.
     pub fn validate(&self, token: &str) -> Result<ValidatedIdentity, IdentityError> {
-        let leaf = self.validate_single(token)?;
+        self.validate_inner(token, false)
+    }
+
+    /// Authenticate a holder revocation request, including an already-revoked
+    /// token or a token scheduled within the next maximum token lifetime.
+    /// Future activation is allowed only for revocation; it never grants access.
+    pub fn validate_for_revocation(&self, token: &str) -> Result<ValidatedIdentity, IdentityError> {
+        self.validate_inner(token, true)
+    }
+
+    fn validate_inner(&self, token: &str, for_revocation: bool) -> Result<ValidatedIdentity, IdentityError> {
+        let leaf = self.validate_single(token, for_revocation)?;
+        if !for_revocation {
+            self.check_not_revoked(&leaf)?;
+        }
+        let mut chain_tokens = vec![RevocationIdentity::from(&leaf)];
+
+        // Check act claim nesting depth against the same cap as parent_token
+        // chains. The total delegation depth = parent_token links + act nesting.
+        let mut act_depth = leaf.act.as_ref().map_or(0, |a| 1 + a.depth());
+        if act_depth > self.max_chain_depth {
+            return Err(IdentityError::ChainTooDeep(self.max_chain_depth));
+        }
+
         let mut depth = 0usize;
         let mut child = leaf.clone();
         let mut parent_token = leaf.parent_token.clone();
         while let Some(pt) = parent_token {
             depth += 1;
-            if depth > self.max_chain_depth {
+            let total = depth + act_depth;
+            if total > self.max_chain_depth {
                 return Err(IdentityError::ChainTooDeep(self.max_chain_depth));
             }
-            let parent = self.validate_single(&pt)?;
+            let parent = self.validate_single(&pt, for_revocation)?;
+            act_depth += parent.act.as_ref().map_or(0, |a| 1 + a.depth());
+            if depth + act_depth > self.max_chain_depth {
+                return Err(IdentityError::ChainTooDeep(self.max_chain_depth));
+            }
+            chain_tokens.push(RevocationIdentity::from(&parent));
+            // Revoking a delegator must cut off every token it delegated.
+            if !for_revocation {
+                self.check_not_revoked(&parent)?;
+            }
             // Scope inheritance: child ⊆ parent, with the SAME wildcard
             // semantics the harness's runtime authorization uses
             // (`av-harness::pipeline::scope_allows`). Do not use
@@ -513,10 +632,17 @@ impl IdentityValidator {
             parent_token = parent.parent_token.clone();
             child = parent;
         }
+        // For tokens with no parent_token chain, still check act depth alone.
+        if depth == 0 && act_depth > self.max_chain_depth {
+            return Err(IdentityError::ChainTooDeep(self.max_chain_depth));
+        }
+        let total = depth + act_depth;
         let now_s = av_core::time::now_ms() / av_core::units::MS_PER_SEC;
         Ok(ValidatedIdentity {
             ttl_remaining_s: leaf.exp.saturating_sub(now_s),
             chain_depth: depth,
+            chain_tokens,
+            total_delegation_depth: total,
             claims: leaf,
         })
     }
@@ -526,7 +652,7 @@ impl IdentityValidator {
     /// exp/aud/sub/iss required (+ `nbf` when present), `exp > iat`
     /// consistency, future-iat, TTL cap, field presence,
     /// bidi/zero-width spoofing guard, issuer allowlist (when configured).
-    fn validate_single(&self, token: &str) -> Result<NhiClaims, IdentityError> {
+    fn validate_single(&self, token: &str, for_revocation: bool) -> Result<NhiClaims, IdentityError> {
         // Reject oversized tokens up front so an unauthenticated caller
         // cannot amplify their pre-auth memory footprint through
         // `jsonwebtoken::decode_header`, which base64-decodes the
@@ -543,6 +669,14 @@ impl IdentityValidator {
         }
         let header =
             jsonwebtoken::decode_header(token).map_err(|e| IdentityError::Malformed(e.to_string()))?;
+        validate_jose_header(&header)?;
+        // Harness tool and intent credentials are separate profiles, even
+        // if an operator also registers the harness key in the IdP key set.
+        if matches!(header.typ.as_deref(), Some("av-tool+jwt" | "av-intent+jwt")) {
+            return Err(IdentityError::Verification(
+                "backend token profile is not an inbound identity".into(),
+            ));
+        }
         let kid = header.kid.ok_or(IdentityError::MissingKid)?;
         let keys = self.keys.read();
         let key = keys
@@ -575,7 +709,7 @@ impl IdentityValidator {
         validation.set_audience(std::slice::from_ref(&self.audience));
         validation.set_required_spec_claims(&["exp", "aud", "sub", "iss"]);
         validation.leeway = self.leeway_secs;
-        validation.validate_nbf = true;
+        validation.validate_nbf = !for_revocation;
 
         let data = jsonwebtoken::decode::<NhiClaims>(token, &decoding_key, &validation).map_err(|e| {
             // Round-107: on expiry, re-decode with the SAME key and
@@ -598,120 +732,8 @@ impl IdentityValidator {
         })?;
         let claims = data.claims;
 
-        if claims.exp <= claims.iat {
-            return Err(IdentityError::BadTimestamps {
-                iat: claims.iat,
-                exp: claims.exp,
-            });
-        }
         let now_s = av_core::time::now_ms() / av_core::units::MS_PER_SEC;
-        if claims.iat > now_s.saturating_add(self.leeway_secs) {
-            return Err(IdentityError::FutureIat {
-                iat: claims.iat,
-                now: now_s,
-            });
-        }
-        let ttl = claims.exp - claims.iat;
-        if ttl > MAX_TTL_SECS {
-            return Err(IdentityError::TtlTooLong(ttl));
-        }
-        if claims.instance_uid.is_empty() {
-            return Err(IdentityError::EmptyField("instance_uid"));
-        }
-        if claims.charter.is_empty() {
-            return Err(IdentityError::EmptyField("charter"));
-        }
-        if claims.version.is_empty() {
-            return Err(IdentityError::EmptyField("version"));
-        }
-        // docs/reference/LIMITS.md documents a 256-code-point charter cap
-        // ("longer are refused with 400"); the same reasoning applies to
-        // EVERY identity string that flows into logs, receipts, and
-        // event chains — an unbounded (up to the ~7 KiB per-claim JWT
-        // budget) attacker-chosen field is log-spam surface and — since
-        // instance_uid/version bind into every SIGNED receipt — bloats
-        // the JCS-canonicalized signing input on every request. Cap all
-        // identity strings at the same limit for one consistent rule.
-        // Threat model: an HMAC-shared-secret deployment where multiple
-        // principals hold the identity signing key. Any of them can
-        // construct a valid JWT with hostile-length claims.
-        const MAX_IDENTITY_STRING_CHARS: usize = 256;
-        // instance_uid has a TIGHTER cap than the other identity
-        // strings: it flows verbatim into `ai_agent.instance_uid` on
-        // every OCSF event and signed receipt, and the shipped schemas
-        // (ocsf-agent-event, receipt-v2) pin it at maxLength 128 —
-        // matching `av_core::InstanceUid::parse`. A 129–256-char uid
-        // admitted here would build events/receipts that Rust-side
-        // validation accepts but every external schema verifier (and
-        // the console ingest) refuses — the split-verdict class.
-        const MAX_INSTANCE_UID_CHARS: usize = 128;
-        if claims.instance_uid.chars().count() > MAX_INSTANCE_UID_CHARS {
-            return Err(IdentityError::FieldTooLong {
-                field: "instance_uid",
-                max: MAX_INSTANCE_UID_CHARS,
-            });
-        }
-        for (name, value) in [
-            ("instance_uid", claims.instance_uid.as_str()),
-            ("charter", claims.charter.as_str()),
-            ("version", claims.version.as_str()),
-            ("sub", claims.sub.as_str()),
-            ("iss", claims.iss.as_str()),
-            ("jti", claims.jti.as_str()),
-        ] {
-            if value.chars().count() > MAX_IDENTITY_STRING_CHARS {
-                return Err(IdentityError::FieldTooLong {
-                    field: name,
-                    max: MAX_IDENTITY_STRING_CHARS,
-                });
-            }
-        }
-        // Bound the scopes array too: an unbounded list (or an
-        // individually oversized scope) is the same log-spam / receipt-
-        // bloat vector as the strings above, and the delegation-chain
-        // subset check runs a per-element comparison so a 10000-entry
-        // scopes[] amplifies delegation-verification cost per request.
-        const MAX_SCOPES: usize = 64;
-        if claims.scopes.len() > MAX_SCOPES {
-            return Err(IdentityError::FieldTooLong {
-                field: "scopes",
-                max: MAX_SCOPES,
-            });
-        }
-        for scope in &claims.scopes {
-            if scope.chars().count() > MAX_IDENTITY_STRING_CHARS {
-                return Err(IdentityError::FieldTooLong {
-                    field: "scopes[]",
-                    max: MAX_IDENTITY_STRING_CHARS,
-                });
-            }
-        }
-        // Trojan-Source guard: any bidi override or zero-width character in
-        // a rendered identity field would spoof how it looks in operator
-        // logs, receipts, and event chains while remaining part of the raw
-        // bytes on the wire. Scopes must be guarded too — they are the
-        // most audit-prominent identity strings and were the only one
-        // omitted from the original list, an inconsistency that let a
-        // scope like `payout\u{202E}elbast` render as visually-corrupt
-        // junk in operator logs while still surviving the length cap and
-        // the scope-subset check on raw bytes.
-        for (name, value) in [
-            ("instance_uid", claims.instance_uid.as_str()),
-            ("charter", claims.charter.as_str()),
-            ("version", claims.version.as_str()),
-            ("sub", claims.sub.as_str()),
-            ("iss", claims.iss.as_str()),
-            ("jti", claims.jti.as_str()),
-        ] {
-            if av_core::text::contains_bidi_or_zero_width(value) {
-                return Err(IdentityError::SpoofingCharacter(name));
-            }
-        }
-        for scope in &claims.scopes {
-            if av_core::text::contains_bidi_or_zero_width(scope) {
-                return Err(IdentityError::SpoofingCharacter("scopes[]"));
-            }
-        }
+        validate_claim_fields(&claims, now_s, self.leeway_secs, for_revocation)?;
         if let Some(allowed) = &self.allowed_issuers {
             if !allowed.contains(&claims.iss) {
                 return Err(IdentityError::BadIssuer(claims.iss));
@@ -719,6 +741,214 @@ impl IdentityValidator {
         }
         Ok(claims)
     }
+}
+
+/// Neither credential profile implements JOSE extensions or unencoded payloads.
+/// jsonwebtoken parses these headers but does not enforce their semantics.
+pub(crate) fn validate_jose_header(header: &jsonwebtoken::Header) -> Result<(), IdentityError> {
+    if header.crit.is_some() || !matches!(header.extras.get::<bool>("b64"), Ok(None | Some(true))) {
+        return Err(IdentityError::Verification(
+            "unsupported critical JWT header or unencoded payload".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Structural checks shared by inbound and harness-issued tokens after signature verification.
+pub(crate) fn validate_claim_fields(
+    claims: &NhiClaims,
+    now_s: u64,
+    leeway_secs: u64,
+    for_revocation: bool,
+) -> Result<(), IdentityError> {
+    if claims.exp <= claims.iat {
+        return Err(IdentityError::BadTimestamps {
+            iat: claims.iat,
+            exp: claims.exp,
+        });
+    }
+    let future_bound = now_s
+        .saturating_add(leeway_secs)
+        .saturating_add(if for_revocation { MAX_TTL_SECS } else { 0 });
+    if claims.iat > future_bound || (for_revocation && claims.nbf.is_some_and(|nbf| nbf > future_bound)) {
+        return Err(IdentityError::FutureIat {
+            iat: claims.iat,
+            now: now_s,
+        });
+    }
+    let ttl = claims.exp - claims.iat;
+    if ttl > MAX_TTL_SECS {
+        return Err(IdentityError::TtlTooLong(ttl));
+    }
+    if claims.iss.is_empty() {
+        return Err(IdentityError::EmptyField("iss"));
+    }
+    if claims.sub.is_empty() {
+        return Err(IdentityError::EmptyField("sub"));
+    }
+    if claims.jti.is_empty() {
+        return Err(IdentityError::EmptyField("jti"));
+    }
+    if claims.instance_uid.is_empty() {
+        return Err(IdentityError::EmptyField("instance_uid"));
+    }
+    // Administrative revocation accepts these exact identifier constraints.
+    // Admitting a control-bearing identifier here would create credentials
+    // that the operator endpoint cannot name when responding to an incident.
+    for (field, value) in [
+        ("jti", claims.jti.as_str()),
+        ("instance_uid", claims.instance_uid.as_str()),
+    ] {
+        if value.trim().is_empty() {
+            return Err(IdentityError::EmptyField(field));
+        }
+        if value.chars().any(char::is_control) {
+            return Err(IdentityError::Malformed(format!(
+                "identity field {field} contains a control character"
+            )));
+        }
+    }
+    if claims.charter.is_empty() {
+        return Err(IdentityError::EmptyField("charter"));
+    }
+    if claims.version.is_empty() {
+        return Err(IdentityError::EmptyField("version"));
+    }
+    // docs/reference/LIMITS.md documents a 256-code-point charter cap
+    // ("longer are refused with 400"); the same reasoning applies to
+    // EVERY identity string that flows into logs, receipts, and
+    // event chains — an unbounded (up to the ~7 KiB per-claim JWT
+    // budget) attacker-chosen field is log-spam surface and — since
+    // instance_uid/version bind into every SIGNED receipt — bloats
+    // the JCS-canonicalized signing input on every request. Cap all
+    // identity strings at the same limit for one consistent rule.
+    // Threat model: an HMAC-shared-secret deployment where multiple
+    // principals hold the identity signing key. Any of them can
+    // construct a valid JWT with hostile-length claims.
+    // instance_uid has a TIGHTER cap than the other identity
+    // strings: it flows verbatim into `ai_agent.instance_uid` on
+    // every OCSF event and signed receipt, and the shipped schemas
+    // (ocsf-agent-event, receipt-v2) pin it at maxLength 128 —
+    // matching `av_core::InstanceUid::parse`. A 129–256-char uid
+    // admitted here would build events/receipts that Rust-side
+    // validation accepts but every external schema verifier (and
+    // the console ingest) refuses — the split-verdict class.
+    const MAX_INSTANCE_UID_CHARS: usize = 128;
+    if claims.instance_uid.chars().count() > MAX_INSTANCE_UID_CHARS {
+        return Err(IdentityError::FieldTooLong {
+            field: "instance_uid",
+            max: MAX_INSTANCE_UID_CHARS,
+        });
+    }
+    // azp: if present, must be non-empty and within length limits.
+    if let Some(azp) = &claims.azp {
+        if azp.is_empty() {
+            return Err(IdentityError::EmptyField("azp"));
+        }
+    }
+    // act: if present, each nested actor sub must be non-empty.
+    if let Some(act) = &claims.act {
+        validate_actor_chain(act)?;
+    }
+    let mut identity_fields: Vec<(&str, &str)> = vec![
+        ("instance_uid", claims.instance_uid.as_str()),
+        ("charter", claims.charter.as_str()),
+        ("version", claims.version.as_str()),
+        ("sub", claims.sub.as_str()),
+        ("iss", claims.iss.as_str()),
+        ("jti", claims.jti.as_str()),
+    ];
+    if let Some(azp) = &claims.azp {
+        identity_fields.push(("azp", azp.as_str()));
+    }
+    for (name, value) in &identity_fields {
+        if value.chars().count() > MAX_IDENTITY_STRING_CHARS {
+            return Err(IdentityError::FieldTooLong {
+                field: name,
+                max: MAX_IDENTITY_STRING_CHARS,
+            });
+        }
+    }
+    // Bound the scopes array too: an unbounded list (or an
+    // individually oversized scope) is the same log-spam / receipt-
+    // bloat vector as the strings above, and the delegation-chain
+    // subset check runs a per-element comparison so a 10000-entry
+    // scopes[] amplifies delegation-verification cost per request.
+    if claims.scopes.len() > MAX_SCOPES {
+        return Err(IdentityError::FieldTooLong {
+            field: "scopes",
+            max: MAX_SCOPES,
+        });
+    }
+    for scope in &claims.scopes {
+        // Scopes are emitted as a space-delimited OAuth scope string during
+        // exchange and introspection. One array entry must never become two
+        // permissions when a backend parses that representation.
+        if scope.is_empty() || scope.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return Err(IdentityError::Malformed(
+                "scope entries must be non-empty without whitespace or controls".into(),
+            ));
+        }
+        if scope.chars().count() > MAX_IDENTITY_STRING_CHARS {
+            return Err(IdentityError::FieldTooLong {
+                field: "scopes[]",
+                max: MAX_IDENTITY_STRING_CHARS,
+            });
+        }
+    }
+    // Trojan-Source guard: any bidi override or zero-width character in
+    // a rendered identity field would spoof how it looks in operator
+    // logs, receipts, and event chains while remaining part of the raw
+    // bytes on the wire. Scopes must be guarded too — they are the
+    // most audit-prominent identity strings and were the only one
+    // omitted from the original list, an inconsistency that let a
+    // scope like `payout\u{202E}elbast` render as visually-corrupt
+    // junk in operator logs while still surviving the length cap and
+    // the scope-subset check on raw bytes.
+    let mut bidi_fields: Vec<(&str, &str)> = vec![
+        ("instance_uid", claims.instance_uid.as_str()),
+        ("charter", claims.charter.as_str()),
+        ("version", claims.version.as_str()),
+        ("sub", claims.sub.as_str()),
+        ("iss", claims.iss.as_str()),
+        ("jti", claims.jti.as_str()),
+    ];
+    if let Some(azp) = &claims.azp {
+        bidi_fields.push(("azp", azp.as_str()));
+    }
+    for (name, value) in &bidi_fields {
+        if av_core::text::contains_bidi_or_zero_width(value) {
+            return Err(IdentityError::SpoofingCharacter(name));
+        }
+    }
+    for scope in &claims.scopes {
+        if av_core::text::contains_bidi_or_zero_width(scope) {
+            return Err(IdentityError::SpoofingCharacter("scopes[]"));
+        }
+    }
+    Ok(())
+}
+
+/// Validate every node in an actor claim chain: each `sub` must be non-empty
+/// and free of bidi/zero-width spoofing characters.
+fn validate_actor_chain(actor: &crate::claims::ActorClaim) -> Result<(), IdentityError> {
+    if actor.sub.is_empty() {
+        return Err(IdentityError::EmptyField("act.sub"));
+    }
+    if av_core::text::contains_bidi_or_zero_width(&actor.sub) {
+        return Err(IdentityError::SpoofingCharacter("act.sub"));
+    }
+    const MAX_IDENTITY_STRING_CHARS: usize = 256;
+    if actor.sub.chars().count() > MAX_IDENTITY_STRING_CHARS {
+        return Err(IdentityError::FieldTooLong {
+            field: "act.sub",
+            max: MAX_IDENTITY_STRING_CHARS,
+        });
+    }
+    if let Some(inner) = &actor.act {
+        validate_actor_chain(inner)?;
+    }
+    Ok(())
 }
 
 /// Return true if `scope` is authorized by any of the `parent_scopes`,

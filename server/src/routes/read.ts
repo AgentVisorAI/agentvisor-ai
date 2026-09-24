@@ -54,13 +54,8 @@ const TRUNC_SQL: Record<string, Prisma.Sql> = {
 };
 
 export async function readRoutes(app: FastifyInstance): Promise<void> {
-  // Fleet overview: aggregate stats over the ENTIRE org (not just the
-  // sliced window) + a recent-sessions preview for the dashboard.
-  //
-  // The COUNT(*) + SUM() queries below use the compound index
-  // (deploymentId, openedAt DESC) that Prisma creates for the
-  // deployment relation, so they stay O(log N) even at 100M+ rows. On
-  // Neon's free tier the whole /overview call is <50ms at 1M sessions.
+  // Fleet overview: aggregate all matching sessions in the selected
+  // time window, independently of the bounded recent-session preview.
   app.get("/overview", async (req, reply) => {
     const claims = requireSession(req, reply);
     if (!claims) return;
@@ -80,17 +75,34 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
       .safeParse(req.query);
     if (!query.success) return reply.code(400).send({ error: "invalid_query" });
 
+    // The cards and chart describe the same selected UTC bucket window.
+    // Lifetime sums under a "last 24 hours" heading overstate usage.
+    const spec = SERIES_SPECS[query.data.range as SeriesRange];
+    const nowMs = Date.now();
+    const windowStart = new Date(
+      Math.floor(nowMs / spec.bucketMs) * spec.bucketMs - (spec.count - 1) * spec.bucketMs,
+    );
+    const windowEnd = new Date(windowStart.getTime() + spec.count * spec.bucketMs);
+
     const deploymentFilter = query.data.deploymentId
       ? {
           orgId: claims.orgId,
           deploymentId: query.data.deploymentId,
         }
       : { orgId: claims.orgId };
+    const sessionFilter = {
+      ...deploymentFilter,
+      openedAt: { gte: windowStart, lt: windowEnd },
+    };
+    const fleetFilter = {
+      orgId: claims.orgId,
+      ...(query.data.deploymentId ? { id: query.data.deploymentId } : {}),
+    };
 
     // Recent sessions preview — bounded by `limit`, ORDER BY openedAt DESC.
     // Small window, small payload, index scan.
     const sessions = await db.session.findMany({
-      where: deploymentFilter,
+      where: sessionFilter,
       orderBy: { openedAt: "desc" },
       take: query.data.limit,
       select: {
@@ -108,22 +120,22 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
         toolsAllowed: true,
         toolsBlocked: true,
         stopReason: true,
+        _count: { select: { events: true } },
         deployment: { select: { id: true, name: true, environment: true } },
       },
     });
 
-    // Real aggregates over the whole org (or the whole deployment if
-    // deploymentId was passed) — not the sliced window. These are cheap
-    // index scans on Postgres; a groupBy avoids the O(N) hydration cost
-    // of pulling every row into JS.
-    const [countByStatus, sums] = await Promise.all([
+    // Aggregate in Postgres rather than hydrating every matching row
+    // into JavaScript. The selected window and tenant constrain each
+    // scan, while fleet counts include deployments without sessions.
+    const [countByStatus, sums, deploymentCount, connectedDeploymentCount] = await Promise.all([
       db.session.groupBy({
         by: ["status"],
-        where: deploymentFilter,
+        where: sessionFilter,
         _count: { _all: true },
       }),
       db.session.aggregate({
-        where: deploymentFilter,
+        where: sessionFilter,
         _sum: {
           costUsdMicros: true,
           toolsAllowed: true,
@@ -131,6 +143,10 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
           blockedPayoutUsdMicros: true,
         },
         _count: { _all: true },
+      }),
+      db.deployment.count({ where: fleetFilter }),
+      db.deployment.count({
+        where: { ...fleetFilter, lastIngestAt: { gte: new Date(nowMs - 5 * 60_000) } },
       }),
     ]);
 
@@ -142,17 +158,11 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
     // index path) so the payload stays a fixed `count` rows regardless
     // of fleet size. Empty buckets are zero-filled here — the SPA
     // renders a fixed-width bar chart and must not have to guess gaps.
-    const spec = SERIES_SPECS[query.data.range as SeriesRange];
-    const nowMs = Date.now();
-    const windowStart = new Date(
-      Math.floor(nowMs / spec.bucketMs) * spec.bucketMs - (spec.count - 1) * spec.bucketMs,
-    );
     // Exclusive upper bound (end of the current bucket). `openedAt` is
     // client-supplied (z.coerce.date in ingest), so a skewed or hostile
     // daemon can insert future-dated rows — without this bound the scan
     // aggregates them into buckets the series builder then discards,
     // unbounded I/O for rows that can never render.
-    const windowEnd = new Date(windowStart.getTime() + spec.count * spec.bucketMs);
     const rows = await db.$queryRaw<
       Array<{ bucket: Date; allowed: bigint; blocked: bigint; cost: bigint; blockedpayout: bigint }>
     >(Prisma.sql`
@@ -188,6 +198,8 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
       };
     });
     const stats = {
+      deployments: deploymentCount,
+      deploymentsHealthy: connectedDeploymentCount,
       sessions: sums._count._all,
       live: byStatus["live"] ?? 0,
       sealed: byStatus["sealed"] ?? 0,
@@ -212,6 +224,7 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
     return reply.send({
       sessions: sessions.map((s) => ({
         ...s,
+        eventCount: s._count.events,
         costUsdMicros: isMember ? "0" : s.costUsdMicros.toString(),
         payoutUsdMicros: isMember ? "0" : s.payoutUsdMicros.toString(),
         blockedPayoutUsdMicros: isMember ? "0" : s.blockedPayoutUsdMicros.toString(),
@@ -353,6 +366,7 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
           toolsAllowed: true,
           toolsBlocked: true,
           stopReason: true,
+          _count: { select: { events: true } },
           deployment: { select: { id: true, name: true, environment: true } },
         },
       });
@@ -377,6 +391,7 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
     return reply.send({
       sessions: page.map((s) => ({
         ...s,
+        eventCount: s._count.events,
         costUsdMicros: isMemberList ? "0" : s.costUsdMicros.toString(),
         payoutUsdMicros: isMemberList ? "0" : s.payoutUsdMicros.toString(),
         blockedPayoutUsdMicros: isMemberList ? "0" : s.blockedPayoutUsdMicros.toString(),
@@ -420,6 +435,7 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
         orgId: claims.orgId,
       },
       include: {
+        _count: { select: { events: true } },
         deployment: { select: { id: true, name: true, environment: true } },
         events: {
           where: query.data.eventCursor !== undefined
@@ -464,6 +480,7 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
       session: {
         ...session,
         events: displayedEvents,
+        eventCount: session._count.events,
         // R114 F3: redact spend counters for members matching
         // /overview and /sessions LIST posture.
         costUsdMicros: isMember ? "0" : session.costUsdMicros.toString(),

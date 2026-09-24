@@ -72,9 +72,9 @@ RestartSec=2
 # Round-18 F3 (budget corrected this round): give the daemon room
 # for its FULL worst-case shutdown. The old comment assumed a 30 s
 # HTTP drain, but the drain phase is
-# `max(30, upstream_read_timeout_s + 5)` and the default
-# upstream_read_timeout_s is 60 — the `avctl init` template writes
-# neither key — so the real default budget is
+# `max(30, max(upstream_read_timeout_s, mcp_request_timeout_s) + 5)`.
+# Both network settings default to 60 s when unset; the `avctl init`
+# template leaves them unset, so the real default budget is
 # 65 s drain + 30 s worker wait_idle + 30 s finalize_sessions
 # + 5 s telemetry flush = 130 s, ABOVE the previous 125 s: a
 # `systemctl restart` SIGKILLed the daemon mid-finalize, dropping

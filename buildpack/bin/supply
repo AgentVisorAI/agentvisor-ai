@@ -1,0 +1,26 @@
+#!/bin/sh
+# CF classic: supply BUILD_DIR CACHE_DIR DEPS_DIR DEPS_IDX.
+set -eu
+[ "$#" -eq 4 ] || { printf 'usage: supply BUILD_DIR CACHE_DIR DEPS_DIR DEPS_IDX\n' >&2; exit 1; }
+case "$4" in ''|*[!0-9]*) printf 'error: DEPS_IDX must be an integer\n' >&2; exit 1;; esac
+buildpack_dir=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+# shellcheck source=buildpack/lib/binding.sh
+. "$buildpack_dir/lib/binding.sh"
+binding=$(read_binding)
+[ "$binding" != null ] || { printf 'error: no agentvisor binding found\n' >&2; exit 1; }
+profile_dir=$3/$4/profile.d
+mkdir -p "$profile_dir"
+# Single quotes and literal newlines cannot escape the generated assignments.
+escape_sq() { printf '%s' "$1" | sed "s/'/'\\\\''/g"; }
+{
+    printf '#!/bin/sh\n# AgentVisor connection metadata; the application must consume these variables.\n'
+    for pair in AV_GATEWAY_URL:gateway_url AV_AUDIENCE:audience AV_IDENTITY_JWKS_URL:identity_jwks_url; do
+        name=${pair%%:*}
+        key=${pair#*:}
+        value=$(printf '%s' "$binding" | jq -r --arg key "$key" '.[$key] // empty')
+        # Export an empty optional value to avoid retaining a previous binding.
+        printf "export %s='%s'\n" "$name" "$(escape_sq "$value")"
+    done
+} > "$profile_dir/agentvisor.sh"
+chmod 644 "$profile_dir/agentvisor.sh"
+printf 'agentvisor: wrote %s\n' "$profile_dir/agentvisor.sh"

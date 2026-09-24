@@ -8,20 +8,19 @@
  *   1. boots agentvisord with scripted LLM + tool mocks (same shapes as
  *      scripts/demo-agent.mjs),
  *   2. runs an allowed call and a BLOCKED $8,400 call in session S,
- *   3. SIGKILLs the daemon (no shutdown hooks, no flush opportunity),
+ *   3. holds another request upstream and SIGKILLs the daemon,
  *   4. restarts it on the SAME config/spool/bridge dirs,
  *   5. finishes the story (allowed $84, close → signed receipt),
- *   6. optionally console-syncs spool+bridge and asserts the PRE-CRASH
- *      blocked call is present in what landed — the crash must not
- *      have eaten the evidence.
+ *   6. optionally console-syncs spool+bridge and verifies that incomplete
+ *      evidence is explicitly quarantined without a complete receipt.
  *
  * Durability invariants asserted (resume semantics are NOT pinned —
  * a restarted daemon may open a fresh internal session for S):
  *   A. restart on a crashed spool succeeds (no corruption refusal)
  *   B. post-restart calls enforce + seal + sign exactly like before
  *   C. console-sync ingests without failures
- *   D. across ALL synced sessions: blocked ≥ 1 (pre-crash evidence)
- *      and allowed ≥ 2 (pre- + post-crash)
+ *   D. the console distinguishes incomplete pre-crash evidence from the
+ *      separately sealed, complete post-restart session
  *
  * Usage:
  *   node scripts/crash-drill.mjs                     # steps 1-5 only
@@ -40,13 +39,16 @@ const LLM_PORT = PORT_BASE;
 const TOOL_PORT = PORT_BASE + 1;
 const DAEMON_PORT = PORT_BASE + 2;
 const repoRoot = new URL("..", import.meta.url).pathname;
-const daemonBin = [join(repoRoot, "target/release/agentvisord"), join(repoRoot, "target/debug/agentvisord")].find(existsSync);
-const avctlBin = [join(repoRoot, "target/release/avctl"), join(repoRoot, "target/debug/avctl")].find(existsSync);
+const daemonBin = process.env.AGENTVISORD ?? [join(repoRoot, "target/release/agentvisord"), join(repoRoot, "target/debug/agentvisord")].find(existsSync);
+const avctlBin = process.env.AVCTL ?? [join(repoRoot, "target/release/avctl"), join(repoRoot, "target/debug/avctl")].find(existsSync);
 if (!daemonBin) {
   console.error("build first: cargo build --release -p av-harness");
   process.exit(2);
 }
 
+const fetch = (input, init = {}) => globalThis.fetch(input, {
+  ...init, signal: init.signal ?? AbortSignal.timeout(15000),
+});
 let failures = 0;
 const beat = (ok, label, extra = "") => {
   if (!ok) failures++;
@@ -55,6 +57,9 @@ const beat = (ok, label, extra = "") => {
 
 // Scripted LLM: same tool-call shapes as demo-agent, indexed by turn.
 let llmTurn = 0;
+let holdNextChat = false;
+let heldChat;
+const upstreamHeld = new Promise((resolve) => { heldChat = resolve; });
 const SCRIPT = [
   { tool: "search_inventory", args: { sku: "NW-1240" } },
   { tool: "create_purchase_order", args: { vendor: "Apex Supply Co", amount_usd: 8400 } },
@@ -64,6 +69,11 @@ const SCRIPT = [
 const llmSrv = createServer((req, res) => {
   req.on("data", () => {});
   req.on("end", () => {
+    if (holdNextChat) {
+      holdNextChat = false;
+      heldChat();
+      return; // Keep the admitted request incomplete until SIGKILL.
+    }
     const step = SCRIPT[Math.min(llmTurn, SCRIPT.length - 1)];
     llmTurn++;
     const message = step.tool
@@ -101,9 +111,13 @@ max_payout_usd_micros = 500000000
 
 const daemonUrl = `http://127.0.0.1:${DAEMON_PORT}`;
 let SESSION = "crash-" + Date.now().toString(36);
+const crashedSession = SESSION;
 
 function startDaemon() {
-  const d = spawn(daemonBin, ["--config", configPath], { stdio: ["ignore", "pipe", "pipe"] });
+  const d = spawn(daemonBin, ["--config", configPath], {
+    stdio: ["ignore", "pipe", "pipe"],
+    env: { ...process.env, AV_SIGNING_SEED_FILE: join(workDir, "signing.seed") },
+  });
   let log = "";
   d.stdout.on("data", (c) => (log += c));
   d.stderr.on("data", (c) => (log += c));
@@ -138,8 +152,18 @@ function spoolFiles() {
 }
 
 let daemon;
-const shutdown = (code) => {
-  try { if (daemon?.proc && daemon.proc.exitCode === null) daemon.proc.kill(); } catch { /* gone */ }
+const shutdown = async (code) => {
+  const child = daemon?.proc;
+  if (child && child.exitCode === null && child.signalCode === null) {
+    child.kill("SIGTERM");
+    await Promise.race([
+      new Promise((resolve) => child.once("exit", resolve)),
+      new Promise((resolve) => setTimeout(resolve, 5000)),
+    ]);
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+  }
+  llmSrv.closeAllConnections();
+  toolSrv.closeAllConnections();
   llmSrv.close();
   toolSrv.close();
   process.exit(code);
@@ -151,7 +175,13 @@ const main = async () => {
   await new Promise((r) => toolSrv.listen(TOOL_PORT, "127.0.0.1", r));
 
   daemon = startDaemon();
-  beat(await waitHealthy(), "boot: daemon healthy", `pid ${daemon.proc.pid}`);
+  const booted = await waitHealthy();
+  beat(booted, "boot: daemon healthy", `pid ${daemon.proc.pid}`);
+  if (!booted) {
+    const logPath = join(workDir, "daemon-boot.log");
+    writeFileSync(logPath, daemon.log(), { mode: 0o600 });
+    throw new Error(`Daemon did not become healthy within 15 seconds. Log: ${logPath}\n${daemon.log().slice(-4000)}`);
+  }
 
   // Pre-crash story: one allowed, one BLOCKED.
   const t1 = await chat("restock");
@@ -162,8 +192,20 @@ const main = async () => {
   const preFiles = spoolFiles();
   beat(preFiles.length > 0, "pre-crash: spool has persisted frames", `${preFiles.length} file(s)`);
 
+  // Make the crash point deterministic: admission has reached the upstream,
+  // while its response and response-capture completion cannot have happened.
+  holdNextChat = true;
+  const interruptedChat = chat("hold until crash").catch(() => null);
+  await Promise.race([
+    upstreamHeld,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("pending request did not reach upstream")), 5000)),
+  ]);
+  beat(true, "pre-crash: admitted request is still awaiting its response");
+
   // The worst moment: SIGKILL. No flush, no shutdown handler.
   process.kill(daemon.proc.pid, "SIGKILL");
+  await interruptedChat;
+  llmSrv.closeAllConnections();
   await new Promise((r) => setTimeout(r, 600));
   const deadNow = !(await fetch(`${daemonUrl}/health`).then((r) => r.ok).catch(() => false));
   beat(deadNow, "SIGKILL delivered, daemon dead");
@@ -211,37 +253,33 @@ const main = async () => {
     let stats = {};
     try { stats = JSON.parse(syncOut.trim().split("\n").pop()); } catch { /* shape drift */ }
     beat(stats.failed === 0 && (stats.succeeded ?? 0) > 0, "C: console-sync ingests with zero failures", syncOut.trim().split("\n").pop());
-    // D: pre-crash evidence visibility. KNOWN GAP — see issue #356
-    // (incl. the correction comment): recovery QUARANTINES crash-
-    // interrupted sessions deliberately (capture may be incomplete —
-    // effects that ran but weren't journaled; attesting that would be
-    // worse than attesting nothing), so no receipt is ever minted and
-    // the MAC'd spool can't be synced by avctl (journal_key-
-    // authenticated — spool reads are not console-trustable). The
-    // console therefore shows the crashed session's PRE-CRASH bridge
-    // flushes only (here: allowed calls, NOT the blocked one) with no
-    // quarantine marker — actively misleading. The ask in #356 is a
-    // synced `quarantined_crash_evidence` session status. This leg
-    // WARNS until that lands, then flips fatal.
+    // D: partial evidence must have an explicit terminal quarantine status.
+    // A private crash journal cannot justify a complete signed receipt.
     const jar = process.env.COOKIE_JAR;
-    if (jar) {
-      const cookie = readFileSync(jar, "utf8").split("\n").filter((l) => l.includes("av_session")).map((l) => "av_session=" + l.trim().split(/\s+/).pop()).pop() ?? "";
-      const sess = await fetch(`${CONSOLE_URL}/api/v1/sessions?limit=20`, { headers: { cookie } }).then((r) => r.json());
-      const totals = (sess.sessions ?? []).reduce((a, s) => ({ allowed: a.allowed + (s.toolsAllowed ?? 0), blocked: a.blocked + (s.toolsBlocked ?? 0) }), { allowed: 0, blocked: 0 });
-      if (totals.blocked >= 1) {
-        beat(true, "D: pre-crash BLOCKED call survived into the console (gap FIXED — make this leg fatal)", JSON.stringify(totals));
-      } else {
-        console.log(`  ⚠️  D (known gap): pre-crash BLOCKED call missing from the console — ${JSON.stringify(totals)}`);
-        console.log("      evidence IS in the ATIF spool; recovery does not replay it (see crash-recovery issue)");
-      }
+    if (!jar) {
+      beat(false, "D: console verification requires COOKIE_JAR");
     } else {
-      console.log("  (D skipped — set COOKIE_JAR to an owner session jar)");
+      const cookie = readFileSync(jar, "utf8").split("\n").filter((line) => line.includes("av_session"))
+        .map((line) => "av_session=" + line.trim().split(/\s+/).pop()).pop() ?? "";
+      const response = await fetch(`${CONSOLE_URL}/api/v1/sessions?q=${encodeURIComponent(crashedSession)}&limit=20`, { headers: { cookie } });
+      beat(response.ok, "D: console session query succeeds");
+      const sessions = await response.json();
+      const quarantined = (sessions.sessions ?? []).find((session) => session.externalId === crashedSession);
+      beat(quarantined?.status === "quarantined_crash_evidence",
+        "D: pre-crash session is explicitly quarantined in the console");
+      if (quarantined) {
+        const detail = await fetch(`${CONSOLE_URL}/api/v1/sessions/${quarantined.id}`, { headers: { cookie } }).then((r) => r.json());
+        const session = detail.session ?? detail;
+        beat(!session.receipt, "D: incomplete capture has no signed receipt");
+      }
+      const recovered = (sessions.sessions ?? []).find((session) => session.externalId === SESSION);
+      beat(recovered?.status === "sealed", "D: complete post-restart session is sealed separately");
     }
   }
 
   console.log("");
-  console.log(failures === 0 ? "✅  crash drill: all invariants hold" : `❌  crash drill: ${failures} failure(s)`);
-  shutdown(failures === 0 ? 0 : 1);
+  console.log(failures === 0 ? (process.env.CONSOLE_URL ? "✅  crash drill: daemon and console invariants hold" : "✅  crash drill: daemon checks pass; console synchronization was not tested") : `❌  crash drill: ${failures} failure(s)`);
+  await shutdown(failures === 0 ? 0 : 1);
 };
 
 main().catch((err) => { console.error(err); shutdown(1); });

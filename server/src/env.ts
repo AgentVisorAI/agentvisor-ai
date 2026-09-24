@@ -1,6 +1,7 @@
 import { config } from "dotenv";
 import { z } from "zod";
 import crypto from "node:crypto";
+import { normalizeDatabaseUrl } from "../database-url.mjs";
 
 config();
 
@@ -8,22 +9,19 @@ config();
 // names. Normalizing here means the same code deploys with zero config
 // tweaks anywhere. Priority order: explicit DATABASE_URL wins, then the
 // provider-native names in order of specificity.
-if (!process.env.DATABASE_URL) {
-  const aliases = [
-    "POSTGRES_URL",         // Vercel Postgres, Vercel-linked Neon
-    "POSTGRES_PRISMA_URL",  // Vercel (pooled — Prisma preference)
-    "NETLIFY_DATABASE_URL", // Netlify Postgres
-    "NEON_DATABASE_URL",    // Neon Vercel integration
-    "PG_URL",               // ad-hoc
-    "PGURL",                // libpq convention
-    "DATABASE_URL_POOLED",  // Fly Postgres pooler
-  ];
-  for (const name of aliases) {
-    const val = process.env[name];
-    if (val && typeof val === "string") {
-      process.env.DATABASE_URL = val;
-      break;
-    }
+normalizeDatabaseUrl(process.env);
+
+function validPublicBaseUrl(value: string): boolean {
+  // These values receive appended paths and queries. Existing credentials,
+  // query strings, or fragments would change the destination of those links.
+  if (!/^https?:\/\//i.test(value) || /[\u0000-\u0020\u007f?#]/.test(value)) return false;
+  try {
+    const url = new URL(value);
+    return Boolean(url.hostname) && !url.username && !url.password
+      && (url.protocol === "https:"
+        || (process.env.NODE_ENV !== "production" && url.protocol === "http:"));
+  } catch {
+    return false;
   }
 }
 
@@ -280,20 +278,8 @@ const Env = z.object({
   APP_BASE_URL: z
     .string()
     .default("http://localhost:8787")
-    .refine(
-      (v) => {
-        if (process.env.NODE_ENV !== "production") return true;
-        // Production requires an explicit non-default value on
-        // https://. Reject the localhost default and any http://
-        // URL (a real deployment always has TLS; the R105 F2
-        // HTTPS-force hook at index.ts:223 would 400 every
-        // request otherwise, but reset/invite email links are
-        // baked in at send-time and don't go through that hook).
-        if (v === "http://localhost:8787") return false;
-        if (v.startsWith("http://")) return false;
-        return true;
-      },
-      "APP_BASE_URL must be an https:// URL in production; the localhost default is unsafe for reset-links, invite-links, OAuth redirect_uri, and WebAuthn rpID.",
+    .refine(validPublicBaseUrl,
+      "APP_BASE_URL must be an absolute HTTP(S) URL without credentials, query, or fragment; production requires HTTPS.",
     ),
   // Public base URL of THIS API when it lives on a different origin
   // than the console (Pages at agentvisorai.me, API at
@@ -307,13 +293,8 @@ const Env = z.object({
   API_PUBLIC_URL: z
     .string()
     .default("")
-    .refine(
-      (v) => {
-        if (v === "") return true;
-        if (process.env.NODE_ENV !== "production") return true;
-        return !v.startsWith("http://");
-      },
-      "API_PUBLIC_URL must be an https:// URL in production (or unset to fall back to APP_BASE_URL).",
+    .refine((v) => v === "" || validPublicBaseUrl(v),
+      "API_PUBLIC_URL must be an absolute HTTP(S) URL without credentials, query, or fragment; production requires HTTPS. Leave it unset to use APP_BASE_URL.",
     ),
   // OIDC providers. All optional — the login page only shows a
   // provider button when the corresponding client-id is set.

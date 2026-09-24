@@ -542,16 +542,18 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         );
         return reply.send({ ok: true, message: "api_key_session_no_cookie_to_clear" });
       }
-      await db.user
-        .update({
+      try {
+        await db.user.update({
           where: { id: req.session.sub },
           data: { sessionRevokedAt: new Date() },
-        })
-        .catch((err) => {
-          // Log but don't fail logout — clearing the cookie is the
-          // essential piece; the fence bump is defense in depth.
-          req.log.warn({ err }, "logout_revoke_bump_failed");
         });
+      } catch (err) {
+        // The database fence is what revokes captured cookies on every
+        // instance. Keep this cookie so the caller can retry, and do not
+        // claim a successful logout or write its success audit yet.
+        req.log.error({ err }, "logout_revoke_bump_failed");
+        return reply.code(503).send({ error: "session_revocation_unavailable" });
+      }
       writeAudit(
         {
           orgId: req.session.orgId,
@@ -1743,10 +1745,13 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         if (!user) return;
         const plaintextToken = randomToken(32);
         const resetTokenHash = await hashPassword(plaintextToken);
-        await db.user.update({
-          where: { id: user.id },
+        const updated = await db.user.updateMany({
+          // Hashing yields to concurrent account changes. Never install a
+          // token for the former mailbox after an email change cleared it.
+          where: { id: user.id, email: user.email },
           data: { resetTokenHash, resetTokenAt: new Date() },
         });
+        if (updated.count === 0) return;
         // R136 F3: forensic breadcrumb — R135 F1 wired the
         // /reset-confirm audit; the /reset-request counterpart was
         // reserved in audit.ts:13 docstring (auth.reset_request)

@@ -1,54 +1,41 @@
 # Nightly Postgres backup — off-provider escape hatch.
 #
-# Why this exists
-#   Neon (and every other managed PG we might use) already has PITR +
-#   snapshots. This workflow adds a SECOND, off-provider copy so we can
-#   restore even if the primary provider vanishes overnight — same
-#   guarantee that keeps the whole stack unlocked from any single vendor.
-#
-#   The dump is standard `pg_dump --format=custom`, restorable to any
-#   Postgres-compatible target with `pg_restore`. No proprietary format,
-#   no proprietary tool.
-#
-# Retention
-#   30 days on GitHub-hosted artifact storage (free for public repos).
-#   Longer horizons should push to S3 / R2 / any object store.
+# Purpose and retention
+#   This adds an encrypted copy outside the database provider. Recovery
+#   still requires access to GitHub artifacts, the vaulted passphrase,
+#   and a compatible target. Provider snapshots/PITR are separate controls.
+#   The custom pg_dump archive uses standard PostgreSQL tools.
+#   Artifacts are retained for 30 days; longer retention needs a separately
+#   configured destination and a tested retrieval path. Storage charges
+#   depend on the repository's plan and usage.
 #
 # Configuration
-#   Requires a repository secret `BACKUP_DATABASE_URL` pointing at a
-#   read-only replica or the primary, AND `BACKUP_PASSPHRASE` to
-#   encrypt the dump (gpg AES-256) before upload. If neither is set
-#   the job is a no-op (fork-friendly). If the database URL is set
-#   without a passphrase the job FAILS: this repository is public,
-#   and artifacts on public repos are downloadable by any GitHub
-#   user — uploading a plaintext production dump (password hashes,
-#   API keys, webhook secrets, PII) would publish the database.
+#   Set repository secrets BACKUP_DATABASE_URL and BACKUP_PASSPHRASE.
+#   A missing database URL skips the job. A configured URL without a
+#   passphrase fails. Only verified ciphertext is uploaded, regardless of
+#   repository visibility; a plaintext archive can contain credentials
+#   and captured personal data.
 #
-# Restore  (drilled end-to-end 2026-09-07 against a live prod dump)
-#   gpg --batch --passphrase-file <vaulted-passphrase> \
-#       --decrypt agentvisor-<ts>.dump.gpg > agentvisor-<ts>.dump
-#   pg_restore --no-owner --dbname "$TARGET_URL" agentvisor-<ts>.dump
+# Restore
+#   Follow docs/RUNBOOK.md's isolated restore procedure. Use PostgreSQL 18
+#   pg_restore against a separate empty PostgreSQL 18 database. The example
+#   uses private PGSERVICEFILE/PGPASSFILE files and --dbname=service=...,
+#   never a password-bearing URI in process arguments. It decrypts into
+#   a private temporary directory and removes plaintext on exit.
+#   Require --single-transaction --exit-on-error; do not ignore errors
+#   from an older server or restore client. These checks do not establish
+#   compatibility with older PostgreSQL major versions.
 #
-#   Two gotchas that WILL bite during a real incident:
-#   - The passphrase is a WRITE-ONLY GitHub secret. If it is not also
-#     stored in a vault a human can read, every artifact is ciphertext
-#     forever (this happened: all dumps 2026-09-06→07 are unrecoverable
-#     after the original passphrase was lost with a session; rotated
-#     2026-09-07, current passphrase vaulted off-GitHub).
-#   - pg_dump 18 emits archive format 1.16 — pg_restore < 18 refuses it
-#     ("unsupported version (1.16) in file header"). Restore with a
-#     matching client, e.g.:
-#       docker run --rm -v "$PWD:/w" postgres:18-alpine \
-#         pg_restore --no-owner --dbname "$TARGET_URL" /w/<dump>
-#     (one ignorable error against older SERVERS: SET transaction_timeout
-#     is unknown before PG 17 — pg_restore reports "errors ignored: 1".)
+#   Keep the passphrase in an accessible vault outside GitHub: repository
+#   secrets cannot be read back for recovery. The current isolated drill
+#   verifies encryption and restoration but does not retrieve production
+#   artifacts or verify access to the production vault.
 name: Nightly PG backup
 
 on:
   schedule:
-    # 04:17 UTC — off the top-of-hour rush that free-tier providers
-    # sometimes throttle. Cron in GitHub Actions is best-effort but
-    # very reliable for once-a-day cadence.
+    # 04:17 UTC avoids the top of the hour. Scheduled Actions are
+    # best-effort; monitor backup freshness separately.
     - cron: "17 4 * * *"
   workflow_dispatch: {}
 
@@ -58,6 +45,7 @@ permissions:
 jobs:
   backup:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - name: Guard on BACKUP_DATABASE_URL
         id: guard
@@ -77,6 +65,11 @@ jobs:
             echo "run=true" >> "$GITHUB_OUTPUT"
           fi
 
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.guard.outputs.run == 'true'
+        with:
+          persist-credentials: false
+
       - name: Install postgres-client-18
         if: steps.guard.outputs.run == 'true'
         run: |
@@ -91,42 +84,35 @@ jobs:
           # version mismatch") — client 16 broke the very first real run.
           sudo apt-get install -y --no-install-recommends postgresql-client-18
 
-      - name: pg_dump (custom format, compressed, encrypted)
+      - name: Create and verify encrypted archive
+        id: archive
         if: steps.guard.outputs.run == 'true'
         env:
-          DATABASE_URL: ${{ secrets.BACKUP_DATABASE_URL }}
+          BACKUP_DATABASE_URL: ${{ secrets.BACKUP_DATABASE_URL }}
           BACKUP_PASSPHRASE: ${{ secrets.BACKUP_PASSPHRASE }}
         run: |
-          ts=$(date -u +%Y%m%d-%H%M)
-          out="agentvisor-${ts}.dump"
-          # The runner PREINSTALLS postgresql-client-16 and Debian's
-          # pg_wrapper keeps /usr/bin/pg_dump pointing at it even after
-          # client-18 lands — the previous fix installed 18 but still
-          # executed 16.15. Call the versioned binary directly.
-          /usr/lib/postgresql/18/bin/pg_dump \
-            --format=custom \
-            --compress=9 \
-            --no-owner \
-            --no-privileges \
-            --file "$out" \
-            "$DATABASE_URL"
-          # Encrypt before upload: artifacts on this PUBLIC repo are
-          # downloadable by any GitHub user, so the plaintext dump
-          # must never leave the runner. gpg ships on ubuntu runners.
-          gpg --batch --symmetric --cipher-algo AES256 \
-            --pinentry-mode loopback --passphrase "$BACKUP_PASSPHRASE" \
-            --output "$out.gpg" "$out"
-          rm -f "$out"
-          # Show size + a short manifest so the artifact is greppable.
-          ls -lh "$out.gpg"
-          echo "BACKUP_FILE=$out.gpg" >> "$GITHUB_ENV"
+          umask 077
+          # Versioned clients avoid Debian's pg_wrapper selecting an older client.
+          python3 scripts/postgres-backup.py \
+            --pg-dump /usr/lib/postgresql/18/bin/pg_dump \
+            --pg-restore /usr/lib/postgresql/18/bin/pg_restore \
+            --output-dir "$RUNNER_TEMP/agentvisor-backup" \
+            --timeout-seconds 900 > "$RUNNER_TEMP/backup-manifest.json"
+          python3 - <<'PYTHON'
+          import json, os
+          from pathlib import Path
+          result = json.loads((Path(os.environ['RUNNER_TEMP']) / 'backup-manifest.json').read_text())
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('file=' + result['file'] + '\n')
+          print('Verified encrypted backup:', result['bytes'], 'bytes; SHA-256:', result['sha256'])
+          PYTHON
 
       - name: Upload backup artifact (30-day retention)
         if: steps.guard.outputs.run == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: pg-backup-${{ github.run_id }}
-          path: ${{ env.BACKUP_FILE }}
+          path: ${{ steps.archive.outputs.file }}
           retention-days: 30
           if-no-files-found: error
           # Compression level 0 — pg_dump already used gzip -9 internally.

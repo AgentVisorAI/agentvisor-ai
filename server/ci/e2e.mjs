@@ -12,7 +12,15 @@ globalThis.fetch = async (url, opts={}) => {
   opts.headers = { ...(opts.headers||{}) };
   const cookieHeader = Object.entries(cookies).map(([k,v])=>`${k}=${v}`).join("; ");
   if (cookieHeader) opts.headers.Cookie = cookieHeader;
-  const res = await origFetch(url, opts);
+  let res = await origFetch(url, opts);
+  // The smoke suite and this suite share one per-IP signup budget.
+  // A 429 prevents the operation, so one Retry-After retry is safe.
+  if (res.status === 429) {
+    const seconds = Math.min(61, Math.max(1, Number(res.headers.get("retry-after")) || 60));
+    await res.arrayBuffer();
+    await new Promise((resolve) => setTimeout(resolve, (seconds + 1) * 1000));
+    res = await origFetch(url, opts);
+  }
   const setCookie = res.headers.getSetCookie ? res.headers.getSetCookie() : [res.headers.get("set-cookie")].filter(Boolean);
   for (const c of setCookie) {
     const [pair] = c.split(";");
@@ -26,6 +34,7 @@ const src = readFileSync(datasourcePath, "utf8");
 // API_BASE override lets the suite run against any port — the default
 // stays the CI convention. (Shared dev machines: 8985 can be taken.)
 const API_BASE = process.env.API_BASE ?? "http://127.0.0.1:8985";
+const SPA_ORIGIN = process.env.SPA_ORIGIN ?? "http://127.0.0.1:8787";
 globalThis.window = { MOCK_MODE: false, API_BASE };
 new Function(src)();
 const ds = globalThis.window.dataSource;
@@ -61,7 +70,7 @@ try {
       for (let attempt = 0; ; attempt++) {
         const r = await origFetch(`${API_BASE}${path}`, {
           method: "POST",
-          headers: { "Content-Type": "application/json", Origin: "http://127.0.0.1:8787" },
+          headers: { "Content-Type": "application/json", Origin: SPA_ORIGIN },
           body: JSON.stringify(body),
         });
         if (r.status === 429 && attempt === 0) {
@@ -91,6 +100,9 @@ try {
   check("normalized dep has environment", deps[0].environment === "production");
   check("normalized dep has ingestTokenHint", !!deps[0].ingestTokenHint, deps[0].ingestTokenHint);
   check("normalized dep has status", !!deps[0].status, deps[0].status);
+  const emptyFleet = await ds.getOverview();
+  check("overview counts deployments before first session", emptyFleet.deployments === 1 && emptyFleet.sessions === 0);
+  check("deployment without ingest is not healthy", emptyFleet.deploymentsHealthy === 0);
 
   // Ingest session
   const openedAt = new Date().toISOString();
@@ -136,6 +148,13 @@ try {
     { sessionExternalId:"sess_e2e_"+rand, seq:4, kind:"sys", tag:"end", body:"session sealed", occurredAt: now },
   ]);
   check("ingest events", evRes.status === 200, JSON.stringify(evRes.data));
+  const countList = await ds.listSessions({ q: "sess_e2e_" + rand });
+  const countedSession = countList.sessions.find((s) => s.externalId === "sess_e2e_" + rand);
+  check("session list reports total events", countedSession?.events === 4);
+  const firstEventPage = await origFetch(`${API_BASE}/api/v1/sessions/${countedSession?.id}?eventLimit=1`, {
+    headers: { Cookie: Object.entries(cookies).map(([k, v]) => `${k}=${v}`).join("; ") },
+  }).then((r) => r.json());
+  check("event total is independent of pagination", firstEventPage.session?.events.length === 1 && firstEventPage.session?.eventCount === 4 && firstEventPage.nextEventCursor != null);
 
   // Seal via the sanctioned lifecycle: register the daemon's signing
   // pubkey, then post a signed receipt. Direct status:"sealed" session
@@ -196,6 +215,19 @@ try {
   check("overview series buckets labeled", (ov.series||[]).every(b => typeof b.label === "string" && b.label.length > 0));
   const ov7 = await ds.getOverview("7d");
   check("overview range=7d has 7 daily buckets", Array.isArray(ov7.series) && ov7.series.length === 7, "len="+(ov7.series||[]).length);
+  const historical = await ds.createDeployment({ name: "historical", environment: "development" });
+  const oldTime = new Date(Date.now() - 3 * 24 * 3600000).toISOString();
+  const oldHeaders = { "Content-Type": "application/json", Authorization: "Bearer " + historical.ingestToken, "X-AV-Deployment": historical.deployment.id };
+  const oldSession = await origFetch(`${API_BASE}/api/v1/ingest/sessions`, { method: "POST", headers: oldHeaders, body: JSON.stringify({ externalId: "old-session", agent: "historical", openedAt: oldTime }) });
+  check("historical session fixture accepted", oldSession.status === 200);
+  const oldEvents = await origFetch(`${API_BASE}/api/v1/ingest/events`, { method: "POST", headers: oldHeaders, body: JSON.stringify([{ sessionExternalId: "old-session", seq: 0, kind: "tool", tag: "OLD", body: "old activity", occurredAt: oldTime, addToolsAllowed: 9, addCostUsdMicros: 9000000 }]) });
+  check("historical event fixture inserted", oldEvents.status === 200 && (await oldEvents.json()).inserted === 1);
+  const currentWindow = await ds.getOverview("24h");
+  const broaderWindow = await ds.getOverview("7d");
+  check("24h cards exclude historical usage", currentWindow.sessions === ov.sessions && currentWindow.toolsAllowed === ov.toolsAllowed && currentWindow.llmSpendUsd === ov.llmSpendUsd);
+  check("7d cards include historical usage", broaderWindow.sessions === ov.sessions + 1 && broaderWindow.toolsAllowed === ov.toolsAllowed + 9 && Number(broaderWindow.llmSpendUsd) === Number(ov.llmSpendUsd) + 9);
+  check("fleet count is independent of session window", currentWindow.deployments === 2);
+  await ds.deleteDeployment(historical.deployment.id, { force: true });
 
   const list = await ds.listSessions();
   check("listSessions has 1", list.sessions.length === 1);
@@ -237,6 +269,65 @@ try {
   await ds.deletePolicy(secondPol.id);
   const polsAfterDel = await ds.listPolicies();
   check("policy delete removes", !polsAfterDel.some(x => x.id === secondPol.id));
+
+  // PostgreSQL TEXT refuses NUL. Validation must reject it before any
+  // event in the batch or its counters commit, while preserving real text.
+  {
+    const externalId = "sess_text_boundary_" + rand;
+    const created = await ingest("/api/v1/ingest/sessions", { externalId, agent: "text-boundary", openedAt: now });
+    check("text boundary session created", created.status === 200);
+    const listed = await ds.listSessions({ q: externalId });
+    const id = listed.sessions.find(session => session.externalId === externalId)?.id;
+    if (!id) throw new Error("text boundary fixture session missing");
+    const read = async () => {
+      const response = await globalThis.fetch(`${API_BASE}/api/v1/sessions/${id}?eventLimit=10`);
+      if (!response.ok) throw new Error("text boundary read failed: " + response.status);
+      return (await response.json()).session;
+    };
+    const event = { sessionExternalId: externalId, seq: 1, kind: "llm", tag: "response", body: "ordinary", occurredAt: now, addPromptTokens: 3 };
+    for (const field of ["body", "sub"]) {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const rejected = await ingest("/api/v1/ingest/events", [event, { ...event, seq: 2, [field]: "before\0after" }]);
+        check(`NUL ${field} attempt ${attempt + 1} is terminal400`, rejected.status === 400 && /invalid_input/.test(rejected.data), rejected.status);
+      }
+      const empty = await read();
+      check(`NUL ${field} leaves all events and counters unchanged`, empty.eventCount === 0 && empty.promptTokens === 0);
+    }
+    for (const field of ["sessionExternalId", "tag", "policyName"]) {
+      const rejected = await ingest("/api/v1/ingest/events", [{ ...event, [field]: "before\0after" }]);
+      check(`NUL event ${field} is refused`, rejected.status === 400 && /invalid_input/.test(rejected.data), rejected.status);
+    }
+    const content = "line one\n\tline two — café e\u0301 你好 🧪";
+    const accepted = await ingest("/api/v1/ingest/events", [{ ...event, body: content, sub: content }]);
+    check("corrected event reuses rejected sequence", accepted.status === 200 && accepted.data.inserted === 1);
+    const preserved = await read();
+    check("newlines tabs and Unicode are stored verbatim", preserved.events.length === 1 && preserved.events[0].body === content && preserved.events[0].sub === content && preserved.promptTokens === 3);
+
+    // Reach int4 max through five legal bounded batches rather than mutating
+    // the database outside the API. This exercises the real overflow handler.
+    let seedOk = true;
+    for (let start = 0; start < 2148; start += 500) {
+      const rows = Array.from({ length: Math.min(500, 2148 - start) }, (_, offset) => {
+        const index = start + offset;
+        return { ...event, seq: index + 2, addPromptTokens: index === 2147 ? 483644 : 1_000_000 };
+      });
+      const result = await ingest("/api/v1/ingest/events", rows);
+      seedOk = seedOk && result.status === 200 && result.data.inserted === rows.length;
+    }
+    check("legal batches reach cumulative counter boundary", seedOk);
+    const beforeOverflow = await read();
+    check("counter equals int4 maximum with all events stored", beforeOverflow.promptTokens === 2147483647 && beforeOverflow.eventCount === 2149);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const rejected = await ingest("/api/v1/ingest/events", [{ ...event, seq: 3000, addPromptTokens: 1 }]);
+      check(`cumulative overflow attempt ${attempt + 1} stays terminal422`, rejected.status === 422 && /counter_overflow/.test(rejected.data), rejected.status);
+    }
+    const afterOverflow = await read();
+    check("overflow retries preserve counter and event count", afterOverflow.promptTokens === beforeOverflow.promptTokens && afterOverflow.eventCount === beforeOverflow.eventCount);
+    const zeroDelta = await ingest("/api/v1/ingest/events", [{ ...event, seq: 3000, addPromptTokens: 0 }]);
+    const duplicate = await ingest("/api/v1/ingest/events", [{ ...event, seq: 3000, addPromptTokens: 0 }]);
+    const afterRetry = await read();
+    check("zero-delta retry remains appendable and idempotent at boundary", zeroDelta.status === 200 && zeroDelta.data.inserted === 1 && duplicate.status === 200 && duplicate.data.inserted === 0 && afterRetry.promptTokens === 2147483647 && afterRetry.eventCount === 2150);
+  }
 
   // Rotate
   const rot = await ds.rotateDeploymentToken(dep.deployment.id);

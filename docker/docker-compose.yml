@@ -1,4 +1,45 @@
 services:
+  install-secrets:
+    # Plain Compose implements file secrets as bind mounts and ignores their
+    # uid/gid/mode fields. Copy them into a dedicated private volume so the
+    # non-root daemon can read them without weakening its permission checks.
+    image: alpine@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
+    user: "0:0"
+    network_mode: none
+    read_only: true
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - FOWNER
+      - DAC_OVERRIDE
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        umask 077
+        for name in identity_hmac signing_seed; do
+          source="/run/secrets/$$name"
+          mode=$$(stat -c '%a' "$$source")
+          if [ $$((0$$mode & 077)) -ne 0 ]; then
+            echo "Secret $$name must be owner-only on the host (chmod 0600)." >&2
+            exit 1
+          fi
+          [ -s "$$source" ] || { echo "Secret $$name is empty." >&2; exit 1; }
+          cp "$$source" "/prepared-secrets/.$$name.tmp"
+          chown 65532:65532 "/prepared-secrets/.$$name.tmp"
+          chmod 0400 "/prepared-secrets/.$$name.tmp"
+          mv -f "/prepared-secrets/.$$name.tmp" "/prepared-secrets/$$name"
+        done
+        chown 65532:65532 /prepared-secrets
+        chmod 0700 /prepared-secrets
+    secrets:
+      - identity_hmac
+      - signing_seed
+    volumes:
+      - runtime-secrets:/prepared-secrets
+
   agentvisor-ai:
     build:
       context: ..
@@ -6,16 +47,9 @@ services:
     image: agentvisor-ai:local
     container_name: agentvisor-ai
     ports:
-      # Round-15 F7: bind to 127.0.0.1 explicitly. Docker's default
-      # (`"8484:8484"`) means `0.0.0.0:8484`, which reaches the host
-      # from any network interface including LAN and — with a
-      # misconfigured firewall — the public internet. Combined with
-      # the shipped default `require_identity = false` in
-      # `config/harness.docker.toml`, an anonymous internet peer
-      # could otherwise exercise `/v1/chat/completions` against the
-      # operator's upstream credentials. If remote access IS
-      # intended, change this mapping AND set
-      # `require_identity = true` at the same step.
+      # Keep the published gateway local. The full configuration requires
+      # identity; configure its issuer and audience before exposing it through
+      # an authenticated ingress. A bare "8484:8484" publishes every interface.
       - "127.0.0.1:8484:8484"
     # Docker's default stop_grace_period is 10 s — far shorter than the
     # harness's four shutdown phases (HTTP drain, worker wait_idle,
@@ -48,36 +82,15 @@ services:
     environment:
       RUST_LOG: info
       AV_CONFIG: /app/config/harness.docker.toml
-      # Round-16 F3: the signing seed IS the receipt trust anchor.
-      # Living on the shared `bridge-data` named volume meant any
-      # co-scheduled container mounting `-v bridge-data:/x` could
-      # read it — no mode enforcement, no Secret gating. The
-      # docker-compose posture claimed to use a mode:0400 secret,
-      # but that secret was only wired for the identity HMAC.
-      # Now it's a first-class docker secret alongside the HMAC.
+      # The receipt trust anchor lives in a private volume populated by
+      # install-secrets and mounted read-only, separate from bridge data.
       AV_SIGNING_SEED_FILE: /run/secrets/signing_seed
       OTEL_EXPORTER_OTLP_ENDPOINT: http://vector:4318
       OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
     volumes:
       - bridge-data:/app/data
       - atif-spool:/app/spool
-    secrets:
-      # Long-form: pin the mount to the container's non-root uid so a
-      # co-scheduled exec session cannot read the HMAC via the world bit
-      # of the default 0444 mount.
-      - source: identity_hmac
-        target: identity_hmac
-        uid: "65532"
-        gid: "65532"
-        mode: 0400
-      # Round-16 F3: signing seed pinned identically. Populate the
-      # file-backed secret before compose-up (see the secrets: block
-      # at the bottom of this file).
-      - source: signing_seed
-        target: signing_seed
-        uid: "65532"
-        gid: "65532"
-        mode: 0400
+      - runtime-secrets:/run/secrets:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     healthcheck:
@@ -95,6 +108,8 @@ services:
       timeout: 3s
       retries: 5
     depends_on:
+      install-secrets:
+        condition: service_completed_successfully
       redpanda:
         condition: service_healthy
       redis:
@@ -103,7 +118,10 @@ services:
         condition: service_healthy
 
   redpanda:
-    image: redpandadata/redpanda:v25.2.5
+    # 26.2 is supported through July 2027; 25.2 reached EOL in July 2026.
+    # Existing 25.2 volumes need sequential 25.3 -> 26.1 -> 26.2 upgrades.
+    # See README's migration note before reusing an existing broker volume.
+    image: docker.redpanda.com/redpandadata/redpanda:v26.2.2@sha256:468bd13a9f2bd24794cb7fddc867c767fb1008b9a07b297b89fde48c564d7d96
     # Internal-only: Kafka is consumed via the compose network as
     # `redpanda:9092`. Binding to 127.0.0.1 keeps the external listener
     # reachable for a local `rpk` on the host without exposing it to the
@@ -168,6 +186,10 @@ services:
       retries: 12
 
   minio:
+    # The community MinIO repository and legacy binary releases are no longer
+    # maintained. This isolated fixture is only for local S3 contract tests.
+    # Production cold storage must use a maintained S3-compatible service.
+    profiles: ["local-test"]
     image: minio/minio:RELEASE.2025-04-22T22-12-26Z
     # Internal-only S3-compatible object store for the cold tier
     # (`cold_uri = "s3://..."`). Used by CI's live cold-store contract
@@ -190,7 +212,8 @@ services:
       retries: 12
 
   nats:
-    image: nats:2.11-alpine
+    # 2.11 no longer receives patches; 2.15 is a maintained release line.
+    image: nats:2.15.0-alpine@sha256:ac8f88a6494bffc2c2a5289a0ca61cb28a9145c11ba5677cf24265d07f46d8d4
     # Internal-only JetStream bus.
     ports:
       - "127.0.0.1:4222:4222"
@@ -231,6 +254,9 @@ services:
       # - /var/run/docker.sock:/var/run/docker.sock:ro
 
 volumes:
+  # Private copies owned by UID 65532, never mounted into backing services.
+  # Source files remain the authority and are copied on every Compose startup.
+  runtime-secrets:
   bridge-data:
   atif-spool:
   qdrant-data:
@@ -259,10 +285,10 @@ secrets:
   # (Both files are read as text: the signing seed MUST be 64 hex
   # chars — the loader hex-decodes it — and the HMAC secret is used
   # verbatim, so hex text works for both and survives editors.)
-  # File secrets are bind-mounted preserving HOST ownership/mode on
-  # engines that ignore the long-form uid/gid/mode pins above, and
-  # the daemon's owner-only-mode check refuses group/world-readable
-  # key material either way.
+  # Compose preserves HOST ownership/mode for file-backed secrets. The
+  # install-secrets service checks owner-only permissions, then makes private
+  # UID-65532 copies. The daemon mounts only those copies, read-only. Protect
+  # and back up the source signing seed; never replace it on routine restarts.
   identity_hmac:
     file: ./secrets/identity_hmac
   # Round-16 F3: the signing seed IS the receipt trust anchor.

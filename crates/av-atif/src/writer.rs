@@ -228,20 +228,10 @@ pub fn metrics(prompt: u64, completion: u64, cached: u64, cost_usd: f64) -> Metr
 /// (strict) before any byte is written — this crate never produces an invalid
 /// file (success criterion R28).
 ///
-/// **Post-rename durability semantics**: once `tmp.persist(path)` returns
-/// `Ok`, the file is atomically visible at `path`. A subsequent
-/// `sync_directory` failure means the dirent may not survive an
-/// immediate power loss on POSIX-conformant filesystems, but every
-/// observer running now sees the file. Log a
-/// `tracing::warn!` and return `Ok(())` instead of returning `Err`,
-/// matching `av_core::fsutil::write_atomic`'s semantic.
-/// Returning `Err` after a successful rename historically confused
-/// caller retry logic: the reconciler would treat this as
-/// "trajectory not persisted" and redo the whole
-/// validate + serialize + rename cycle on the next tick — wasted IO,
-/// and worse: a caller that gates session-state advancement on `Ok`
-/// would keep the session as "capture failed" while the trajectory
-/// was in fact on disk.
+/// A directory synchronization failure is returned even if rename already
+/// made the trajectory visible. Callers must retain the complete file for
+/// recovery or retry, and must not attest successful durable capture until the
+/// write succeeds. See `av_core::fsutil::write_atomic` for the shared contract.
 pub fn write_atomic(trajectory: &Trajectory, path: &Path) -> Result<(), WriterError> {
     let issues = crate::validate::validate_trajectory(trajectory, crate::validate::Mode::Strict);
     if !issues.is_empty() {
