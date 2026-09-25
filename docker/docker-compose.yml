@@ -186,11 +186,13 @@ services:
       retries: 12
 
   minio:
-    # The community MinIO repository and legacy binary releases are no longer
-    # maintained. This isolated fixture is only for local S3 contract tests.
-    # Production cold storage must use a maintained S3-compatible service.
+    # The community MinIO images were withdrawn from Docker Hub (minio/minio
+    # now answers 404), so this fixture uses Chainguard's maintained build of
+    # the MinIO server, pinned by index digest. It is only for local S3
+    # contract tests. Production cold storage must use a maintained
+    # S3-compatible service.
     profiles: ["local-test"]
-    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    image: cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1
     # Internal-only S3-compatible object store for the cold tier
     # (`cold_uri = "s3://..."`). Used by CI's live cold-store contract
     # test (`AV_COLD_S3_URL`); the entrypoint pre-creates the bucket so
@@ -202,11 +204,13 @@ services:
     environment:
       MINIO_ROOT_USER: agentvisor
       MINIO_ROOT_PASSWORD: agentvisor-ci-secret
+      # The image has no curl; its bundled MinIO client checks readiness.
+      MC_HOST_local: http://agentvisor:agentvisor-ci-secret@127.0.0.1:9000
     entrypoint: ["/bin/sh", "-c", "mkdir -p /data/agentvisor-cold && exec minio server /data"]
     volumes:
       - minio-data:/data
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live"]
+      test: ["CMD", "mc", "ready", "local"]
       interval: 5s
       timeout: 3s
       retries: 12
