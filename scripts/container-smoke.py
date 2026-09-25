@@ -300,7 +300,10 @@ class ConsoleSmoke(Smoke):
         deadline = time.monotonic() + 40
         while True:
             try:
-                self.run(["docker", "exec", self.database, "pg_isready", "-U", "agentvisor", "-d", "agentvisor"])
+                # TCP check: the image's temporary init server listens only
+                # on its local socket and is not the server clients reach.
+                self.run(["docker", "exec", self.database, "pg_isready", "-h", "127.0.0.1",
+                          "-U", "agentvisor", "-d", "agentvisor"])
                 return
             except RuntimeError:
                 if time.monotonic() >= deadline:

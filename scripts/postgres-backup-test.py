@@ -212,7 +212,10 @@ def main():
         ready = False
         for _ in range(60):
             try:
-                docker('exec', name, 'pg_isready', '-U', 'fixture', '-d', 'postgres', timeout=10)
+                # TCP, not the local socket: the image's temporary init
+                # server listens only on the socket, so a socket check can
+                # pass before the final server accepts 127.0.0.1.
+                docker('exec', name, 'pg_isready', '-h', '127.0.0.1', '-U', 'fixture', '-d', 'postgres', timeout=10)
                 ready = True
                 break
             except subprocess.CalledProcessError:

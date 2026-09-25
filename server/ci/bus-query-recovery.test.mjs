@@ -238,17 +238,21 @@ test("an idle listener blackhole is detected even while its publisher remains he
   const origin = f.bus();
   const peer = f.bus();
   assert.equal(await origin.connectPgBridge(), true);
+  let resets = 0;
+  origin.subscribeReset(() => { resets++; });
   assert.equal(await peer.connectPgBridge(), true);
-  await pause(20);
+  // The peer's own opening reset reaches the origin asynchronously, and on
+  // Linux small-packet coalescing can delay it by tens of milliseconds.
+  // Wait for it, so the listener recovery below is the only reset counted.
+  await eventually(() => resets === 1, "the origin must first see the peer's opening reset");
+  resets = 0;
   const blockedListener = f.connections[2];
   assert.equal(blockedListener.listening, true);
   blockedListener.blackhole = true;
   const received = [], reverse = [], otherTenant = [];
-  let resets = 0;
   peer.subscribeOrg("tenant-a", (ev) => received.push(ev.sessionId));
   peer.subscribeOrg("tenant-b", (ev) => otherTenant.push(ev.sessionId));
   origin.subscribeOrg("tenant-a", (ev) => reverse.push(ev.sessionId));
-  origin.subscribeReset(() => { resets++; });
   origin.publish(event("missed-during-listener-blackhole"));
   peer.publish(event("publisher-still-works"));
   await eventually(() => reverse.includes("publisher-still-works"), "the affected instance's independent publisher must still work");
