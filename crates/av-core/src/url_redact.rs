@@ -220,6 +220,31 @@ mod tests {
         assert_eq!(redact_userinfo(""), "");
     }
 
+    /// Regression: a one-character credential is also a prefix of the
+    /// host in `:://T@\x00%TTT`. The product redacts to
+    /// `:://***@\x00%TTT`, which is correct — the credential is gone
+    /// from the userinfo slot. This case exists so a future change
+    /// cannot "fix" the false alarm by weakening the redaction.
+    #[test]
+    fn single_character_credential_is_redacted() {
+        let input = ":://T@\x00%TTT";
+        let expected = ":://***@\x00%TTT";
+        assert_eq!(redact_userinfo(input), expected);
+        // Idempotent.
+        assert_eq!(redact_userinfo(expected), expected);
+        // The userinfo slot really is `***`.
+        let out = redact_userinfo(input);
+        let scheme_end = out.find("://");
+        assert_eq!(scheme_end, Some(1), "output lost its scheme: {out}");
+        let rest = &out[scheme_end.map_or(0, |end| end + 3)..];
+        let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+        assert_eq!(
+            authority.rsplit_once('@').map(|(u, _)| u).unwrap_or(""),
+            "***",
+            "userinfo slot is not the redaction marker: {out}"
+        );
+    }
+
     #[test]
     fn query_fragment_after_authority() {
         assert_eq!(

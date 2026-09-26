@@ -16,11 +16,15 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 serde_json = "1"
 
-av-harness = { path = "../crates/av-harness" }
+# `otel` is required: `bounded_attribute` fuzzes
+# `av_harness::otel_content::bounded`, and that module only exists when
+# the `otel` feature is on.
+av-harness = { path = "../crates/av-harness", features = ["otel"] }
 av-core = { path = "../crates/av-core" }
 av-compress = { path = "../crates/av-compress" }
 av-receipts = { path = "../crates/av-receipts" }
 av-sandbox = { path = "../crates/av-sandbox" }
+av-identity = { path = "../crates/av-identity" }
 
 [[bin]]
 name = "canonicalize_receipt_subject"
@@ -55,5 +59,35 @@ doc = false
 [[bin]]
 name = "redact_userinfo"
 path = "fuzz_targets/redact_userinfo.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "authzen_decision"
+path = "fuzz_targets/authzen_decision.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "scope_intersection"
+path = "fuzz_targets/scope_intersection.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "bounded_attribute"
+path = "fuzz_targets/bounded_attribute.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "der_name"
+path = "fuzz_targets/der_name.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "url_redact"
+path = "fuzz_targets/url_redact.rs"
 test = false
 doc = false

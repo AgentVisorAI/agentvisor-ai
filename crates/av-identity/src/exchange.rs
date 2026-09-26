@@ -539,6 +539,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
     use super::*;
+    use proptest::prelude::*;
 
     fn base_claims(scopes: &[&str]) -> NhiClaims {
         NhiClaims {
@@ -591,6 +592,70 @@ mod tests {
         let b = vec!["payout".to_owned()];
         let result = scope_intersection(&a, &b);
         assert!(result.is_empty());
+    }
+
+    proptest! {
+        /// Intersection is commutative: the same scopes come out
+        /// regardless of argument order.
+        #[test]
+        fn intersection_is_commutative(
+            a in prop::collection::vec("[a-z:*]{1,12}", 0..12),
+            b in prop::collection::vec("[a-z:*]{1,12}", 0..12),
+        ) {
+            let mut ab = scope_intersection(&a, &b);
+            ab.sort();
+            let mut ba = scope_intersection(&b, &a);
+            ba.sort();
+            prop_assert_eq!(ab, ba);
+        }
+
+        /// Intersection never grows: every output scope is covered by
+        /// both inputs (privilege narrowing).
+        #[test]
+        fn intersection_never_grows(
+            a in prop::collection::vec("[a-z:*]{1,12}", 0..12),
+            b in prop::collection::vec("[a-z:*]{1,12}", 0..12),
+        ) {
+            for scope in scope_intersection(&a, &b) {
+                let covered_a = a.iter().any(|as_| scope_covers(as_, &scope));
+                let covered_b = b.iter().any(|bs| scope_covers(bs, &scope));
+                prop_assert!(covered_a && covered_b, "scope {scope:?} not covered by both");
+            }
+        }
+
+        /// Intersection is a subset of each input (no escalation).
+        #[test]
+        fn intersection_is_subset_of_each_input(
+            a in prop::collection::vec("[a-z:*]{1,12}", 0..12),
+            b in prop::collection::vec("[a-z:*]{1,12}", 0..12),
+        ) {
+            for scope in scope_intersection(&a, &b) {
+                prop_assert!(a.contains(&scope) || b.contains(&scope));
+            }
+        }
+
+        /// Self-intersection is the identity (idempotence).
+        #[test]
+        fn intersection_with_self_is_idempotent(
+            a in prop::collection::vec("[a-z:*]{1,12}", 0..12),
+        ) {
+            let mut result = scope_intersection(&a, &a);
+            result.sort();
+            result.dedup();
+            let mut expected = a.clone();
+            expected.sort();
+            expected.dedup();
+            prop_assert_eq!(result, expected);
+        }
+
+        /// Total: never panics on arbitrary UTF-8 scope strings.
+        #[test]
+        fn intersection_never_panics(
+            a in prop::collection::vec(".*", 0..8),
+            b in prop::collection::vec(".*", 0..8),
+        ) {
+            let _ = scope_intersection(&a, &b);
+        }
     }
 
     fn default_params<'a>(

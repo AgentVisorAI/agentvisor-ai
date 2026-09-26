@@ -365,7 +365,7 @@ fn parts(message: &Value) -> Vec<Value> {
 }
 
 /// Truncate at a character boundary so no attribute exceeds the limit.
-fn bounded(text: &str) -> String {
+pub fn bounded(text: &str) -> String {
     if text.len() <= MAX_ATTRIBUTE_BYTES {
         return text.to_owned();
     }
@@ -543,5 +543,231 @@ mod tests {
         );
         assert_eq!(role(Some("agent")), "assistant");
         assert_eq!(role(Some("user")), "user");
+    }
+
+    #[test]
+    fn pending_chats_are_evicted_and_emitted_when_the_map_overflows() {
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporter::default();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let redaction = av_redact::RedactionEngine::new(av_redact::RedactionConfig {
+            include_builtin_patterns: true,
+            ..av_redact::RedactionConfig::default()
+        })
+        .unwrap();
+        let sink = TenantContentSink::new(&provider, redaction, "openai");
+
+        // Overfill the pending-chat map. Each request is non-terminal and
+        // carries an attempt id, so it is held rather than emitted.
+        for i in 0..(MAX_PENDING_CHATS + 10) {
+            let mut request = record(EventClass::Compression, Some(&format!("a{i}")), false);
+            request.message = Some(json!("hello"));
+            sink.record(request);
+        }
+
+        // The map must never exceed the limit.
+        {
+            let pending = sink.pending.lock();
+            assert!(pending.0.len() <= MAX_PENDING_CHATS);
+            assert_eq!(pending.1.len(), pending.0.len());
+        }
+
+        // Evicted records are emitted as event spans, not silently dropped.
+        provider.force_flush().unwrap();
+        let spans = exporter.get_finished_spans().unwrap();
+        assert!(
+            spans.len() >= 10,
+            "evicted requests must be emitted, got {}",
+            spans.len()
+        );
+    }
+
+    #[test]
+    fn terminal_responses_without_a_pending_request_still_emit() {
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporter::default();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let redaction = av_redact::RedactionEngine::new(av_redact::RedactionConfig {
+            include_builtin_patterns: true,
+            ..av_redact::RedactionConfig::default()
+        })
+        .unwrap();
+        let sink = TenantContentSink::new(&provider, redaction, "openai");
+
+        // A terminal record with an attempt id but no matching request.
+        let mut response = record(EventClass::StopReason, Some("orphan"), true);
+        response.message = Some(json!("orphan response"));
+        sink.record(response);
+
+        provider.force_flush().unwrap();
+        let spans = exporter.get_finished_spans().unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].name, "chat");
+        assert!(
+            attribute(&spans[0], "gen_ai.output.messages")
+                .unwrap()
+                .contains("orphan response")
+        );
+    }
+
+    #[test]
+    fn tool_records_without_tool_calls_fall_back_to_event_payload() {
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporter::default();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let redaction = av_redact::RedactionEngine::new(av_redact::RedactionConfig {
+            include_builtin_patterns: true,
+            ..av_redact::RedactionConfig::default()
+        })
+        .unwrap();
+        let sink = TenantContentSink::new(&provider, redaction, "openai");
+
+        // ToolCall with no tool_calls array: the tool name comes from the
+        // event payload.
+        let mut tool = record(EventClass::ToolCall, None, false);
+        tool.event = json!({"payload": {"tool": "from-payload", "allowed": false, "denial_code": "UNMAPPED_TOOL", "policy": "pdp.intent_map", "stage": "intent", "reason": "not mapped"}});
+        sink.record(tool);
+
+        provider.force_flush().unwrap();
+        let spans = exporter.get_finished_spans().unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].name, "execute_tool from-payload");
+        assert_eq!(
+            attribute(&spans[0], "agentvisor.tool.allowed").as_deref(),
+            Some("false")
+        );
+        assert_eq!(
+            attribute(&spans[0], "agentvisor.tool.denial_code").as_deref(),
+            Some("UNMAPPED_TOOL")
+        );
+        assert_eq!(
+            attribute(&spans[0], "agentvisor.tool.policy").as_deref(),
+            Some("pdp.intent_map")
+        );
+        assert_eq!(
+            attribute(&spans[0], "agentvisor.tool.stage").as_deref(),
+            Some("intent")
+        );
+    }
+
+    #[test]
+    fn tool_result_without_message_or_payload_still_emits() {
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporter::default();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let redaction = av_redact::RedactionEngine::new(av_redact::RedactionConfig {
+            include_builtin_patterns: true,
+            ..av_redact::RedactionConfig::default()
+        })
+        .unwrap();
+        let sink = TenantContentSink::new(&provider, redaction, "openai");
+
+        // tool_completed with no message and no execution_key.
+        let mut result = record(EventClass::Session, None, false);
+        result.event = json!({"payload": {"action": "tool_completed"}});
+        sink.record(result);
+
+        provider.force_flush().unwrap();
+        let spans = exporter.get_finished_spans().unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].name, "execute_tool.result");
+    }
+
+    #[test]
+    fn redaction_strips_reasoning_and_tool_calls_before_export() {
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporter::default();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let redaction = av_redact::RedactionEngine::new(av_redact::RedactionConfig {
+            include_builtin_patterns: true,
+            ..av_redact::RedactionConfig::default()
+        })
+        .unwrap();
+        let sink = TenantContentSink::new(&provider, redaction, "openai");
+
+        let mut request = record(EventClass::Compression, Some("r1"), false);
+        request.message = Some(json!("my SSN is 123-45-6789"));
+        request.reasoning = Some("thinking about 4111 1111 1111 1111".into());
+        sink.record(request);
+        let mut response = record(EventClass::StopReason, Some("r1"), true);
+        response.message = Some(json!("done"));
+        response.tool_calls = Some(json!([{
+            "tool_call_id": "1",
+            "function_name": "lookup",
+            "arguments": {"card": "4111 1111 1111 1111"}
+        }]));
+        sink.record(response);
+
+        provider.force_flush().unwrap();
+        let spans = exporter.get_finished_spans().unwrap();
+        assert_eq!(spans.len(), 1);
+        let chat = &spans[0];
+        let input = attribute(chat, "gen_ai.input.messages").unwrap();
+        assert!(!input.contains("123-45-6789"), "SSN leaked: {input}");
+        assert!(input.contains("[REDACTED]"), "{input}");
+        let output = attribute(chat, "gen_ai.output.messages").unwrap();
+        assert!(
+            !output.contains("4111 1111 1111 1111"),
+            "card leaked in output: {output}"
+        );
+    }
+
+    #[test]
+    fn class_labels_are_stable() {
+        assert_eq!(class_label(EventClass::ToolCall), "tool_call");
+        assert_eq!(class_label(EventClass::StopReason), "stop_reason");
+        assert_eq!(class_label(EventClass::Receipt), "receipt");
+        assert_eq!(class_label(EventClass::Compression), "compression");
+        assert_eq!(class_label(EventClass::Identity), "identity");
+        assert_eq!(class_label(EventClass::Session), "session");
+    }
+
+    #[test]
+    fn bounded_preserves_ascii_and_never_exceeds_limit() {
+        assert_eq!(bounded("short"), "short");
+        assert_eq!(bounded(""), "");
+        let text = "a".repeat(MAX_ATTRIBUTE_BYTES);
+        assert_eq!(bounded(&text), text);
+        let oversized = "b".repeat(MAX_ATTRIBUTE_BYTES + 1);
+        let cut = bounded(&oversized);
+        assert!(cut.len() <= MAX_ATTRIBUTE_BYTES + 64, "cut too large: {}", cut.len());
+        assert!(cut.contains("[truncated"));
+        // "é" is two bytes, so this input is exactly at the limit and is
+        // returned unchanged.
+        let at_limit = "é".repeat(MAX_ATTRIBUTE_BYTES / 2);
+        assert_eq!(at_limit.len(), MAX_ATTRIBUTE_BYTES);
+        assert_eq!(bounded(&at_limit), at_limit);
+
+        // One more character puts the input over the limit, so it is cut —
+        // on a character boundary, never through the middle of "é".
+        let text = "é".repeat(MAX_ATTRIBUTE_BYTES / 2 + 1);
+        let cut = bounded(&text);
+        assert!(cut.contains("[truncated"), "not truncated: {cut}");
+        assert!(cut.len() <= MAX_ATTRIBUTE_BYTES + 64, "cut too large: {}", cut.len());
+        let kept = cut.split('…').next().unwrap_or_default();
+        assert!(kept.ends_with('é'), "cut split a character: {kept}");
+        assert!(text.starts_with(kept), "kept prefix is not a prefix of the input");
+    }
+
+    #[test]
+    fn parts_handle_empty_and_nested_arrays() {
+        assert_eq!(parts(&json!([])), Vec::<Value>::new());
+        assert_eq!(
+            parts(&json!([{"type": "text", "text": "a"}, {"type": "text", "text": "b"}])),
+            vec![json!({"type": "text", "content": "a"}), json!({"type": "text", "content": "b"})]
+        );
+        assert_eq!(
+            parts(&json!(null)),
+            vec![json!({"type": "text", "content": "null"})]
+        );
+        assert_eq!(
+            parts(&json!(42)),
+            vec![json!({"type": "text", "content": "42"})]
+        );
     }
 }
