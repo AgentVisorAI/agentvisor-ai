@@ -605,11 +605,9 @@ mod tests {
         let spans = exporter.get_finished_spans().unwrap();
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].name, "chat");
-        assert!(
-            attribute(&spans[0], "gen_ai.output.messages")
-                .unwrap()
-                .contains("orphan response")
-        );
+        assert!(attribute(&spans[0], "gen_ai.output.messages")
+            .unwrap()
+            .contains("orphan response"));
     }
 
     #[test]
@@ -735,7 +733,11 @@ mod tests {
         assert_eq!(bounded(&text), text);
         let oversized = "b".repeat(MAX_ATTRIBUTE_BYTES + 1);
         let cut = bounded(&oversized);
-        assert!(cut.len() <= MAX_ATTRIBUTE_BYTES + 64, "cut too large: {}", cut.len());
+        assert!(
+            cut.len() <= MAX_ATTRIBUTE_BYTES + 64,
+            "cut too large: {}",
+            cut.len()
+        );
         assert!(cut.contains("[truncated"));
         // "é" is two bytes, so this input is exactly at the limit and is
         // returned unchanged.
@@ -748,7 +750,11 @@ mod tests {
         let text = "é".repeat(MAX_ATTRIBUTE_BYTES / 2 + 1);
         let cut = bounded(&text);
         assert!(cut.contains("[truncated"), "not truncated: {cut}");
-        assert!(cut.len() <= MAX_ATTRIBUTE_BYTES + 64, "cut too large: {}", cut.len());
+        assert!(
+            cut.len() <= MAX_ATTRIBUTE_BYTES + 64,
+            "cut too large: {}",
+            cut.len()
+        );
         let kept = cut.split('…').next().unwrap_or_default();
         assert!(kept.ends_with('é'), "cut split a character: {kept}");
         assert!(text.starts_with(kept), "kept prefix is not a prefix of the input");
@@ -759,15 +765,15 @@ mod tests {
         assert_eq!(parts(&json!([])), Vec::<Value>::new());
         assert_eq!(
             parts(&json!([{"type": "text", "text": "a"}, {"type": "text", "text": "b"}])),
-            vec![json!({"type": "text", "content": "a"}), json!({"type": "text", "content": "b"})]
+            vec![
+                json!({"type": "text", "content": "a"}),
+                json!({"type": "text", "content": "b"})
+            ]
         );
         assert_eq!(
             parts(&json!(null)),
             vec![json!({"type": "text", "content": "null"})]
         );
-        assert_eq!(
-            parts(&json!(42)),
-            vec![json!({"type": "text", "content": "42"})]
-        );
+        assert_eq!(parts(&json!(42)), vec![json!({"type": "text", "content": "42"})]);
     }
 }

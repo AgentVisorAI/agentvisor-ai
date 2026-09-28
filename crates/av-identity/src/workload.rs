@@ -555,7 +555,12 @@ mod tests {
     #[test]
     fn identity_fields_must_look_like_guids() {
         for (instance, app, space, org) in [
-            ("has spaces here", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "s-1", "o-1"),
+            (
+                "has spaces here",
+                "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                "s-1",
+                "o-1",
+            ),
             ("inst-1", "has/slash", "s-1", "o-1"),
             ("inst-1", "app-1", "has:colon", "o-1"),
             ("inst-1", "app-1", "s-1", "has.dot"),

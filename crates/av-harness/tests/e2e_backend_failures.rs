@@ -70,12 +70,7 @@ fn gateway(
     config.backends = backends;
     tweak(&mut config);
     let sandbox = common::sandbox_for(&config);
-    common::app_state(
-        config,
-        sandbox,
-        Arc::new(common::CountingBus::default()),
-        7,
-    )
+    common::app_state(config, sandbox, Arc::new(common::CountingBus::default()), 7)
 }
 
 fn gateway_with_identity(
@@ -220,67 +215,65 @@ fn closed_port_url() -> String {
 /// An MCP backend that completes the handshake and then answers `tools/call`
 /// according to `behavior`.
 async fn backend_with_call_behavior(behavior: CallBehavior) -> String {
-    let app = axum::Router::new().fallback(
-        move |body: axum::body::Bytes| async move {
-            let request: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-            let id = request.get("id").cloned().unwrap_or(Value::Null);
-            let method = request.get("method").and_then(Value::as_str).unwrap_or_default();
-            if request.get("id").is_none() && method.starts_with("notifications/") {
-                return axum::http::StatusCode::ACCEPTED.into_response();
-            }
-            match method {
-                "initialize" => {
-                    let mut response = axum::Json(json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": {
-                            "protocolVersion": "2025-11-25",
-                            "capabilities": {"tools": {}},
-                            "serverInfo": {"name": "failing-backend", "version": "1"}
-                        }
-                    }))
-                    .into_response();
-                    response.headers_mut().insert(
-                        "mcp-session-id",
-                        axum::http::HeaderValue::from_static("failing-backend-session"),
-                    );
-                    response
-                }
-                "tools/list" => axum::Json(json!({
+    let app = axum::Router::new().fallback(move |body: axum::body::Bytes| async move {
+        let request: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        let id = request.get("id").cloned().unwrap_or(Value::Null);
+        let method = request.get("method").and_then(Value::as_str).unwrap_or_default();
+        if request.get("id").is_none() && method.starts_with("notifications/") {
+            return axum::http::StatusCode::ACCEPTED.into_response();
+        }
+        match method {
+            "initialize" => {
+                let mut response = axum::Json(json!({
                     "jsonrpc": "2.0",
                     "id": id,
-                    "result": {"tools": []}
+                    "result": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "failing-backend", "version": "1"}
+                    }
+                }))
+                .into_response();
+                response.headers_mut().insert(
+                    "mcp-session-id",
+                    axum::http::HeaderValue::from_static("failing-backend-session"),
+                );
+                response
+            }
+            "tools/list" => axum::Json(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {"tools": []}
+            }))
+            .into_response(),
+            _ => match behavior {
+                CallBehavior::Http500 => (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "backend exploded after handshake",
+                )
+                    .into_response(),
+                CallBehavior::Hang => {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    axum::http::StatusCode::OK.into_response()
+                }
+                CallBehavior::Oversized => {
+                    let huge = vec![b'x'; MAX_TOOL_RESPONSE_BYTES + 1];
+                    (
+                        axum::http::StatusCode::OK,
+                        [(axum::http::header::CONTENT_TYPE, "text/plain")],
+                        huge,
+                    )
+                        .into_response()
+                }
+                CallBehavior::JsonRpcError => axum::Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {"code": -32000, "message": "tool failed inside the backend"}
                 }))
                 .into_response(),
-                _ => match behavior {
-                    CallBehavior::Http500 => (
-                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        "backend exploded after handshake",
-                    )
-                        .into_response(),
-                    CallBehavior::Hang => {
-                        tokio::time::sleep(Duration::from_secs(60)).await;
-                        axum::http::StatusCode::OK.into_response()
-                    }
-                    CallBehavior::Oversized => {
-                        let huge = vec![b'x'; MAX_TOOL_RESPONSE_BYTES + 1];
-                        (
-                            axum::http::StatusCode::OK,
-                            [(axum::http::header::CONTENT_TYPE, "text/plain")],
-                            huge,
-                        )
-                            .into_response()
-                    }
-                    CallBehavior::JsonRpcError => axum::Json(json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "error": {"code": -32000, "message": "tool failed inside the backend"}
-                    }))
-                    .into_response(),
-                },
-            }
-        },
-    );
+            },
+        }
+    });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/mcp", listener.local_addr().unwrap());
     tokio::spawn(async move {
@@ -325,15 +318,11 @@ fn single_call_budget() -> BudgetSpec {
 #[tokio::test]
 async fn a_tool_backend_that_fails_after_the_handshake_relays_the_error_and_keeps_the_claim() {
     let url = backend_with_call_behavior(CallBehavior::Http500).await;
-    let state = gateway(
-        vec![backend("svc", &url, &["lookup"])],
-        None,
-        |config| {
-            // One call total. A refund would let a second call through;
-            // keeping the debit must refuse it.
-            config.budget.max_total_tool_calls = Some(1);
-        },
-    );
+    let state = gateway(vec![backend("svc", &url, &["lookup"])], None, |config| {
+        // One call total. A refund would let a second call through;
+        // keeping the debit must refuse it.
+        config.budget.max_total_tool_calls = Some(1);
+    });
 
     let first = send(&state, tool_call("sess-500", None, "lookup", 1)).await;
     assert_eq!(first.status, 500, "{}", first.text());
@@ -357,7 +346,8 @@ async fn a_tool_backend_that_fails_after_the_handshake_relays_the_error_and_keep
     let fresh = send(&state, tool_call("sess-500", None, "lookup", 2)).await;
     assert_eq!(fresh.status, 403, "{}", fresh.json());
     assert_eq!(
-        fresh.json()["error"]["data"]["code"], "BUDGET_EXCEEDED",
+        fresh.json()["error"]["data"]["code"],
+        "BUDGET_EXCEEDED",
         "a backend failure that is not a connect error must not refund: {}",
         fresh.json()
     );
@@ -366,20 +356,17 @@ async fn a_tool_backend_that_fails_after_the_handshake_relays_the_error_and_keep
 #[tokio::test]
 async fn a_json_rpc_error_after_the_handshake_is_relayed_like_any_other_answer() {
     let url = backend_with_call_behavior(CallBehavior::JsonRpcError).await;
-    let state = gateway(
-        vec![backend("svc", &url, &["lookup"])],
-        None,
-        |config| {
-            config.budget.max_total_tool_calls = Some(1);
-        },
-    );
+    let state = gateway(vec![backend("svc", &url, &["lookup"])], None, |config| {
+        config.budget.max_total_tool_calls = Some(1);
+    });
 
     let reply = send(&state, tool_call("sess-jrpc", None, "lookup", 1)).await;
     // A JSON-RPC error object is a valid answer. The gateway relays it
     // with the upstream status rather than inventing a new one.
     assert_eq!(reply.status, 200, "{}", reply.text());
     assert_eq!(
-        reply.json()["error"]["message"], "tool failed inside the backend",
+        reply.json()["error"]["message"],
+        "tool failed inside the backend",
         "the JSON-RPC error must be relayed unchanged: {}",
         reply.json()
     );
@@ -394,14 +381,10 @@ async fn a_json_rpc_error_after_the_handshake_is_relayed_like_any_other_answer()
 #[tokio::test]
 async fn a_tool_timeout_is_502_and_keeps_the_budget_debit() {
     let url = backend_with_call_behavior(CallBehavior::Hang).await;
-    let state = gateway(
-        vec![backend("svc", &url, &["lookup"])],
-        None,
-        |config| {
-            config.budget.max_total_tool_calls = Some(1);
-            config.mcp_request_timeout_s = Some(1);
-        },
-    );
+    let state = gateway(vec![backend("svc", &url, &["lookup"])], None, |config| {
+        config.budget.max_total_tool_calls = Some(1);
+        config.mcp_request_timeout_s = Some(1);
+    });
 
     // The tool path maps every send failure that is not a connect error
     // to 502, not 504. Only the chat path distinguishes timeout with
@@ -411,7 +394,9 @@ async fn a_tool_timeout_is_502_and_keeps_the_budget_debit() {
     let first = send(&state, tool_call("sess-timeout", None, "lookup", 1)).await;
     assert_eq!(first.status, 502, "{}", first.text());
     assert!(
-        first.text().contains("tool executed but its response could not be read"),
+        first
+            .text()
+            .contains("tool executed but its response could not be read"),
         "a tool timeout is journaled as an unreadable answer: {}",
         first.text()
     );
@@ -432,7 +417,8 @@ async fn a_tool_timeout_is_502_and_keeps_the_budget_debit() {
     let second = send(&state, tool_call("sess-timeout", None, "lookup", 2)).await;
     assert_eq!(second.status, 403, "{}", second.json());
     assert_eq!(
-        second.json()["error"]["data"]["code"], "BUDGET_EXCEEDED",
+        second.json()["error"]["data"]["code"],
+        "BUDGET_EXCEEDED",
         "a timeout must keep the debit: {}",
         second.json()
     );
@@ -471,7 +457,9 @@ async fn a_chat_timeout_is_504_and_keeps_the_token_debit() {
     assert_eq!(second.status, 403, "{}", second.json());
     assert_eq!(second.json()["error"]["type"], "permission_error");
     assert!(
-        second.text().contains(&format!("max_tokens exceeded (cap {cost})")),
+        second
+            .text()
+            .contains(&format!("max_tokens exceeded (cap {cost})")),
         "the token debit must survive a timeout: {}",
         second.text()
     );
@@ -482,17 +470,14 @@ async fn a_chat_timeout_is_504_and_keeps_the_token_debit() {
 #[tokio::test]
 async fn a_connection_refused_backend_refunds_the_debit_on_both_ledgers() {
     let dead = closed_port_url();
-    let state = gateway_with_identity(
-        vec![backend("dead", &dead, &["lookup"])],
-        |config| {
-            // Bind the session ledger and the principal ledger at one
-            // call each. Two admitted attempts prove both were refunded:
-            // if either ledger kept the charge, the second call would be
-            // refused for budget.
-            config.budget = single_call_budget();
-            config.principal_budget = Some(single_call_budget());
-        },
-    );
+    let state = gateway_with_identity(vec![backend("dead", &dead, &["lookup"])], |config| {
+        // Bind the session ledger and the principal ledger at one
+        // call each. Two admitted attempts prove both were refunded:
+        // if either ledger kept the charge, the second call would be
+        // refused for budget.
+        config.budget = single_call_budget();
+        config.principal_budget = Some(single_call_budget());
+    });
     let bearer = token(&state, "user:ana@acme.io", &["tool:*"], "j-dead");
 
     let first = send(&state, tool_call("sess-dead", Some(&bearer), "lookup", 1)).await;
@@ -531,16 +516,14 @@ async fn a_connection_refused_backend_refunds_the_debit_on_both_ledgers() {
 #[tokio::test]
 async fn an_oversized_tool_response_is_refused_without_leaking_the_upstream_url() {
     let url = backend_with_call_behavior(CallBehavior::Oversized).await;
-    let state = gateway(
-        vec![backend("svc", &url, &["lookup"])],
-        None,
-        |_| {},
-    );
+    let state = gateway(vec![backend("svc", &url, &["lookup"])], None, |_| {});
 
     let first = send(&state, tool_call("sess-huge", None, "lookup", 1)).await;
     assert_eq!(first.status, 502, "{}", first.text());
     assert!(
-        first.text().contains("tool executed but its response could not be read"),
+        first
+            .text()
+            .contains("tool executed but its response could not be read"),
         "an unreadable body is a 502 with a stable message: {}",
         first.text()
     );
@@ -577,14 +560,13 @@ async fn a_chat_backend_that_returns_500_is_relayed_not_remapped() {
     let scrape = send(&state, get("/metrics")).await;
     assert_eq!(scrape.status, 200);
     let scrape = scrape.text();
-    let upstream_5xx = metric_value(&scrape, "av_upstream_errors_total{kind=\"http_5xx\"}")
-        .unwrap_or(0.0);
+    let upstream_5xx = metric_value(&scrape, "av_upstream_errors_total{kind=\"http_5xx\"}").unwrap_or(0.0);
     assert!(
         upstream_5xx >= 1.0,
         "a relayed 5xx must bump the http_5xx counter:\n{scrape}"
     );
-    let chat_5xx = metric_value(&scrape, "av_requests_total{route=\"chat\",status_class=\"5xx\"}")
-        .unwrap_or(0.0);
+    let chat_5xx =
+        metric_value(&scrape, "av_requests_total{route=\"chat\",status_class=\"5xx\"}").unwrap_or(0.0);
     assert!(
         chat_5xx >= 1.0,
         "a 5xx chat answer must bump the chat 5xx counter:\n{scrape}"
@@ -597,7 +579,10 @@ async fn metrics_pre_registers_every_documented_series_on_a_fresh_boot() {
     let scrape = send(&state, get("/metrics")).await;
     assert_eq!(scrape.status, 200);
     assert_eq!(
-        scrape.headers.get("content-type").and_then(|value| value.to_str().ok()),
+        scrape
+            .headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
         Some("text/plain; version=0.0.4; charset=utf-8"),
     );
     let scrape = scrape.text();
@@ -661,12 +646,7 @@ async fn livez_stays_alive_while_readyz_reports_a_missing_spool() {
     // surface.
     config.atif_spool_dir = config.atif_spool_dir.clone() + "/missing-spool";
     let sandbox = common::sandbox_for(&config);
-    let state = common::app_state(
-        config,
-        sandbox,
-        Arc::new(common::CountingBus::default()),
-        7,
-    );
+    let state = common::app_state(config, sandbox, Arc::new(common::CountingBus::default()), 7);
 
     let livez = send(&state, get("/livez")).await;
     assert_eq!(livez.status, 200, "{}", livez.text());
@@ -718,7 +698,8 @@ async fn a_chat_token_budget_refusal_is_an_openai_shaped_403() {
     let reply = send(&state, chat_request("sess-chat-budget", common::chat_payload())).await;
     assert_eq!(reply.status, 403, "{}", reply.json());
     assert_eq!(
-        reply.json()["error"]["type"], "permission_error",
+        reply.json()["error"]["type"],
+        "permission_error",
         "a budget refusal is a permission error: {}",
         reply.json()
     );
@@ -733,13 +714,9 @@ async fn a_chat_token_budget_refusal_is_an_openai_shaped_403() {
 #[tokio::test]
 async fn a_tool_call_budget_refusal_is_a_json_rpc_budget_exceeded() {
     let upstream = common::MockBackend::start().await;
-    let state = gateway(
-        vec![backend("svc", &upstream.url, &["lookup"])],
-        None,
-        |config| {
-            config.budget.max_total_tool_calls = Some(1);
-        },
-    );
+    let state = gateway(vec![backend("svc", &upstream.url, &["lookup"])], None, |config| {
+        config.budget.max_total_tool_calls = Some(1);
+    });
 
     // The first call must actually spend the budget. A failure that
     // refunds would leave the second call admitted.
@@ -749,7 +726,8 @@ async fn a_tool_call_budget_refusal_is_a_json_rpc_budget_exceeded() {
     let second = send(&state, tool_call("sess-tool-budget", None, "lookup", 2)).await;
     assert_eq!(second.status, 403, "{}", second.json());
     assert_eq!(
-        second.json()["error"]["data"]["code"], "BUDGET_EXCEEDED",
+        second.json()["error"]["data"]["code"],
+        "BUDGET_EXCEEDED",
         "a tool budget refusal carries the stable denial code: {}",
         second.json()
     );

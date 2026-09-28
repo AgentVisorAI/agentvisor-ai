@@ -336,7 +336,9 @@ mod tests {
     fn reason_language_map_variants_are_read() {
         // Language map with "en" key is preferred.
         assert_eq!(
-            reason_of(Some(&json!({"reason_admin": {"en": "outside hours", "fr": "hors heures"}}))),
+            reason_of(Some(
+                &json!({"reason_admin": {"en": "outside hours", "fr": "hors heures"}})
+            )),
             "outside hours"
         );
         // Missing "en" falls back to the first value.
@@ -356,7 +358,9 @@ mod tests {
         );
         // reason_admin is preferred over reason_user.
         assert_eq!(
-            reason_of(Some(&json!({"reason_admin": "admin reason", "reason_user": "user reason"}))),
+            reason_of(Some(
+                &json!({"reason_admin": "admin reason", "reason_user": "user reason"})
+            )),
             "admin reason"
         );
         // Unknown keys are ignored.
@@ -390,40 +394,38 @@ mod tests {
     async fn mock_pdp(single: bool, batch: Batch) -> (String, Arc<Mutex<Vec<Value>>>) {
         let seen: Arc<Mutex<Vec<Value>>> = Arc::default();
         let seen_in_handler = Arc::clone(&seen);
-        let app = axum::Router::new().fallback(
-            move |uri: axum::http::Uri, body: axum::body::Bytes| {
-                let seen = Arc::clone(&seen_in_handler);
-                let batch = batch.clone();
-                async move {
-                    let request: Value = serde_json::from_slice(&body).unwrap();
-                    seen.lock().unwrap().push(request.clone());
-                    if !uri.path().ends_with("/evaluations") {
-                        let answer = if single {
-                            json!({"decision": true})
-                        } else {
-                            json!({"decision": false, "context": {"reason_admin": "blocked by policy"}})
-                        };
-                        return (axum::http::StatusCode::OK, axum::Json(answer));
-                    }
-                    let answer = match batch {
-                        Batch::Echo(verdict) => {
-                            let count = request["evaluations"].as_array().map(Vec::len).unwrap_or(0);
-                            let evaluations: Vec<Value> =
-                                (0..count).map(|_| json!({"decision": verdict})).collect();
-                            json!({"evaluations": evaluations})
-                        }
-                        Batch::Fixed(verdicts) => json!({
-                            "evaluations": verdicts
-                                .iter()
-                                .map(|verdict| json!({"decision": verdict}))
-                                .collect::<Vec<Value>>()
-                        }),
-                        Batch::Missing => json!({}),
+        let app = axum::Router::new().fallback(move |uri: axum::http::Uri, body: axum::body::Bytes| {
+            let seen = Arc::clone(&seen_in_handler);
+            let batch = batch.clone();
+            async move {
+                let request: Value = serde_json::from_slice(&body).unwrap();
+                seen.lock().unwrap().push(request.clone());
+                if !uri.path().ends_with("/evaluations") {
+                    let answer = if single {
+                        json!({"decision": true})
+                    } else {
+                        json!({"decision": false, "context": {"reason_admin": "blocked by policy"}})
                     };
-                    (axum::http::StatusCode::OK, axum::Json(answer))
+                    return (axum::http::StatusCode::OK, axum::Json(answer));
                 }
-            },
-        );
+                let answer = match batch {
+                    Batch::Echo(verdict) => {
+                        let count = request["evaluations"].as_array().map(Vec::len).unwrap_or(0);
+                        let evaluations: Vec<Value> =
+                            (0..count).map(|_| json!({"decision": verdict})).collect();
+                        json!({"evaluations": evaluations})
+                    }
+                    Batch::Fixed(verdicts) => json!({
+                        "evaluations": verdicts
+                            .iter()
+                            .map(|verdict| json!({"decision": verdict}))
+                            .collect::<Vec<Value>>()
+                    }),
+                    Batch::Missing => json!({}),
+                };
+                (axum::http::StatusCode::OK, axum::Json(answer))
+            }
+        });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move {
@@ -533,7 +535,11 @@ mod tests {
             .unwrap();
         assert_eq!(decisions, vec![true, true], "each request gets its own verdict");
         let requests = seen.lock().unwrap();
-        assert_eq!(requests.len(), 2, "one HTTP call per request without a batch endpoint");
+        assert_eq!(
+            requests.len(),
+            2,
+            "one HTTP call per request without a batch endpoint"
+        );
     }
 
     #[test]

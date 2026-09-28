@@ -19,9 +19,7 @@
 mod common;
 
 use av_harness::config::{BackendAuth, BackendConfig};
-use av_identity::{
-    ActorClaim, Audience, InMemoryRevocationStore, NhiClaims, RevocationStore,
-};
+use av_identity::{ActorClaim, Audience, InMemoryRevocationStore, NhiClaims, RevocationStore};
 use std::sync::Arc;
 
 const HMAC_SECRET: &[u8] = b"test-hmac-secret-for-delegation-chain-0";
@@ -173,10 +171,7 @@ fn assert_opaque_401(reply: &Reply, what: &str) {
         "chain-kid",
         "test-issuer",
     ] {
-        assert!(
-            !body.contains(leak),
-            "{what}: response echoes {leak:?}: {body}"
-        );
+        assert!(!body.contains(leak), "{what}: response echoes {leak:?}: {body}");
     }
 }
 
@@ -202,10 +197,7 @@ fn exchange_body_with_actor(subject: &str, actor: &str, audience: &str) -> Strin
 #[tokio::test]
 async fn a_valid_delegation_chain_reaches_the_backend() {
     let upstream = common::MockBackend::start().await;
-    let (state, _dir) = gateway(
-        vec![backend("svc", &upstream.url, &["lookup"])],
-        |_| {},
-    );
+    let (state, _dir) = gateway(vec![backend("svc", &upstream.url, &["lookup"])], |_| {});
     let now = now_s();
     let audience = state.config.audience.clone();
 
@@ -228,10 +220,7 @@ async fn a_valid_delegation_chain_reaches_the_backend() {
 #[tokio::test]
 async fn a_child_token_must_not_outlive_its_parent() {
     let upstream = common::MockBackend::start().await;
-    let (state, _dir) = gateway(
-        vec![backend("svc", &upstream.url, &["lookup"])],
-        |_| {},
-    );
+    let (state, _dir) = gateway(vec![backend("svc", &upstream.url, &["lookup"])], |_| {});
     let now = now_s();
     let audience = state.config.audience.clone();
 
@@ -255,10 +244,7 @@ async fn a_child_token_must_not_outlive_its_parent() {
 #[tokio::test]
 async fn a_child_token_must_not_be_issued_before_its_parent() {
     let upstream = common::MockBackend::start().await;
-    let (state, _dir) = gateway(
-        vec![backend("svc", &upstream.url, &["lookup"])],
-        |_| {},
-    );
+    let (state, _dir) = gateway(vec![backend("svc", &upstream.url, &["lookup"])], |_| {});
     let now = now_s();
     let audience = state.config.audience.clone();
 
@@ -279,10 +265,7 @@ async fn a_child_token_must_not_be_issued_before_its_parent() {
 #[tokio::test]
 async fn a_child_token_must_not_be_usable_before_its_parent() {
     let upstream = common::MockBackend::start().await;
-    let (state, _dir) = gateway(
-        vec![backend("svc", &upstream.url, &["lookup"])],
-        |_| {},
-    );
+    let (state, _dir) = gateway(vec![backend("svc", &upstream.url, &["lookup"])], |_| {});
     let now = now_s();
     let audience = state.config.audience.clone();
 
@@ -306,10 +289,7 @@ async fn a_child_token_must_not_be_usable_before_its_parent() {
 #[tokio::test]
 async fn a_child_token_must_not_widen_its_parent_scopes() {
     let upstream = common::MockBackend::start().await;
-    let (state, _dir) = gateway(
-        vec![backend("svc", &upstream.url, &["lookup", "write"])],
-        |_| {},
-    );
+    let (state, _dir) = gateway(vec![backend("svc", &upstream.url, &["lookup", "write"])], |_| {});
     let now = now_s();
     let audience = state.config.audience.clone();
 
@@ -318,12 +298,7 @@ async fn a_child_token_must_not_widen_its_parent_scopes() {
     // The parent holds only `tool:lookup`. The child claims `tool:write`
     // as well. A child's privileges are the intersection with its parent,
     // never the union, so the extra scope must refuse the whole token.
-    let mut child = base_claims(
-        now,
-        &audience,
-        "jti-child",
-        &["tool:lookup", "tool:write"],
-    );
+    let mut child = base_claims(now, &audience, "jti-child", &["tool:lookup", "tool:write"]);
     child.parent_token = Some(root_jwt);
     let child_jwt = mint(&child);
 
@@ -335,10 +310,7 @@ async fn a_child_token_must_not_widen_its_parent_scopes() {
 #[tokio::test]
 async fn a_wildcard_parent_still_allows_narrowing() {
     let upstream = common::MockBackend::start().await;
-    let (state, _dir) = gateway(
-        vec![backend("svc", &upstream.url, &["lookup"])],
-        |_| {},
-    );
+    let (state, _dir) = gateway(vec![backend("svc", &upstream.url, &["lookup"])], |_| {});
     let now = now_s();
     let audience = state.config.audience.clone();
 
@@ -359,10 +331,9 @@ async fn a_wildcard_parent_still_allows_narrowing() {
 #[tokio::test]
 async fn a_delegation_chain_deeper_than_the_cap_is_refused() {
     let upstream = common::MockBackend::start().await;
-    let (state, _dir) = gateway(
-        vec![backend("svc", &upstream.url, &["lookup"])],
-        |config| config.max_delegation_depth = 2,
-    );
+    let (state, _dir) = gateway(vec![backend("svc", &upstream.url, &["lookup"])], |config| {
+        config.max_delegation_depth = 2
+    });
     let now = now_s();
     let audience = state.config.audience.clone();
 
@@ -386,10 +357,9 @@ async fn a_delegation_chain_deeper_than_the_cap_is_refused() {
 #[tokio::test]
 async fn an_act_chain_deeper_than_the_cap_is_refused() {
     let upstream = common::MockBackend::start().await;
-    let (state, _dir) = gateway(
-        vec![backend("svc", &upstream.url, &["lookup"])],
-        |config| config.max_delegation_depth = 2,
-    );
+    let (state, _dir) = gateway(vec![backend("svc", &upstream.url, &["lookup"])], |config| {
+        config.max_delegation_depth = 2
+    });
     let now = now_s();
     let audience = state.config.audience.clone();
 
@@ -452,10 +422,7 @@ async fn revoking_the_delegator_cuts_off_the_child() {
 
 #[tokio::test]
 async fn exchange_refuses_a_delegated_actor_token() {
-    let (state, _dir) = gateway(
-        vec![backend("svc", "http://127.0.0.1:9", &["lookup"])],
-        |_| {},
-    );
+    let (state, _dir) = gateway(vec![backend("svc", "http://127.0.0.1:9", &["lookup"])], |_| {});
     let now = now_s();
     let audience = state.config.audience.clone();
 
@@ -477,8 +444,7 @@ async fn exchange_refuses_a_delegated_actor_token() {
     )
     .await;
     assert_eq!(
-        reply.status,
-        400,
+        reply.status, 400,
         "a delegated actor must be refused: {}",
         reply.json
     );
@@ -507,14 +473,9 @@ async fn exchange_refuses_when_a_link_would_exceed_the_depth_cap() {
     });
     let subject_jwt = mint(&subject);
 
-    let reply = send(
-        &state,
-        form("/v1/token", exchange_body(&subject_jwt, "svc")),
-    )
-    .await;
+    let reply = send(&state, form("/v1/token", exchange_body(&subject_jwt, "svc"))).await;
     assert_eq!(
-        reply.status,
-        400,
+        reply.status, 400,
         "the exchange must not push the chain past the cap: {}",
         reply.json
     );
