@@ -14,6 +14,7 @@ const LOCKFILE: &str = include_str!("../../../Cargo.lock");
 const WASM_POLICY: &str = include_str!("../../av-sandbox/src/wasm_policy.rs");
 const COLD_STORE: &str = include_str!("../../av-bridge/src/cold_store.rs");
 const COMPRESS_PASSES: &str = include_str!("../../av-compress/src/passes.rs");
+const COMPRESS_MARKER: &str = include_str!("../../av-compress/src/marker.rs");
 const ONNX_EMBED: &str = include_str!("../../av-loopdetect/src/onnx_embed.rs");
 
 /// The whole wasmtime advisory triage rests on this exact feature set.
@@ -81,16 +82,35 @@ fn cold_store_mac_still_verified_constant_time() {
     );
 }
 
-/// The compression-marker design limitation is tracked at a named TODO.
+/// The compression-marker design limitation is fixed: the TODO is retired and
+/// the audit records the keyed-tag resolution.
 #[test]
-fn compression_marker_todo_still_tracked() {
+fn compression_marker_is_keyed_and_the_todo_is_retired() {
     assert!(
-        COMPRESS_PASSES.contains("TODO(compression-marker)"),
-        "SECURITY-AUDIT.md tracks the marker-spoofing limitation at \
-         TODO(compression-marker) in av-compress/src/passes.rs; if the fix \
-         landed, update the audit doc's entry instead of deleting the TODO"
+        !COMPRESS_PASSES.contains("TODO(compression-marker)"),
+        "the marker-spoofing fix landed — the TODO should be gone from \
+         av-compress/src/passes.rs (and SECURITY-AUDIT.md should record the \
+         keyed-tag resolution)"
     );
-    assert!(AUDIT.contains("TODO(compression-marker)"));
+    assert!(
+        !AUDIT.contains("TODO(compression-marker)"),
+        "SECURITY-AUDIT.md still cites the retired TODO; the resolved entry \
+         should name derive_marker_key and the regression test instead"
+    );
+    assert!(
+        COMPRESS_MARKER.contains("pub fn derive_marker_key")
+            && COMPRESS_MARKER.contains("agentvisor-compress-marker-v1")
+            && COMPRESS_PASSES.contains("is_middle_history_stub"),
+        "the keyed stub tag in av-compress/src/marker.rs is gone — \
+         SECURITY-AUDIT.md claims stubs are HMAC-tagged under a key derived \
+         from the journal key"
+    );
+    assert!(
+        AUDIT.contains("derive_marker_key")
+            && AUDIT.contains("spoofed_middle_marker_does_not_disable_the_pass_under_a_key"),
+        "SECURITY-AUDIT.md's resolved marker entry must name the key \
+         derivation and the regression test"
+    );
 }
 
 /// The tract-nnef not-reachable argument names the real call site.

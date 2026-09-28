@@ -13,8 +13,12 @@
 //! 5. output token count ≤ input token count.
 //!
 //! Every pruned block leaves an audit stub `[pruned: N tokens, sha256:…]` so a
-//! reviewer can prove what was removed. Metrics mirror ATIF field names.
+//! reviewer can prove what was removed. When a marker key is configured the
+//! stub also carries a keyed HMAC tag, so user text that merely quotes the
+//! stub shape cannot impersonate one. Metrics mirror ATIF field names.
 
+pub mod marker;
 pub mod passes;
 
+pub use marker::derive_marker_key;
 pub use passes::{compress, CompressionConfig, CompressionOutcome};

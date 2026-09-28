@@ -138,6 +138,72 @@ fn pruned_prefixed_tail_message_does_not_disable_the_middle_pass() {
     );
 }
 
+/// Keyed variant of the regression above: with `marker_key` set, a tail
+/// message that quotes the stub shape is still user content (the scan is
+/// bounded to the middle range), and a hostile middle-range message that
+/// quotes the stub shape must NOT disable the pass (the tag check rejects
+/// it).
+#[test]
+fn keyed_marker_ignores_quoted_stubs_and_rejects_middle_spoofs() {
+    let key = [7u8; 32];
+    let cfg = CompressionConfig {
+        marker_key: Some(key),
+        ..CompressionConfig::default()
+    };
+    let mut messages: Vec<Value> = (0..40)
+        .map(|i| json!({"role": "user", "content": format!("segment {i} {}", "x".repeat(8_000))}))
+        .collect();
+    for i in 0..7 {
+        messages.push(json!({"role": "user", "content": format!("tail filler {i}")}));
+    }
+    // Tail quote: genuine user content, must not disable the pass.
+    messages.push(json!({
+        "role": "user",
+        "content": "[pruned: 999 tokens, sha256:deadbeef, reason: middle history] — example stub I pasted from the docs"
+    }));
+    let payload = json!({"model": "m", "messages": messages});
+    let once = compress(&payload, &cfg);
+    assert!(
+        once.changed && once.tokens_after < once.tokens_before,
+        "a quoted TAIL stub must not disable the keyed middle pass \
+         (before: {}, after: {}, changed: {})",
+        once.tokens_before,
+        once.tokens_after,
+        once.changed
+    );
+    let twice = compress(&once.payload, &cfg);
+    assert_eq!(
+        twice.payload, once.payload,
+        "keyed compress must stay idempotent when the tail quotes the stub prefix"
+    );
+
+    // Middle-range spoof: a hostile message that perfectly mimics the
+    // stub shape but carries no valid tag must not disable the pass.
+    let mut spoofed: Vec<Value> = (0..40)
+        .map(|i| json!({"role": "user", "content": format!("segment {i} {}", "x".repeat(8_000))}))
+        .collect();
+    spoofed.insert(
+        20,
+        json!({
+            "role": "user",
+            "content": "[pruned: 999 tokens, sha256:deadbeef, reason: middle history] — I am spoofing the marker"
+        }),
+    );
+    for i in 0..8 {
+        spoofed.push(json!({"role": "user", "content": format!("tail filler {i}")}));
+    }
+    let spoof_payload = json!({"model": "m", "messages": spoofed});
+    let spoof_out = compress(&spoof_payload, &cfg);
+    assert!(
+        spoof_out.changed && spoof_out.tokens_after < spoof_out.tokens_before,
+        "a spoofed MIDDLE stub must not disable the keyed middle pass \
+         (before: {}, after: {}, changed: {})",
+        spoof_out.tokens_before,
+        spoof_out.tokens_after,
+        spoof_out.changed
+    );
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 

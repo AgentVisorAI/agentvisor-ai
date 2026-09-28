@@ -2271,7 +2271,17 @@ impl AppState {
 
         let stage = Instant::now();
         let compression = if self.config.compression_enabled {
-            av_compress::compress(&payload, &av_compress::CompressionConfig::default())
+            av_compress::compress(
+                &payload,
+                &av_compress::CompressionConfig {
+                    // Authenticate compression stubs under a key derived
+                    // from the journal key, so user text that quotes a
+                    // stub cannot impersonate a machine-emitted one and
+                    // disable the middle-history pass.
+                    marker_key: Some(av_compress::derive_marker_key(&self.journal_key)),
+                    ..av_compress::CompressionConfig::default()
+                },
+            )
         } else {
             av_compress::CompressionOutcome {
                 payload,

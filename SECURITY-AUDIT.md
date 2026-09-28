@@ -77,17 +77,15 @@ attacker cannot substitute a hostile model.
   *Resolved after this audit:* the workspace now pins `async-nats 0.50`
   with `rustls-webpki 0.103.13` in `Cargo.lock`.
 
-- **Compression-marker spoofing (design limitation, av-compress)** — the
-  idempotence marker the middle-history stubbing pass leaves behind is an
-  unauthenticated literal substring, so a hostile middle-range message can
-  quote it and make the pass skip stubbing of surrounding messages (a
-  compression-degradation, not an integrity or disclosure issue). The scan
-  is already bounded to the middle range so tail messages cannot trigger
-  it. Exploitation requires message-content control (a compromised prior
-  turn), and the impact is bounded to "compression pass skips". Durable
-  fix is a keyed marker (HMAC over prior content) or an out-of-band
-  per-payload flag; both are larger refactors, unscheduled. Tracked at
-  the `TODO(compression-marker)` in `crates/av-compress/src/passes.rs`.
+- ~~**Compression-marker spoofing (design limitation, av-compress)**~~ —
+  the idempotence marker was an unauthenticated literal substring.
+  *Resolved:* every stub is now tagged with a 128-bit HMAC under a key
+  derived from the journal key (`derive_marker_key` in
+  `crates/av-compress/src/marker.rs`). The middle-history idempotence guard
+  verifies the tag before treating a stub as machine-emitted, so a hostile
+  middle-range message that merely quotes the stub shape cannot disable the
+  pass. Regression test:
+  `spoofed_middle_marker_does_not_disable_the_pass_under_a_key`.
 
 ### Informational (no CVE)
 
